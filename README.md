@@ -53,7 +53,7 @@ Set-Location D:\Projects\Audio\MicNoize
 
 `verify.ps1` пересобирает `mic_engine` и проверочные exe (`mic_check`, `effects_check`, `bridge_check`; хост и UI не трогает), затем запускает CTest, Rust-тесты и строгий Clippy. NVIDIA для этого не нужен.
 
-Готовая dev-сборка: `bin\MicNoize.exe` (`Run.bat` = `run.ps1` с проверкой VRAM; запускать из Проводника, не из терминала агента). Она читает и сохраняет `%APPDATA%\Mic Noize\settings.ini`, но при наличии `vendor\nvidia-afx-3.0.0` всегда использует runtime и модели из репозитория; установленная версия использует `%APPDATA%\Mic Noize\Components`. При открытии программа сама выбирает сохранённые устройства и запускает обработку; допустимый виртуальный выход — TAG или Voicemeeter. В Discord или игре выберите **Microphone (Thin Audio Gateway)**. Установка TAG на новом ПК: `.\install-tag.ps1` (проверяет подписи, запрашивает права администратора).
+Готовая dev-сборка: `bin\MicNoize.exe` (`Run.bat` = `run.ps1` с проверкой VRAM; запускать из Проводника, не из терминала агента). Она читает и сохраняет `%APPDATA%\Mic Noize\settings.ini`, но при наличии `vendor\nvidia-afx-3.0.0` всегда использует runtime и модели из репозитория; установленная версия использует `%APPDATA%\Mic Noize\Components`. При открытии программа сама выбирает сохранённые устройства и запускает обработку; допустимый виртуальный выход — TAG или Voicemeeter. В Discord или игре выберите **Mic Noize (Thin Audio Gateway)**. Суффикс — имя подписанного TAG-драйвера; наша capture-линия называется `MicNoize Microphone`. Установка TAG на новом ПК: `.\install-tag.ps1` (проверяет подписи, запрашивает права администратора).
 
 ## Постоянный виртуальный микрофон
 
