@@ -1889,7 +1889,7 @@ fn main() {
             App::update,
             App::view,
         )
-        .title("MicNoiseReducer")
+        .title("Mic Noize")
         .theme(|_: &App, _: window::Id| {
             Theme::custom(
                 "Graphite",

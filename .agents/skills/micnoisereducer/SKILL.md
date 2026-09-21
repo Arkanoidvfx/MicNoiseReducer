@@ -1,11 +1,13 @@
 ---
 name: micnoisereducer
-description: "Work on MicNoiseReducer in this Windows project: Rust/Iced UI, C++ NVIDIA audio engine, TAG/WASAPI, Discord-only effects, hotkeys, settings, builds and focused checks. Use for project changes or troubleshooting; not for unrelated audio projects or general NVIDIA advice."
+description: "Work on Mic Noize (internal project ID MicNoiseReducer) in this Windows project: Rust/Iced UI, C++ NVIDIA audio engine, TAG/WASAPI, Discord-only effects, hotkeys, settings, builds and focused checks. Use for project changes or troubleshooting; not for unrelated audio projects or general NVIDIA advice."
 ---
 
-# MicNoiseReducer
+# Mic Noize
 
 Resolve all source paths below from the project root (the folder containing `AGENTS.md` and `CMakeLists.txt`). Default location: `D:\Projects\Audio\MicNoiseReducer`.
+
+The user-facing product name is **Mic Noize**. Keep the internal `MicNoiseReducer` package ID, executable names, `%LOCALAPPDATA%` directory, repository URL, mutexes, window classes and TAG endpoint names unchanged so installed versions, settings, updates and the persistent driver connection remain compatible.
 
 ## Find the smallest relevant path
 

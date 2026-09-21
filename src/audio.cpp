@@ -43,7 +43,7 @@ struct InternetHandle {
 };
 constexpr unsigned rvcFrames=rate/2;
 static bool rvcRequest(float* input,float* output,unsigned frames,const RvcSettings& config,uint64_t stream) {
-    InternetHandle session{WinHttpOpen(L"MicNoiseReducer/1.0",WINHTTP_ACCESS_TYPE_NO_PROXY,
+    InternetHandle session{WinHttpOpen(L"MicNoize/1.0",WINHTTP_ACCESS_TYPE_NO_PROXY,
         WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0)};
     if(!session.h || !WinHttpSetTimeouts(session.h,200,200,1000,3000)) return false;
     InternetHandle connection{WinHttpConnect(session.h,L"127.0.0.1",18889,0)};
@@ -644,7 +644,7 @@ void Engine::start(const Config& c) {
             throw std::runtime_error("Select the physical microphone, not TAG's own output");
         HANDLE owner=CreateMutexW(nullptr,FALSE,L"Local\\MicNoiseReducer.TAG");
         if(!owner) throw std::runtime_error("Cannot create TAG ownership mutex");
-        if(GetLastError()==ERROR_ALREADY_EXISTS) {CloseHandle(owner);throw std::runtime_error("TAG is already running in another MicNoiseReducer instance");}
+        if(GetLastError()==ERROR_ALREADY_EXISTS) {CloseHandle(owner);throw std::runtime_error("TAG is already running in another Mic Noize instance");}
         tagOwner_=owner;
         try {ensureTagHost();} catch(...) {CloseHandle(tagOwner_);tagOwner_=nullptr;throw;}
     }
@@ -687,8 +687,8 @@ void Engine::stop() {
                <<" graphs="<<config_.cudaGraphs<<" blocks="<<stats.processed<<" underruns="<<stats.underruns<<" drops="<<stats.drops
                <<" run_max_ms="<<stats.maxRunMs<<" reset_max_ms="<<stats.maxResetMs<<" tag_gaps="<<stats.tagDriverGaps
                <<" late_ticks="<<stats.tagLateTicks<<" reconnects="<<stats.tagReconnects<<" status="<<utf8(status())<<'\n';
-            if(!log) OutputDebugStringW(L"MicNoiseReducer: could not write results/sessions.log\n");
-        } catch(...) {OutputDebugStringW(L"MicNoiseReducer: session log unavailable\n");}
+            if(!log) OutputDebugStringW(L"Mic Noize: could not write results/sessions.log\n");
+        } catch(...) {OutputDebugStringW(L"Mic Noize: session log unavailable\n");}
     }
     stats.outputActive=false;
     stats.inputPeak=0; stats.outputPeak=0; stats.inputQueue=0; stats.outputQueue=0;

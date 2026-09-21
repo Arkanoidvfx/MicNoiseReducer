@@ -234,7 +234,7 @@ impl App {
         .align_y(iced::Center);
         let title = mouse_area(
             container(
-                row![logo, bold("MicNoiseReducer", 18, INK)]
+                row![logo, bold("Mic Noize", 18, INK)]
                     .spacing(12)
                     .align_y(iced::Center),
             )
@@ -1007,7 +1007,7 @@ impl App {
                     style
                 }), self.focus == focus::settings::AUTOSTART),
             widget::rule::horizontal(1),
-            label(format!("MicNoiseReducer {}", env!("CARGO_PKG_VERSION")), 13, INK),
+            label(format!("Mic Noize {}", env!("CARGO_PKG_VERSION")), 13, INK),
             label(&self.update_status, 12, if self.update_ready { GREEN } else { DIM }),
             row![
                 action(label(if self.update_checking { "Проверка…" } else { "Проверить обновления" },13,INK),Msg::UpdateCheck,self.focus==focus::settings::UPDATE,false)

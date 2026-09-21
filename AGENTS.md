@@ -1,4 +1,4 @@
-# MicNoiseReducer — project instructions
+# Mic Noize — project instructions
 
 Windows-only Rust/Iced UI + C++ audio engine. Open this folder as the project root.
 

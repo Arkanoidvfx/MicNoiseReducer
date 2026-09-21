@@ -157,14 +157,14 @@ static LRESULT CALLBACK shellProc(HWND w,UINT message,WPARAM wp,LPARAM lp) {
     case WM_APP+2: p->events.fetch_or(1);return 0;
     case WM_APP+3:
         p->tray.uFlags=NIF_INFO;
-        wcscpy_s(p->tray.szInfoTitle,L"MicNoiseReducer работает в трее");
+        wcscpy_s(p->tray.szInfoTitle,L"Mic Noize работает в трее");
         wcscpy_s(p->tray.szInfo,L"Микрофон продолжает работать. Управление доступно в меню значка.");
         p->tray.dwInfoFlags=NIIF_INFO;Shell_NotifyIconW(NIM_MODIFY,&p->tray);return 0;
     case WM_APP+1:
         if(lp==WM_LBUTTONUP || lp==WM_LBUTTONDBLCLK) p->events.fetch_or(1);
         if(lp==WM_RBUTTONUP) {
             HMENU menu=CreatePopupMenu();
-            AppendMenuW(menu,MF_STRING,1,L"Открыть MicNoiseReducer");
+            AppendMenuW(menu,MF_STRING,1,L"Открыть Mic Noize");
             AppendMenuW(menu,MF_STRING,4,L"Перезапустить");
             AppendMenuW(menu,MF_SEPARATOR,0,nullptr); AppendMenuW(menu,MF_STRING,2,L"Выход");
             POINT point;GetCursorPos(&point);SetForegroundWindow(w);
@@ -210,12 +210,12 @@ extern "C" int32_t mnr_shell_start(Mnr* p,char* error,uint32_t cap) {
             try {mic::ensureTagHost();} catch(const std::exception& e) {p->engine.reportError(e.what());}
             WNDCLASSW cls{};cls.lpfnWndProc=shellProc;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"MicNoiseReducer.RustShell";
             RegisterClassW(&cls);
-            HWND w=CreateWindowExW(0,cls.lpszClassName,L"MicNoiseReducer background",0,0,0,0,0,nullptr,nullptr,cls.hInstance,p);
+            HWND w=CreateWindowExW(0,cls.lpszClassName,L"Mic Noize background",0,0,0,0,0,nullptr,nullptr,cls.hInstance,p);
             if(!w) {p->events.fetch_or(16);return;}
             p->window=w;p->taskbar=RegisterWindowMessageW(L"TaskbarCreated");
             WTSRegisterSessionNotification(w,NOTIFY_FOR_THIS_SESSION);
             p->tray.cbSize=sizeof(p->tray);p->tray.hWnd=w;p->tray.uID=1;p->tray.uCallbackMessage=WM_APP+1;
-            p->tray.hIcon=trayIcon();wcscpy_s(p->tray.szTip,L"MicNoiseReducer");addTray(p);
+            p->tray.hIcon=trayIcon();wcscpy_s(p->tray.szTip,L"Mic Noize");addTray(p);
             mic::HoldLatch latch,replayLatch,noiseLatch; unsigned previousReplay=0; bool monitorArmed=false,captureArmed=false,capturedThisSession=false;unsigned captureGeneration=0;
             bool desktop=true;ULONGLONG lastDesktop=0,lastTick=GetTickCount64();
             while(!stop.stop_requested()) {

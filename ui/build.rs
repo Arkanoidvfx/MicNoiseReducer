@@ -4,6 +4,8 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         winresource::WindowsResource::new()
             .set_icon(icon.to_str().unwrap())
+            .set("ProductName", "Mic Noize")
+            .set("FileDescription", "Mic Noize")
             .compile()
             .expect("embed application icon");
     }

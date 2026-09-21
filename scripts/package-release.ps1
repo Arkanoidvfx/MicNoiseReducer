@@ -14,7 +14,7 @@ dotnet tool run vpk -- pack `
     --packVersion $Version `
     --packDir $publish `
     --mainExe MicNoiseReducer.exe `
-    --packTitle MicNoiseReducer `
+    --packTitle 'Mic Noize' `
     --packAuthors 'Arkanoid VFX' `
     --channel win-x64-stable `
     --outputDir $releases `
@@ -24,9 +24,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Velopack packaging failed.' }
 $setup = Get-ChildItem $releases -File -Filter '*-Setup.exe' |
     Where-Object Name -ne 'Setup.exe' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if ($setup) {
-    Copy-Item $setup.FullName (Join-Path $releases "MicNoiseReducer-Setup-$Version.exe") -Force
+    Copy-Item $setup.FullName (Join-Path $releases "Mic-Noize-Setup-$Version.exe") -Force
     Copy-Item $setup.FullName (Join-Path $releases 'Setup.exe') -Force
 }
-Get-ChildItem $releases -File | Get-FileHash -Algorithm SHA256 |
+Get-ChildItem $releases -File | Where-Object Name -ne 'checksums.sha256' | Get-FileHash -Algorithm SHA256 |
     ForEach-Object { "$($_.Hash)  $([IO.Path]::GetFileName($_.Path))" } |
     Set-Content (Join-Path $releases 'checksums.sha256') -Encoding ascii

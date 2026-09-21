@@ -102,7 +102,7 @@ void addTray() {
     if(!trayAdded) {
         tray.cbSize=sizeof(tray); tray.hWnd=window; tray.uID=1; tray.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP;
         tray.uCallbackMessage=trayMessage; tray.hIcon=LoadIconW(nullptr,IDI_APPLICATION);
-        const auto tip=L"MicNoiseReducer — "+lastStatus;
+        const auto tip=L"Mic Noize — "+lastStatus;
         wcsncpy_s(tray.szTip,tip.c_str(),_TRUNCATE);
         if(!Shell_NotifyIconW(NIM_ADD,&tray)) throw std::runtime_error("Не удалось добавить значок в трей.");
         trayAdded=true;
@@ -144,7 +144,7 @@ void updateStatus() {
     if(label!=lastStatus) {
         lastStatus=label; SetWindowTextW(statusLabel,label.c_str());
         if(trayAdded) {
-            const auto tip=L"MicNoiseReducer — "+label;
+            const auto tip=L"Mic Noize — "+label;
             wcsncpy_s(tray.szTip,tip.c_str(),_TRUNCATE); tray.uFlags=NIF_TIP;
             Shell_NotifyIconW(NIM_MODIFY,&tray);
         }
@@ -166,7 +166,7 @@ void meter(HDC dc,int y,const wchar_t* name,float value) {
 void paint() {
     PAINTSTRUCT ps; HDC dc=BeginPaint(window,&ps);
     RECT bounds; GetClientRect(window,&bounds); FillRect(dc,&bounds,backgroundBrush);
-    text(dc,32,25,704,38,L"MicNoiseReducer",true);
+    text(dc,32,25,704,38,L"Mic Noize",true);
     text(dc,34,70,700,26,L"Шумоподавление NVIDIA · обработка на вашем ПК",false,mutedInk);
     for(auto r: {RECT{32,112,736,286},RECT{32,302,736,487},RECT{32,503,736,613}}) {
         RECT scaled{px(r.left),px(r.top),px(r.right),px(r.bottom)}; FillRect(dc,&scaled,whiteBrush);
@@ -288,7 +288,7 @@ LRESULT CALLBACK procedure(HWND h,UINT message,WPARAM w,LPARAM l) {
         case WM_DESTROY:
             KillTimer(h,1); engine->stop(); if(trayAdded) Shell_NotifyIconW(NIM_DELETE,&tray); PostQuitMessage(0); return 0;
         }
-    } catch(const std::exception& e) { MessageBoxW(h,mic::wide(e.what()).c_str(),L"MicNoiseReducer",MB_OK|MB_ICONERROR); if(message==WM_CREATE) return -1; }
+    } catch(const std::exception& e) { MessageBoxW(h,mic::wide(e.what()).c_str(),L"Mic Noize",MB_OK|MB_ICONERROR); if(message==WM_CREATE) return -1; }
     return DefWindowProcW(h,message,w,l);
 }
 }
@@ -308,11 +308,11 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int showCommand) {
         if(!RegisterClassW(&c)) throw std::runtime_error("Window class registration failed");
         RECT size{0,0,px(768),px(760)}; constexpr DWORD style=WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_CLIPCHILDREN;
         AdjustWindowRectEx(&size,style,FALSE,0);
-        HWND h=CreateWindowExW(WS_EX_CONTROLPARENT,c.lpszClassName,L"MicNoiseReducer",style,CW_USEDEFAULT,CW_USEDEFAULT,size.right-size.left,size.bottom-size.top,nullptr,nullptr,instance,nullptr);
+        HWND h=CreateWindowExW(WS_EX_CONTROLPARENT,c.lpszClassName,L"Mic Noize",style,CW_USEDEFAULT,CW_USEDEFAULT,size.right-size.left,size.bottom-size.top,nullptr,nullptr,instance,nullptr);
         if(!h) throw std::runtime_error("Window creation failed");
         ShowWindow(h,showCommand); UpdateWindow(h);
         MSG message; while(GetMessageW(&message,nullptr,0,0)>0) { if(!IsDialogMessageW(h,&message)) { TranslateMessage(&message); DispatchMessageW(&message); } }
-    } catch(const std::exception& e) { MessageBoxW(nullptr,mic::wide(e.what()).c_str(),L"MicNoiseReducer",MB_OK|MB_ICONERROR); exitCode=1; }
+    } catch(const std::exception& e) { MessageBoxW(nullptr,mic::wide(e.what()).c_str(),L"Mic Noize",MB_OK|MB_ICONERROR); exitCode=1; }
     engine.reset(); if(font) DeleteObject(font); if(titleFont) DeleteObject(titleFont);
     if(backgroundBrush) DeleteObject(backgroundBrush); if(whiteBrush) DeleteObject(whiteBrush); if(single) CloseHandle(single);
     return exitCode;
