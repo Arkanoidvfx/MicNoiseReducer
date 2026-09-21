@@ -2,6 +2,13 @@
 
 Хронология изменений и результаты проверок. Поведение программы описано в [README.md](README.md); здесь — что и когда менялось, какие проверки прошли и что осталось непроверенным. Логи и снимки лежат в `results/` (не в Git). Исторические логи описывают прошлые прогоны, а не свежую валидацию текущей сборки.
 
+## 2026-09-21 — Mic Noize 0.2.0: локальная миграция TAG
+
+- Старый хост PID 16932 остановлен только после выхода UI; новый `mic_tag_host.exe` собран и запущен из Проводника, PID 34508. Миграция оставила один активный capture endpoint: **Mic Noize (Thin Audio Gateway)**, id `{0.0.1.00000000}.{e4ba2cb9-afc9-47ed-909f-20513051c269}`. `Thin Audio Gateway` — имя подписанного родительского драйвера из INF; KS-линия называется `MicNoize Microphone`.
+- `mic_check --tag-reconnect 4`: стойла 120/400 мс пережиты, `reconnects=1/2`, `underruns=0`, `drops=0`, `TAG_gaps=0`. `--persistent-tag 4`: тот же endpoint, постоянно открытый клиент и два жизненных цикла движка прошли. Логи: `results/mic-noize-0.2.0-tag-reconnect.log`, `results/mic-noize-0.2.0-persistent-tag.log`. VRAM preflight: 15 223 MiB свободно из 24 576 MiB.
+- UI `bin\MicNoize.exe` запущен из Проводника, маршрут `QuadCast S → NVIDIA v2 → TAG` поднялся на repository runtime (в процессе загружены `NVAudioEffects.dll` и `nvafxdenoiser.dll`). `%APPDATA%\Mic Noize\settings.ini` побайтно совпал с legacy-файлом; старые Components не копировались, dev runtime видит 6 repository RVC-слотов. Старый `%LOCALAPPDATA%\MicNoiseReducer` содержал только эту копию настроек и восстановимо перенесён в `.tmp\archive\LocalAppData-MicNoiseReducer`.
+- Реальный HKCU Run нельзя достоверно прочитать из MSIX-терминала агента: его виртуализированный view всё ещё показывает legacy-значение; успешный внешний запуск нового хоста подтверждён новым PID и endpoint. Ещё не проверены наушниковая линия, установка/удаление 0.2.0 и публикация.
+
 ## 2026-09-21 — Mic Noize 0.2.0: внутренний rename, шаг 1
 
 - Пакет и dev EXE переименованы в `micnoize` / `bin\MicNoize.exe`; удалён старый Win32 UI и его CMake target. Velopack теперь использует `packId MicNoize`, `MicNoize.exe` и версию 0.2.0; URL приложения и runtime переведены на `Arkanoidvfx/MicNoize`, core manifest — на `runtime-core-v2`.
