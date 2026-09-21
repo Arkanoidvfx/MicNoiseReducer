@@ -2,6 +2,14 @@
 
 Хронология изменений и результаты проверок. Поведение программы описано в [README.md](README.md); здесь — что и когда менялось, какие проверки прошли и что осталось непроверенным. Логи и снимки лежат в `results/` (не в Git). Исторические логи описывают прошлые прогоны, а не свежую валидацию текущей сборки.
 
+## 2026-09-22 — Mic Noize 0.2.0: публикация и контрольная установка
+
+- Репозитории переименованы в public `Arkanoidvfx/MicNoize` и private `Arkanoidvfx/MicNoize-dev`. Telemetry Worker принимает новый `mic_noize`, сохраняет переходный `mic_noise_reducer` и fallback на прежний секрет; vitest 91/91 и typecheck прошли, deploy run `35662099192` зелёный.
+- Опубликован и проверен `runtime-core-v2`: Ed25519-подпись валидна, размер `core-runtime-2.part000` в GitHub и манифесте совпадает (1 153 997 586 байт), архив содержит новый `mic_tag_host.exe`. Манифест `runtime-rvc-v2.1.4` переподписан с URL `Arkanoidvfx/MicNoize`; подпись, размеры и SHA-256 двух существующих частей совпали.
+- Release run `35663002046` прошёл и опубликовал `v0.2.0`. Скачанный `Mic-Noize-Setup-0.2.0.exe` совпал с `checksums.sha256` (`EA9D4E6DDF5363BFF8E955641C09101442E42E04FD320715F7D8E665E752F4B2`); метаданные показывают `Mic Noize` / `0.2.0`, Velopack package id — `MicNoize`.
+- Установка из Проводника создала `%LOCALAPPDATA%\MicNoize\current\MicNoize.exe`; UI 0.2.0 загрузил NVIDIA DLL из `%APPDATA%\Mic Noize\Components`, сохранил прежний `settings.ini` и поднял сохранённый маршрут `QuadCast S → NVIDIA v2 → TAG`. После удаления приложения install root и UI исчезли, но `settings.ini`, `install-id.txt`, runtime v2 и TAG endpoint **Mic Noize (Thin Audio Gateway)** остались; SHA-256 настроек не изменился. Главная цель отделения пользовательских данных от программы подтверждена.
+- Старые `v0.1.0–v0.1.2` и `runtime-core-v1` помечены pre-release как superseded; RVC, core v2 и v0.2.0 остаются обычными релизами. Не проверены наушниковая линия, SmartScreen на чистом ПК и субъективное прослушивание установленной сборки.
+
 ## 2026-09-21 — Mic Noize 0.2.0: локальная миграция TAG
 
 - Старый хост PID 16932 остановлен только после выхода UI; новый `mic_tag_host.exe` собран и запущен из Проводника, PID 34508. Миграция оставила один активный capture endpoint: **Mic Noize (Thin Audio Gateway)**, id `{0.0.1.00000000}.{e4ba2cb9-afc9-47ed-909f-20513051c269}`. `Thin Audio Gateway` — имя подписанного родительского драйвера из INF; KS-линия называется `MicNoize Microphone`.
