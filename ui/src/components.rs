@@ -1,0 +1,240 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Write},
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+const CORE_MANIFEST_URL: &str = "https://github.com/Arkanoidvfx/MicNoiseReducer/releases/download/runtime-core-v1/components.json";
+const RVC_MANIFEST_URL: &str = "https://github.com/Arkanoidvfx/MicNoiseReducer/releases/download/runtime-rvc-v2.1.4/components.json";
+const PUBLIC_KEY: &str = "plpoEiomh7k+cZtpxNJX9Zq2RNv0ugQruiH4lZGazHg=";
+static DONE: AtomicU64 = AtomicU64::new(0);
+static TOTAL: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Deserialize)]
+struct Envelope {
+    payload: String,
+    signature: String,
+}
+
+#[derive(Deserialize)]
+struct Manifest {
+    version: String,
+    archive_sha256: String,
+    parts: Vec<Part>,
+}
+
+#[derive(Deserialize)]
+struct Part {
+    url: String,
+    size: u64,
+    sha256: String,
+}
+
+pub fn rvc_installed(root: &Path) -> bool {
+    root.join("vendor/vcclient-2.1.4-alpha/dist/main/mnr_vcclient_server.exe")
+        .is_file()
+}
+
+pub fn core_installed(root: &Path) -> bool {
+    root.join("vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/bin/NvAudioEffects.dll")
+        .is_file()
+        && root
+            .join("vendor/tag-2.0.0.1903-demo/apidll/x64/tagapi.dll")
+            .is_file()
+        && root.join("bin/mic_tag_host.exe").is_file()
+}
+
+pub fn progress() -> Option<u8> {
+    let total = TOTAL.load(Ordering::Relaxed);
+    (total > 0).then(|| ((DONE.load(Ordering::Relaxed).saturating_mul(100) / total).min(100)) as u8)
+}
+
+pub fn install_rvc(components: &Path) -> Result<String, String> {
+    install(
+        RVC_MANIFEST_URL,
+        components,
+        "vendor/vcclient-2.1.4-alpha/dist/main/mnr_vcclient_server.exe",
+        &["vendor/vcclient-2.1.4-alpha"],
+    )
+}
+
+pub fn install_core(components: &Path) -> Result<String, String> {
+    install(
+        CORE_MANIFEST_URL,
+        components,
+        "vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/bin/NvAudioEffects.dll",
+        &[
+            "vendor/nvidia-afx-3.0.0",
+            "vendor/tag-2.0.0.1903-demo",
+            "bin/mic_tag_host.exe",
+        ],
+    )
+}
+
+fn install(
+    manifest_url: &str,
+    components: &Path,
+    expected: &str,
+    entries: &[&str],
+) -> Result<String, String> {
+    DONE.store(0, Ordering::Relaxed);
+    let mut response = ureq::get(manifest_url).call().map_err(|e| e.to_string())?;
+    let envelope: Envelope = serde_json::from_str(
+        &response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    verify(&envelope)?;
+    let manifest: Manifest = serde_json::from_str(&envelope.payload).map_err(|e| e.to_string())?;
+    if manifest.parts.is_empty() {
+        return Err("Манифест RVC не содержит частей архива".into());
+    }
+    TOTAL.store(
+        manifest.parts.iter().map(|p| p.size).sum(),
+        Ordering::Relaxed,
+    );
+    let work = components.join(".download-rvc");
+    let stage = components.join(".stage-rvc");
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    if stage.exists() {
+        std::fs::remove_dir_all(&stage).map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+    let archive = work.join("rvc-runtime.tar.zst");
+    let _ = std::fs::remove_file(&archive);
+    for (index, part) in manifest.parts.iter().enumerate() {
+        let path = work.join(format!("part-{index:03}"));
+        download(part, &path)?;
+        append(&path, &archive)?;
+    }
+    check_hash(&archive, &manifest.archive_sha256)?;
+    let status = std::process::Command::new("tar.exe")
+        .args(["-xf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(&stage)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("Не удалось распаковать RVC runtime".into());
+    }
+    if !stage.join(expected).is_file() {
+        return Err("Архив компонента не содержит ожидаемый файл".into());
+    }
+    for entry in entries {
+        let source = stage.join(entry);
+        let destination = components.join(entry);
+        if destination.is_dir() {
+            std::fs::remove_dir_all(&destination).map_err(|e| e.to_string())?;
+        } else if destination.exists() {
+            std::fs::remove_file(&destination).map_err(|e| e.to_string())?;
+        }
+        std::fs::create_dir_all(destination.parent().unwrap()).map_err(|e| e.to_string())?;
+        std::fs::rename(source, destination).map_err(|e| e.to_string())?;
+    }
+    if entries.iter().any(|entry| entry.contains("vcclient")) {
+        std::fs::create_dir_all(components.join("vendor/vcclient-2.1.4-alpha/dist/main/model_dir"))
+            .map_err(|e| e.to_string())?;
+    }
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_dir_all(&stage);
+    Ok(manifest.version)
+}
+
+fn verify(envelope: &Envelope) -> Result<(), String> {
+    let key: [u8; 32] = STANDARD
+        .decode(PUBLIC_KEY)
+        .map_err(|e| e.to_string())?
+        .try_into()
+        .map_err(|_| "Неверный публичный ключ")?;
+    verify_with_key(envelope, key)
+}
+
+fn verify_with_key(envelope: &Envelope, key: [u8; 32]) -> Result<(), String> {
+    let signature: [u8; 64] = STANDARD
+        .decode(&envelope.signature)
+        .map_err(|e| e.to_string())?
+        .try_into()
+        .map_err(|_| "Неверная подпись манифеста")?;
+    VerifyingKey::from_bytes(&key)
+        .map_err(|e| e.to_string())?
+        .verify(
+            envelope.payload.as_bytes(),
+            &Signature::from_bytes(&signature),
+        )
+        .map_err(|_| "Подпись RVC-манифеста не прошла проверку".into())
+}
+
+fn download(part: &Part, path: &Path) -> Result<(), String> {
+    let response = ureq::get(&part.url).call().map_err(|e| e.to_string())?;
+    let mut reader = response.into_parts().1.into_reader();
+    let mut output = File::create(path).map_err(|e| e.to_string())?;
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|e| e.to_string())?;
+        DONE.fetch_add(count as u64, Ordering::Relaxed);
+    }
+    drop(output);
+    if path.metadata().map_err(|e| e.to_string())?.len() != part.size {
+        return Err("Размер загруженной части RVC не совпадает с манифестом".into());
+    }
+    check_hash(path, &part.sha256)
+}
+
+fn append(part: &Path, archive: &Path) -> Result<(), String> {
+    let mut input = File::open(part).map_err(|e| e.to_string())?;
+    let mut output = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(archive)
+        .map_err(|e| e.to_string())?;
+    std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn check_hash(path: &Path, expected: &str) -> Result<(), String> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut hash = Sha256::new();
+    std::io::copy(&mut file, &mut hash).map_err(|e| e.to_string())?;
+    let actual = hex::encode(hash.finalize());
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(format!("SHA-256 не совпадает: {}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn component_manifest_signature_rejects_tampering() {
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let payload = r#"{"version":"test"}"#;
+        let envelope = Envelope {
+            payload: payload.into(),
+            signature: STANDARD.encode(signing.sign(payload.as_bytes()).to_bytes()),
+        };
+        assert!(verify_with_key(&envelope, signing.verifying_key().to_bytes()).is_ok());
+        let tampered = Envelope {
+            payload: "{}".into(),
+            ..envelope
+        };
+        assert!(verify_with_key(&tampered, signing.verifying_key().to_bytes()).is_err());
+    }
+}

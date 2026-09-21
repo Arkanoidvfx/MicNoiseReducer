@@ -1,0 +1,5 @@
+65225c75a6b10a141345ed3dbb97980d910ae495b202580f3366d9eabfa2f04d  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/include/nvAFXDenoiser.h
+03f9c2339adc12720f73ef34b32fea76e52e41e68c79fe0d36c6242ea24f0fb8  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/bin/nvafxdenoiser.dll
+c627cf52aaee7a1eee207ab157017c0f016e95003389c61dbbb9a1ae0305b481  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models/ampere/denoiser_48k.trtpkg
+7d868d60e0f0859a274dc8101afc3f01c73fe3f32445bdfa71956a6e37cb80a5  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models/ampere/denoiser_v2_48k.trtpkg
+3074b5b3cd2abcde86b118a4a20055a0c1bad15564042734fb7a08c58e9c6364  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/license/NVIDIA-Models-Community-License-2025-04-15.pdf

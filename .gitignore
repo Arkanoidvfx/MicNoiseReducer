@@ -1,0 +1,14 @@
+vendor/
+build/
+results/
+.tmp/
+bin/
+settings.ini
+.cache/
+settings.pre-rust.ini
+settings.ini.tmp
+__pycache__/
+.codex-delegate-enabled
+ui/target/
+publish/
+Releases/

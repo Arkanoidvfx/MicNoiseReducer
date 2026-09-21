@@ -1,0 +1,115 @@
+use hmac::{Hmac, Mac};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::{
+    path::Path,
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use uuid::Uuid;
+
+const ENDPOINT: &str = "https://moment-telemetry.arkanoidvfx.workers.dev/v1/ingest";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+static SESSION: OnceLock<(Uuid, u64)> = OnceLock::new();
+
+fn secret() -> &'static str {
+    option_env!("MNR_TELEMETRY_SECRET").unwrap_or("")
+}
+
+pub fn record(data: &Path, name: &str, details: serde_json::Value) {
+    if secret().is_empty() || std::env::var_os("MNR_DISABLE_TELEMETRY").is_some() {
+        return;
+    }
+    let data = data.to_path_buf();
+    let name = name.to_owned();
+    std::thread::spawn(move || {
+        let _ = send(&data, &name, details);
+    });
+}
+
+pub fn record_blocking(data: &Path, name: &str, details: serde_json::Value) {
+    if !secret().is_empty() && std::env::var_os("MNR_DISABLE_TELEMETRY").is_none() {
+        let _ = send(data, name, details);
+    }
+}
+
+fn send(data: &Path, name: &str, details: serde_json::Value) -> Result<(), String> {
+    let install_path = data.join("install-id.txt");
+    let install_id = std::fs::read_to_string(&install_path)
+        .ok()
+        .and_then(|s| Uuid::parse_str(s.trim()).ok())
+        .unwrap_or_else(|| {
+            let id = Uuid::new_v4();
+            let _ = std::fs::write(&install_path, id.to_string());
+            id
+        });
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let (session, started_at) = SESSION.get_or_init(|| (Uuid::new_v4(), timestamp));
+    let iso = format!("{}Z", chrono_free_utc(timestamp));
+    let started_iso = format!("{}Z", chrono_free_utc(*started_at));
+    let body = serde_json::to_vec(&json!({
+        "app_id": "mic_noise_reducer",
+        "session_id": session.to_string(),
+        "session_started_at": started_iso,
+        "app_version": VERSION,
+        "events": [{"ts": iso, "tag": "app-lifecycle", "name": name, "data": details}]
+    }))
+    .map_err(|e| e.to_string())?;
+    let body_hash = hex::encode(Sha256::digest(&body));
+    let signed = format!("{install_id}|{timestamp}|2|{body_hash}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret().as_bytes()).map_err(|e| e.to_string())?;
+    mac.update(signed.as_bytes());
+    let hmac = hex::encode(mac.finalize().into_bytes());
+    ureq::post(ENDPOINT)
+        .header("Content-Type", "application/json")
+        .header("X-App-Id", "mic_noise_reducer")
+        .header("X-Install-Id", &install_id.to_string())
+        .header("X-App-Version", VERSION)
+        .header("X-Schema-Version", "2")
+        .header("X-Timestamp", &timestamp.to_string())
+        .header("X-Hmac", &hmac)
+        .send(&body)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// UTC formatting without another time dependency; telemetry accepts ISO-8601.
+fn chrono_free_utc(seconds: u64) -> String {
+    const SECONDS_PER_DAY: u64 = 86_400;
+    let days = seconds / SECONDS_PER_DAY;
+    let rem = seconds % SECONDS_PER_DAY;
+    let (year, month, day) = civil_from_days(days as i64);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+        rem / 3600,
+        rem / 60 % 60,
+        rem % 60
+    )
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unix_epoch_formats_as_utc() {
+        assert_eq!(chrono_free_utc(0), "1970-01-01T00:00:00");
+        assert_eq!(chrono_free_utc(1_767_225_600), "2026-01-01T00:00:00");
+    }
+}

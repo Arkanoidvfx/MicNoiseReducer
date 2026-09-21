@@ -1,0 +1,43 @@
+#include "bridge.h"
+#include "audio.hpp"
+#include <iostream>
+#include <stdexcept>
+#include <cstring>
+static void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
+int main(){try{
+    mic::checkRvcIdle();
+    static_assert(sizeof(MnrSnapshot)==64);
+    char error[4096]{};Mnr* p=mnr_create(error,sizeof(error));require(p!=nullptr,error);
+    struct Guard{Mnr* p;~Guard(){mnr_destroy(p);}}guard{p};
+    MnrSnapshot s{};mnr_snapshot(p,&s,error,sizeof(error),1);require(s.state==0,"Initial state");
+    require(mnr_monitor_state(p,error,sizeof(error))==0,"Monitor must start off");
+    require(!mnr_monitor(p,1,error,sizeof(error)),"Stopped engine must not enable monitoring");
+    require(mnr_monitor(p,0,error,sizeof(error))==1,"Monitor off must be idempotent");
+    for(int mode:{2,3,4}){
+        require(!mnr_monitor(p,mode,error,sizeof(error)),"Stopped engine enabled effect preview");
+        require(strstr(error,"Start processing before listening")!=nullptr,"Effect monitor mode rejected at ABI");
+    }
+    require(!mnr_monitor(p,5,error,sizeof(error)) && strstr(error,"Invalid monitor mode"),"Invalid monitor mask accepted");
+    require(mnr_headphone_state(p,error,sizeof(error))==0,"Headphones must start off");
+    require(mnr_headphones(p,0,"",0,0,error,sizeof(error))==1,"Headphone stop must be idempotent");
+    require(mnr_headphones(p,2,"",0,0,error,sizeof(error))==0,"Invalid headphone mode accepted");
+    require(mnr_headphones(p,1,"",40000,0,error,sizeof(error))==0,"Invalid headphone string accepted");
+    mnr_controls(p,0.5f,3,-5,1,1,0.7f,1.5f,1,0.5f,1);mnr_snapshot(p,&s,error,sizeof(error),1);require(s.muted==1&&s.rvc_state==0,"Controls");
+    const auto epoch=s.epoch;
+    uint32_t keys[]={119,120,121,122,123,124,125,126,127,128,129,130};mnr_bindings(p,keys,12);mnr_snapshot(p,&s,error,sizeof(error),1);require(s.epoch!=epoch,"Bindings must reset holds");
+    const auto bindingEpoch=s.epoch;keys[2]=119;mnr_bindings(p,keys,12);mnr_snapshot(p,&s,error,sizeof(error),1);require(s.epoch==bindingEpoch,"Duplicate phrase binding accepted");
+    keys[2]=121;keys[9]=119;mnr_bindings(p,keys,12);mnr_snapshot(p,&s,error,sizeof(error),1);require(s.epoch==bindingEpoch,"Duplicate reverse binding accepted");
+    uint32_t extended[]={119,120,121,122,123,124,125,126,127,128,129,130,131};
+    mnr_bindings(p,extended,13);mnr_snapshot(p,&s,error,sizeof(error),1);
+    require(s.epoch!=bindingEpoch,"Thirteenth noise binding rejected");
+    const auto noiseEpoch=s.epoch;extended[12]=119;
+    mnr_bindings(p,extended,13);mnr_snapshot(p,&s,error,sizeof(error),1);
+    require(s.epoch==noiseEpoch,"Duplicate noise binding accepted");
+    mnr_alternate_intensity(p,0.15f);
+    require(!mnr_start(p,"",0,"TAG",3,2,40,5,-1,1,error,sizeof(error)),"Invalid input accepted");
+    mnr_snapshot(p,&s,error,sizeof(error),1);require(s.state==5&&strstr(error,"Invalid audio settings"),"Error lost at ABI boundary");
+    mnr_stop(p);mnr_snapshot(p,&s,error,sizeof(error),1);require(s.state==0&&s.muted==1,"Stop lost mute");
+    require(mnr_start(p,"abc",40000,"TAG",3,2,40,5,-1,1,error,sizeof(error))==0,"Invalid length accepted");
+    std::cout<<"BRIDGE CHECK PASSED: ABI, errors, controls, mute, epochs\n";
+    return 0;
+}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

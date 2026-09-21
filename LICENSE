@@ -1,0 +1,12 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+
+MicNoiseReducer is free software: you may redistribute and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 2 of the License, or (at your option) any later
+version.
+
+The canonical license text is available at:
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+Third-party components retain their own licenses. They are not relicensed by
+this file and are not stored in this source repository.

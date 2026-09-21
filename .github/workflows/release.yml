@@ -1,0 +1,48 @@
+name: Release MicNoiseReducer
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version such as 0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: [self-hosted, Windows, X64]
+    steps:
+      - uses: actions/checkout@v4
+        with: { clean: false }
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $value = "${{ inputs.version }}"
+          if (-not $value) { $value = "${{ github.ref_name }}".TrimStart('v') }
+          if ($value -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid semver' }
+          "value=$value" >> $env:GITHUB_OUTPUT
+      - name: Restore private build inputs
+        shell: pwsh
+        run: |
+          $source = 'D:\Projects\Audio\MicNoiseReducer\vendor'
+          if (-not (Test-Path vendor)) { cmd /c mklink /J vendor $source }
+      - name: Build and verify
+        shell: pwsh
+        env:
+          MNR_TELEMETRY_SECRET: ${{ secrets.MNR_TELEMETRY_SECRET }}
+        run: |
+          .\verify.ps1
+          .\scripts\package-release.ps1 -Version '${{ steps.version.outputs.value }}' -Stage
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'v${{ steps.version.outputs.value }}'
+          $assets = Get-ChildItem Releases -File | ForEach-Object FullName
+          gh release create $tag @assets --title "MicNoiseReducer $tag" --notes-file release\notes.md
