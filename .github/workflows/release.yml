@@ -14,10 +14,11 @@ permissions:
 
 jobs:
   release:
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with: { clean: false }
+      - uses: dtolnay/rust-toolchain@stable
       - name: Resolve version
         id: version
         shell: pwsh
@@ -26,11 +27,15 @@ jobs:
           if (-not $value) { $value = "${{ github.ref_name }}".TrimStart('v') }
           if ($value -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid semver' }
           "value=$value" >> $env:GITHUB_OUTPUT
-      - name: Restore private build inputs
+      - name: Restore runtime build inputs
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $source = 'D:\Projects\Audio\MicNoiseReducer\vendor'
-          if (-not (Test-Path vendor)) { cmd /c mklink /J vendor $source }
+          New-Item -ItemType Directory -Force .tmp\runtime | Out-Null
+          gh release download runtime-core-v1 --pattern core-runtime-1.part000 --dir .tmp\runtime
+          tar.exe -xf .tmp\runtime\core-runtime-1.part000 -C .
+          .\build.ps1 -NativeOnly
       - name: Build and verify
         shell: pwsh
         env:
@@ -45,4 +50,9 @@ jobs:
         run: |
           $tag = 'v${{ steps.version.outputs.value }}'
           $assets = Get-ChildItem Releases -File | ForEach-Object FullName
-          gh release create $tag @assets --title "MicNoiseReducer $tag" --notes-file release\notes.md
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --title "MicNoiseReducer $tag" --notes-file release\notes.md
+          }

@@ -33,7 +33,7 @@ UI использует Iced daemon и tiny-skia; wgpu / WebView не включ
 
 Основной NVIDIA/TAG runtime устанавливается отдельно при первом запуске. RVC runtime загружается только при первом включении Voice Changer. Модели голоса пользователя (`.pth`, `.index`, `.onnx`, `params.json`) не входят в релизы и должны импортироваться отдельно. Манифесты компонентов подписаны Ed25519, каждый архив и его части проверяются по SHA-256. Настройки и модели хранятся в `%LOCALAPPDATA%\MicNoiseReducer`, поэтому обновление приложения их не заменяет.
 
-Сборка релиза: `scripts\package-release.ps1 -Version 0.1.0 -Stage`; отдельные компоненты: `scripts\package-components.ps1`. Workflow `release.yml` публикует приложение, `runtime.yml` — неизменяемые подписанные runtime-релизы. Секреты сборки: `MNR_TELEMETRY_SECRET` и `COMPONENT_SIGNING_KEY`.
+Сборка релиза: `scripts\package-release.ps1 -Version 0.1.0 -Stage`; отдельные компоненты: `scripts\package-components.ps1`. Workflow `release.yml` на GitHub-hosted Windows скачивает опубликованный core runtime, проверяет проект и выпускает приложение. Редкие runtime-релизы собираются локально из vendor-папок, подписываются `COMPONENT_SIGNING_KEY` и публикуются через `gh release create`; эти большие сторонние входы намеренно не лежат в Git. Секрет приложения: `MNR_TELEMETRY_SECRET`.
 
 ## Сборка и запуск
 
