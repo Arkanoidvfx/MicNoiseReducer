@@ -7,7 +7,7 @@ Read only the section needed. Commands assume the existing configured checkout a
 Use absolute paths so shell cwd cannot redirect the work:
 
 ```powershell
-$project = 'D:\Projects\Audio\MicNoiseReducer'
+$project = 'D:\Projects\Audio\MicNoize'
 $cmake = 'C:\Program Files\CMake\bin\cmake.exe'
 $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
 $env:CARGO_TARGET_DIR = Join-Path $project 'build\rust'
@@ -26,9 +26,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Rust build failed' }
 ```
 
-Rust links `build/native/Release/mic_engine.lib` and `rubberband.lib`; `ui/build.rs` watches them. Cargo output is `build/rust/release/mic-ui.exe`; the installed UI is `bin/MicNoiseReducer-rust.exe`. A successful Cargo build alone does **not** update the installed app.
+Rust links `build/native/Release/mic_engine.lib` and `rubberband.lib`; `ui/build.rs` watches them. Cargo output is `build/rust/release/micnoize.exe`; the dev UI is `bin/MicNoize.exe`. A successful Cargo build alone does **not** update the dev app.
 
-`build.ps1` is the full dependency/configure/build/install path. It includes `mic_tag_host` and copies the UI executable: either may be locked by a running process. Do not use it as the default incremental command or kill the host to make it pass. For a fresh checkout use the README prerequisites/full build instructions. Keep the frozen `bin/MicNoiseReducer-legacy.exe` intact.
+`build.ps1` is the full dependency/configure/build/install path. It includes `mic_tag_host` and copies the UI executable: either may be locked by a running process. Do not use it as the default incremental command or kill the host to make it pass. For a fresh checkout use the README prerequisites/full build instructions.
 
 ## Focused checks
 
@@ -50,10 +50,10 @@ Controller tests use in-memory settings and skip the native shell, device discov
 After build and selected checks pass, stop the matching installed UI and wait for its exit before copying. This resets processing; the relaunched UI starts the saved route itself after device discovery (there is no Start button). Do not restart for documentation-only changes.
 
 ```powershell
-$installed = Join-Path $project 'bin\MicNoiseReducer-rust.exe'
-$built = Join-Path $project 'build\rust\release\mic-ui.exe'
+$installed = Join-Path $project 'bin\MicNoize.exe'
+$built = Join-Path $project 'build\rust\release\micnoize.exe'
 if (-not (Test-Path -LiteralPath $built)) { throw 'Built UI missing' }
-Get-Process -Name 'MicNoiseReducer-rust' -ErrorAction SilentlyContinue |
+Get-Process -Name 'MicNoize' -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -eq $installed } |
     ForEach-Object { Stop-Process -Id $_.Id; $_.WaitForExit() }
 Copy-Item -LiteralPath $built -Destination $installed -ErrorAction Stop
@@ -85,7 +85,7 @@ Headphone transport check: `mic_check --headphones-check OUTPUT_INDEX 0` for dry
 
 ## Publishing and machine layout
 
-Two remotes with **different histories**: `origin` (private `Arkanoidvfx/MicNoise`) carries the full history on `main`; `release` (public `Arkanoidvfx/MicNoiseReducer`) has a squashed root ("Initial public release") and holds the `v*` tags, GitHub Releases and the Actions workflow. Never `git push release main` and never force-push either remote. To publish commits from `main`:
+Two remotes with **different histories**: `origin` (private `Arkanoidvfx/MicNoize-dev`) carries the full history on `main`; `release` (public `Arkanoidvfx/MicNoize`) has a squashed root ("Initial public release") and holds the `v*` tags, GitHub Releases and the Actions workflow. Never `git push release main` and never force-push either remote. To publish commits from `main`:
 
 ```powershell
 git worktree add "$project\.tmp\public" release/main
@@ -96,6 +96,6 @@ git worktree remove "$project\.tmp\public"
 
 A release is then `workflow_dispatch` of `release.yml` (or pushing a `vX.Y.Z` tag) on the public repo; `release/version.txt` and `ui/Cargo.toml` must already carry that version. Runtime components (`runtime-core-*`, `runtime-rvc-*`) are separate GitHub Releases without a Velopack feed; the updater scans the 10 newest releases and skips them, so keep app releases within that window.
 
-Installed layout: Velopack puts the app in `%LOCALAPPDATA%\MicNoiseReducer\current` and the same folder root holds `settings.ini`, `install-id.txt` and `Components\` (downloaded runtime). Both `Paths::runtime_root()` and native `projectRoot()` prefer `%LOCALAPPDATA%\MicNoiseReducer\Components` whenever `Componentsendor` exists, so **the dev build from `bin` silently switches to it too** (no repository RVC models there). Remove that folder when returning to development from `bin`.
+Velopack puts program files in `%LOCALAPPDATA%\MicNoize\current`; `settings.ini`, `install-id.txt` and downloaded `Components\` live in `%APPDATA%\Mic Noize`, so uninstalling the app does not remove user data. A dev executable in `bin` always uses the repository root when `vendor\nvidia-afx-3.0.0` is present; installed builds use the persistent Components directory.
 
-Claude Desktop and Codex run their terminals inside MSIX packages with AppData/HKCU write virtualization: an application launched from those terminals writes its settings and runtime to `%LOCALAPPDATA%\Packages\<agent>\LocalCache\Local\MicNoiseReducer`, not to the real folder, and Setup.exe run from them installs into that sandbox. Reads from the terminal still see the real files. Launch `Setup.exe`, `Run.bat` and anything that must persist user data from Explorer (or ask the user), and verify results by reading paths, not by launching.
+Claude Desktop and Codex run their terminals inside MSIX packages with AppData/HKCU write virtualization. Launch `Setup.exe`, `Run.bat` and anything that must persist `%APPDATA%\Mic Noize` data or HKCU state from Explorer (or ask the user), and verify results by reading paths, not by launching.

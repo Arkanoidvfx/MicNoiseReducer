@@ -199,16 +199,15 @@ static bool desktopAvailable() {
 }
 extern "C" int32_t mnr_shell_start(Mnr* p,char* error,uint32_t cap) {
     try {
-        p->instance=CreateMutexW(nullptr,FALSE,L"Local\\MicNoiseReducer.SingleInstance");
+        p->instance=CreateMutexW(nullptr,FALSE,L"Local\\MicNoize.SingleInstance");
         if(!p->instance) throw std::runtime_error("Cannot create instance mutex");
         if(GetLastError()==ERROR_ALREADY_EXISTS) {
-            if(auto w=FindWindowW(L"MicNoiseReducer.RustShell",nullptr)) {AllowSetForegroundWindow(ASFW_ANY);PostMessageW(w,WM_APP+2,0,0);}
-            else if(auto old=FindWindowW(L"MicNoiseReducer.Window",nullptr)) {ShowWindow(old,SW_SHOW);SetForegroundWindow(old);}
+            if(auto w=FindWindowW(L"MicNoize.Shell",nullptr)) {AllowSetForegroundWindow(ASFW_ANY);PostMessageW(w,WM_APP+2,0,0);}
             return 0;
         }
         p->shell=std::jthread([p](std::stop_token stop) {
             try {mic::ensureTagHost();} catch(const std::exception& e) {p->engine.reportError(e.what());}
-            WNDCLASSW cls{};cls.lpfnWndProc=shellProc;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"MicNoiseReducer.RustShell";
+            WNDCLASSW cls{};cls.lpfnWndProc=shellProc;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"MicNoize.Shell";
             RegisterClassW(&cls);
             HWND w=CreateWindowExW(0,cls.lpszClassName,L"Mic Noize background",0,0,0,0,0,nullptr,nullptr,cls.hInstance,p);
             if(!w) {p->events.fetch_or(16);return;}

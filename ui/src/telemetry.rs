@@ -51,7 +51,7 @@ fn send(data: &Path, name: &str, details: serde_json::Value) -> Result<(), Strin
     let iso = format!("{}Z", chrono_free_utc(timestamp));
     let started_iso = format!("{}Z", chrono_free_utc(*started_at));
     let body = serde_json::to_vec(&json!({
-        "app_id": "mic_noise_reducer",
+        "app_id": "mic_noize",
         "session_id": session.to_string(),
         "session_started_at": started_iso,
         "app_version": VERSION,
@@ -65,7 +65,7 @@ fn send(data: &Path, name: &str, details: serde_json::Value) -> Result<(), Strin
     let hmac = hex::encode(mac.finalize().into_bytes());
     ureq::post(ENDPOINT)
         .header("Content-Type", "application/json")
-        .header("X-App-Id", "mic_noise_reducer")
+        .header("X-App-Id", "mic_noize")
         .header("X-Install-Id", &install_id.to_string())
         .header("X-App-Version", VERSION)
         .header("X-Schema-Version", "2")

@@ -4,7 +4,7 @@ Windows-only Rust/Iced UI + C++ audio engine. Open this folder as the project ro
 
 ## Start with the task
 
-- For implementation, debugging, review, build or audio questions, read the local [micnoisereducer skill](.agents/skills/micnoisereducer/SKILL.md). If skill discovery misses it, open that file directly.
+- For implementation, debugging, review, build or audio questions, read the local [micnoize skill](.agents/skills/micnoize/SKILL.md). If skill discovery misses it, open that file directly.
 - Read only the relevant source files and referenced section. Do not ingest previous chats, logs, `CHANGELOG.md`, `vendor`, `.cache`, `build` or `results` to start a small task.
 - Treat source as implementation truth; [README.md](README.md) documents current behavior, [CHANGELOG.md](CHANGELOG.md) holds dated changes, measurements and verification history. Historical test logs are not proof that today's changes pass.
 - Keep changes within the request. Use existing checks that cover the affected path; broaden only for a concrete risk or failure. Documentation-only changes need no application build or restart.

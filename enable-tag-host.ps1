@@ -1,7 +1,9 @@
 param([switch]$Disable)
 $ErrorActionPreference = 'Stop'
 $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$name = 'MicNoiseReducer.TagHost'
+$name = 'MicNoize.TagHost'
+$legacyName = 'MicNoiseReducer.TagHost' # Legacy name, migration only.
+Remove-ItemProperty -LiteralPath $key -Name $legacyName -ErrorAction SilentlyContinue
 if ($Disable) {
     Remove-ItemProperty -LiteralPath $key -Name $name -ErrorAction SilentlyContinue
     Write-Host 'TAG host autostart disabled. The current host keeps running until sign-out.'

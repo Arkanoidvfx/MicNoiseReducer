@@ -9,8 +9,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-const CORE_MANIFEST_URL: &str = "https://github.com/Arkanoidvfx/MicNoiseReducer/releases/download/runtime-core-v1/components.json";
-const RVC_MANIFEST_URL: &str = "https://github.com/Arkanoidvfx/MicNoiseReducer/releases/download/runtime-rvc-v2.1.4/components.json";
+const CORE_MANIFEST_URL: &str =
+    "https://github.com/Arkanoidvfx/MicNoize/releases/download/runtime-core-v2/components.json";
+const RVC_MANIFEST_URL: &str =
+    "https://github.com/Arkanoidvfx/MicNoize/releases/download/runtime-rvc-v2.1.4/components.json";
 const PUBLIC_KEY: &str = "plpoEiomh7k+cZtpxNJX9Zq2RNv0ugQruiH4lZGazHg=";
 static DONE: AtomicU64 = AtomicU64::new(0);
 static TOTAL: AtomicU64 = AtomicU64::new(0);

@@ -15,7 +15,7 @@ try {
     & $cmake -S $source -B $build -G 'Visual Studio 17 2022' -A x64
     if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
     if ($Samples) { & $cmake --build $build --config Release }
-    else { & $cmake --build $build --config Release --target MicNoiseReducer mic_check mic_tag mic_tag_host effects_check bridge_check }
+    else { & $cmake --build $build --config Release --target mic_check mic_tag mic_tag_host effects_check bridge_check }
     if ($LASTEXITCODE -ne 0) { throw 'C++ build failed.' }
 } finally {
     $env:AFX_SDK_ROOT = $previousSdk
@@ -34,8 +34,8 @@ if (-not $Samples -and -not $NativeOnly) {
         New-Item -ItemType Directory -Force $env:CARGO_HOME,$env:TEMP | Out-Null
         & $cargo build --release --locked --manifest-path (Join-Path $PSScriptRoot 'ui\Cargo.toml')
         if ($LASTEXITCODE -ne 0) { throw 'Rust build failed.' }
-        $destination = Join-Path $PSScriptRoot 'bin\MicNoiseReducer-rust.exe'
-        Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release\mic-ui.exe') -Destination $destination
+        $destination = Join-Path $PSScriptRoot 'bin\MicNoize.exe'
+        Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release\micnoize.exe') -Destination $destination
         Write-Host "Built: $destination"
     } finally {
         $env:CARGO_TARGET_DIR=$previousTarget; $env:CARGO_HOME=$previousCache; $env:TEMP=$previousTemp; $env:TMP=$previousTmp

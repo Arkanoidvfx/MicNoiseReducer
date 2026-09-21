@@ -1,6 +1,6 @@
 use velopack::{UpdateCheck, UpdateManager, sources::GithubSource};
 
-const REPOSITORY: &str = "https://github.com/Arkanoidvfx/MicNoiseReducer";
+const REPOSITORY: &str = "https://github.com/Arkanoidvfx/MicNoize";
 
 #[derive(Clone, Debug)]
 pub enum Status {

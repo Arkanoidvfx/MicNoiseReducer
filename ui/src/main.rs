@@ -19,7 +19,8 @@ use std::{
 };
 
 const TAG_HOST_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-const TAG_HOST_RUN_NAME: &str = "MicNoiseReducer.TagHost";
+const TAG_HOST_RUN_NAME: &str = "MicNoize.TagHost";
+const LEGACY_TAG_HOST_RUN_NAME: &str = "MicNoiseReducer.TagHost"; // Legacy name, migration only.
 const EXIT_EVENT: u32 = 2;
 const RESTART_EVENT: u32 = 4;
 /// Mirrors `mic::rvcSlack` (src/audio.hpp): RVC output is a fixed delay line of chunk + slack.
@@ -105,14 +106,30 @@ fn restart_requested(events: u32) -> bool {
 }
 
 fn tag_host_autostart() -> bool {
-    Command::new("reg")
-        .args(["query", TAG_HOST_RUN_KEY, "/v", TAG_HOST_RUN_NAME])
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW: a GUI parent would otherwise flash a console.
-        .output()
-        .is_ok_and(|output| output.status.success())
+    [TAG_HOST_RUN_NAME, LEGACY_TAG_HOST_RUN_NAME]
+        .iter()
+        .any(|name| {
+            Command::new("reg")
+                .args(["query", TAG_HOST_RUN_KEY, "/v", name])
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW: a GUI parent would otherwise flash a console.
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })
 }
 
 fn set_tag_host_autostart(enabled: bool) -> Result<(), String> {
+    Command::new("reg")
+        .args([
+            "delete",
+            TAG_HOST_RUN_KEY,
+            "/v",
+            LEGACY_TAG_HOST_RUN_NAME,
+            "/f",
+        ])
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|e| e.to_string())?;
+    // A missing legacy value is expected; it exists only during migration.
     let mut command = Command::new("reg");
     command.creation_flags(0x08000000);
     if enabled {
@@ -646,7 +663,7 @@ impl App {
                 d.id != "TAG"
                     && ![
                         "thin audio",
-                        "micnoisereducer",
+                        "mic noize",
                         "cable",
                         "voicemeeter",
                         "broadcast",

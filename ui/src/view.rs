@@ -912,7 +912,7 @@ impl App {
             row![bold("Высота", 14, INK), Space::new().width(Length::Fill), label(format!("{:+} полутонов", self.headphone_pitch), 13, INK)],
             frame(slider(-12.0..=12.0, self.headphone_pitch as f32, Msg::HeadphonePitch).step(1.0_f32).style(slider_style), self.focus == focus::headphones::PITCH),
             line(),
-            label("Выход приложения в микшере Windows → MicNoiseReducer Headphones. После остановки верните физические наушники.", 11, DIM),
+            label("Выход приложения в микшере Windows → Mic Noize Headphones. После остановки верните физические наушники.", 11, DIM),
             label("Режим NVIDIA меняется после остановки. Музыка и атмосфера тоже могут подавляться.", 11, DIM),
         ].spacing(12);
         if !self.headphone_message.is_empty() {
