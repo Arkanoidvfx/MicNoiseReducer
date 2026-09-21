@@ -57,7 +57,8 @@ Get-Process -Name 'MicNoiseReducer-rust' -ErrorAction SilentlyContinue |
     Where-Object { $_.Path -eq $installed } |
     ForEach-Object { Stop-Process -Id $_.Id; $_.WaitForExit() }
 Copy-Item -LiteralPath $built -Destination $installed -ErrorAction Stop
-Start-Process -FilePath $installed -WorkingDirectory $project
+# Relaunch from Explorer / ask the user: a launch from an agent terminal is MSIX-virtualized (see the last section).
+explorer.exe $installed
 ```
 
 Before stopping, preserve any pending user edits; prefer the application's Exit when appropriate. Never terminate processes by a broad audio/Discord/NVIDIA name match. Never touch `mic_tag_host` during this sequence. A visible window is intentional here because this is the user's interactive UI. The current controller automatically starts a saved valid audio route after device discovery; check VRAM before launching.
@@ -81,3 +82,20 @@ For hardware tasks build `mic_check`, then use `--list` to get **current** devic
 Do not record user speech to files without an explicit recording task. Synthetic DSP/ABI checks do not establish physical hotkey behavior, subjective voice quality, USB unplug recovery, lock/sleep/Explorer recovery or game FPS. FPS testing is deferred. Do not change Discord settings for a test.
 
 Headphone transport check: `mic_check --headphones-check OUTPUT_INDEX 0` for dry stereo or `1` for NVIDIA. Resolve a physical output with `--list`; this sends synthetic stereo with final output muted and records no microphone audio. NVIDIA mode requires the VRAM preflight. It needs the headphone-capable TAG host; never restart the host merely to run the check. The check executable uses an 8 MiB stack for its existing audio test objects.
+
+## Publishing and machine layout
+
+Two remotes with **different histories**: `origin` (private `Arkanoidvfx/MicNoise`) carries the full history on `main`; `release` (public `Arkanoidvfx/MicNoiseReducer`) has a squashed root ("Initial public release") and holds the `v*` tags, GitHub Releases and the Actions workflow. Never `git push release main` and never force-push either remote. To publish commits from `main`:
+
+```powershell
+git worktree add "$project\.tmp\public" release/main
+git -C "$project\.tmp\public" cherry-pick <sha>...
+git -C "$project\.tmp\public" push release HEAD:main
+git worktree remove "$project\.tmp\public"
+```
+
+A release is then `workflow_dispatch` of `release.yml` (or pushing a `vX.Y.Z` tag) on the public repo; `release/version.txt` and `ui/Cargo.toml` must already carry that version. Runtime components (`runtime-core-*`, `runtime-rvc-*`) are separate GitHub Releases without a Velopack feed; the updater scans the 10 newest releases and skips them, so keep app releases within that window.
+
+Installed layout: Velopack puts the app in `%LOCALAPPDATA%\MicNoiseReducer\current` and the same folder root holds `settings.ini`, `install-id.txt` and `Components\` (downloaded runtime). Both `Paths::runtime_root()` and native `projectRoot()` prefer `%LOCALAPPDATA%\MicNoiseReducer\Components` whenever `Componentsendor` exists, so **the dev build from `bin` silently switches to it too** (no repository RVC models there). Remove that folder when returning to development from `bin`.
+
+Claude Desktop and Codex run their terminals inside MSIX packages with AppData/HKCU write virtualization: an application launched from those terminals writes its settings and runtime to `%LOCALAPPDATA%\Packages\<agent>\LocalCache\Local\MicNoiseReducer`, not to the real folder, and Setup.exe run from them installs into that sandbox. Reads from the terminal still see the real files. Launch `Setup.exe`, `Run.bat` and anything that must persist user data from Explorer (or ask the user), and verify results by reading paths, not by launching.
