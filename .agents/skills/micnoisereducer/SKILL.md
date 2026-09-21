@@ -21,6 +21,7 @@ The user-facing product name is **Mic Noize**. Keep the internal `MicNoiseReduce
 | Hotkeys / stale state / tray / lifecycle | `src/hotkeys.hpp`, `src/bridge.cpp` | `src/bridge_check.cpp`, UI controller |
 | C ABI / control messages | `src/bridge.h`, `src/bridge.cpp`, `ui/src/engine.rs` | all native callers and Rust FFI; fixed-width fields/layout |
 | Persistent virtual microphone | `src/tag_host.cpp`, `src/tag_link.hpp`, `src/tag.hpp` | `enable-tag-host.ps1`; host owns the driver connection |
+| Downloaded core / RVC runtime | `ui/src/components.rs`, `scripts/package-components.ps1` | signed manifest, part size/SHA-256, archive layout and runtime-root lookup |
 | Build / dependencies / linkage | `CMakeLists.txt`, `ui/build.rs`, `build.ps1` | [workflow](references/workflow.md) |
 
 Search symbols in `src` and `ui/src` before reading entire large files. Trace producers, queues and consumers before changing audio semantics. `src/main.cpp` is the old Win32 interface, not the current UI.

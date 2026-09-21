@@ -41,7 +41,7 @@ pub fn rvc_installed(root: &Path) -> bool {
 }
 
 pub fn core_installed(root: &Path) -> bool {
-    root.join("vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/bin/NvAudioEffects.dll")
+    root.join("vendor/nvidia-afx-3.0.0/bin/NVAudioEffects.dll")
         .is_file()
         && root
             .join("vendor/tag-2.0.0.1903-demo/apidll/x64/tagapi.dll")
@@ -67,7 +67,7 @@ pub fn install_core(components: &Path) -> Result<String, String> {
     install(
         CORE_MANIFEST_URL,
         components,
-        "vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/bin/NvAudioEffects.dll",
+        "vendor/nvidia-afx-3.0.0/bin/NVAudioEffects.dll",
         &[
             "vendor/nvidia-afx-3.0.0",
             "vendor/tag-2.0.0.1903-demo",
@@ -173,6 +173,10 @@ fn verify_with_key(envelope: &Envelope, key: [u8; 32]) -> Result<(), String> {
 }
 
 fn download(part: &Part, path: &Path) -> Result<(), String> {
+    if cached_part_is_valid(part, path) {
+        DONE.fetch_add(part.size, Ordering::Relaxed);
+        return Ok(());
+    }
     let response = ureq::get(&part.url).call().map_err(|e| e.to_string())?;
     let mut reader = response.into_parts().1.into_reader();
     let mut output = File::create(path).map_err(|e| e.to_string())?;
@@ -192,6 +196,12 @@ fn download(part: &Part, path: &Path) -> Result<(), String> {
         return Err("Размер загруженной части RVC не совпадает с манифестом".into());
     }
     check_hash(path, &part.sha256)
+}
+
+fn cached_part_is_valid(part: &Part, path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.len() == part.size)
+        && check_hash(path, &part.sha256).is_ok()
 }
 
 fn append(part: &Path, archive: &Path) -> Result<(), String> {
@@ -236,5 +246,23 @@ mod tests {
             ..envelope
         };
         assert!(verify_with_key(&tampered, signing.verifying_key().to_bytes()).is_err());
+    }
+
+    #[test]
+    fn cached_component_part_requires_matching_hash() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../.tmp/component-cache-test")
+            .join(std::process::id().to_string());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"runtime").unwrap();
+        let part = Part {
+            url: String::new(),
+            size: 7,
+            sha256: "d92c6a81b2ff50096bcda80885427d1f59a25b5f483f7055523504925d16ab23".into(),
+        };
+        assert!(cached_part_is_valid(&part, &path));
+        std::fs::write(&path, b"corrupt").unwrap();
+        assert!(!cached_part_is_valid(&part, &path));
+        std::fs::remove_file(path).unwrap();
     }
 }
