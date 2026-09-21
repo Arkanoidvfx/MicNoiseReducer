@@ -8,6 +8,7 @@
 - Внутренние `MicNoiseReducer` package ID, имена бинарников, `%LOCALAPPDATA%`, URL репозитория, mutex/window-class и TAG endpoint сохранены для бесшовного обновления 0.1.0 → 0.1.1 без потери настроек и без создания второй виртуальной линии.
 - Проверены CTest 3/3, 16 Rust-тестов, строгий Clippy, release-сборка и Velopack-упаковка; Windows-метаданные EXE и `Setup.exe` показывают `ProductName=Mic Noize`, `FileDescription=Mic Noize`, версию 0.1.1. SHA-256 локального `Setup.exe`: `5F0586C7335CE1EBD1550F58221CE115759E2320C16879C49949F19A9FF828B4`. Повторная упаковка больше не пытается хэшировать собственный `checksums.sha256`. TAG-хост не перезапускался.
 - GitHub-hosted workflow полностью прошёл и опубликовал `v0.1.1`; скачанный обратно `Setup.exe` имеет имя/версию Mic Noize 0.1.1 и совпадает с SHA-256 `F0D33575C7F6FA881425652A091AF9F9D64A138A346B991131C73C3C81057119`. Velopack manifest содержит пакет `MicNoiseReducer` 0.1.1, сохраняя цепочку обновлений. Интерактивный переход установленной 0.1.0 → 0.1.1 ещё не проверялся.
+- QA-снимок настроек подтвердил `Mic Noize` в шапке и `Mic Noize 0.1.1` в версии (`results/mic-noize-0.1.1.png`). Локальный `bin\MicNoiseReducer-rust.exe` заменён проверенной сборкой 0.1.1 и запущен снова; `mic_tag_host.exe` сохранил прежний процесс и не перезапускался.
 
 ## 2026-09-21 — Setup, обновления и отделённые runtime-компоненты
 
