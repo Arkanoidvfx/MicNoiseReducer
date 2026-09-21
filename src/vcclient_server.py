@@ -102,7 +102,7 @@ certifi.where = lambda: str(INTERNAL / "certifi" / "cacert.pem")
 certifi.contents = lambda: Path(certifi.where()).read_text(encoding="ascii")
 sys.modules["certifi"] = certifi
 
-# VCClient's bundled PortAudio crashes on this machine. MicNoiseReducer owns all
+# VCClient's bundled PortAudio crashes on this machine. Mic Noize owns all
 # devices, so its REST-only sidecar intentionally exposes no local audio devices.
 sounddevice = types.ModuleType("sounddevice")
 sounddevice.PortAudioError = type("PortAudioError", (Exception,), {})

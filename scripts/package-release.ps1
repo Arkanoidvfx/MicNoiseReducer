@@ -6,14 +6,14 @@ $root = Split-Path -Parent $PSScriptRoot
 $publish = Join-Path $root 'publish'
 $releases = Join-Path $root 'Releases'
 if ($Stage) { & (Join-Path $PSScriptRoot 'stage-release.ps1') -Version $Version }
-if (-not (Test-Path (Join-Path $publish 'MicNoiseReducer.exe'))) { throw 'Release is not staged.' }
+if (-not (Test-Path (Join-Path $publish 'MicNoize.exe'))) { throw 'Release is not staged.' }
 New-Item -ItemType Directory -Force $releases | Out-Null
 dotnet tool restore
 dotnet tool run vpk -- pack `
-    --packId MicNoiseReducer `
+    --packId MicNoize `
     --packVersion $Version `
     --packDir $publish `
-    --mainExe MicNoiseReducer.exe `
+    --mainExe MicNoize.exe `
     --packTitle 'Mic Noize' `
     --packAuthors 'Arkanoid VFX' `
     --channel win-x64-stable `

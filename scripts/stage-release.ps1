@@ -24,7 +24,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Native engine build failed.' }
 & $cargo build --release --locked --manifest-path (Join-Path $root 'ui\Cargo.toml')
 if ($LASTEXITCODE -ne 0) { throw 'Rust UI build failed.' }
 
-Copy-Item (Join-Path $env:CARGO_TARGET_DIR 'release\mic-ui.exe') (Join-Path $stage 'MicNoiseReducer.exe')
+Copy-Item (Join-Path $env:CARGO_TARGET_DIR 'release\micnoize.exe') (Join-Path $stage 'MicNoize.exe')
 Copy-Item (Join-Path $root 'LICENSE') $stage
 Copy-Item (Join-Path $root 'release\notes.md') $stage
 Get-ChildItem $stage -File | Get-FileHash -Algorithm SHA256 |

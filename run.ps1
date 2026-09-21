@@ -1,10 +1,5 @@
-param([switch]$Legacy)
 $ErrorActionPreference = 'Stop'
-$exe = Join-Path $PSScriptRoot 'bin\MicNoiseReducer-rust.exe'
-if ($Legacy) {
-    $exe = Join-Path $PSScriptRoot 'bin\MicNoiseReducer-legacy.exe'
-    if (-not (Test-Path -LiteralPath $exe)) { $exe = Join-Path $PSScriptRoot 'bin\MicNoiseReducer.exe' }
-}
+$exe = Join-Path $PSScriptRoot 'bin\MicNoize.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw 'Run .\build.ps1 first.' }
 & nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free,utilization.gpu --format=csv,noheader,nounits
 if ($LASTEXITCODE -ne 0) { throw 'NVIDIA driver is unavailable.' }

@@ -1,13 +1,13 @@
 ---
-name: micnoisereducer
-description: "Work on Mic Noize (internal project ID MicNoiseReducer) in this Windows project: Rust/Iced UI, C++ NVIDIA audio engine, TAG/WASAPI, Discord-only effects, hotkeys, settings, builds and focused checks. Use for project changes or troubleshooting; not for unrelated audio projects or general NVIDIA advice."
+name: micnoize
+description: "Work on Mic Noize in this Windows project: Rust/Iced UI, C++ NVIDIA audio engine, TAG/WASAPI, Discord-only effects, hotkeys, settings, builds and focused checks. Use for project changes or troubleshooting; not for unrelated audio projects or general NVIDIA advice."
 ---
 
 # Mic Noize
 
-Resolve all source paths below from the project root (the folder containing `AGENTS.md` and `CMakeLists.txt`). Default location: `D:\Projects\Audio\MicNoiseReducer`.
+Resolve all source paths below from the project root (the folder containing `AGENTS.md` and `CMakeLists.txt`). Default location: `D:\Projects\Audio\MicNoize`.
 
-The user-facing product name is **Mic Noize**. Keep the internal `MicNoiseReducer` package ID, executable names, `%LOCALAPPDATA%` directory, repository URL, mutexes, window classes and TAG endpoint names unchanged so installed versions, settings, updates and the persistent driver connection remain compatible.
+The product and internal app name is **Mic Noize**. Installed program files live under `%LOCALAPPDATA%\MicNoize`; persistent settings and runtime live under `%APPDATA%\Mic Noize`. `MNR` means **Mic Noize Runtime**: preserve the `mnr_*` ABI, `MNR_*` environment variables, `/mnr/` routes, sidecar name and TAG IPC protocol `.v1`.
 
 ## Find the smallest relevant path
 
@@ -24,7 +24,7 @@ The user-facing product name is **Mic Noize**. Keep the internal `MicNoiseReduce
 | Downloaded core / RVC runtime | `ui/src/components.rs`, `scripts/package-components.ps1` | signed manifest, part size/SHA-256, archive layout and runtime-root lookup |
 | Build / dependencies / linkage | `CMakeLists.txt`, `ui/build.rs`, `build.ps1` | [workflow](references/workflow.md) |
 
-Search symbols in `src` and `ui/src` before reading entire large files. Trace producers, queues and consumers before changing audio semantics. `src/main.cpp` is the old Win32 interface, not the current UI.
+Search symbols in `src` and `ui/src` before reading entire large files. Trace producers, queues and consumers before changing audio semantics. The deleted Win32 interface is not part of the current UI.
 
 ## Preserve these contracts
 

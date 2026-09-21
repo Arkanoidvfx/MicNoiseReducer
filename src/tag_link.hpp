@@ -17,7 +17,7 @@ public:
     TagPacket* packet=nullptr;
     explicit TagLink(bool create,bool headphones=false) {
         try {
-            const std::wstring prefix=headphones?L"Local\\MicNoiseReducer.HeadphoneLink":L"Local\\MicNoiseReducer.TagLink";
+            const std::wstring prefix=headphones?L"Local\\MicNoize.HeadphoneLink":L"Local\\MicNoize.TagLink";
             mutex=CreateMutexW(nullptr,FALSE,(prefix+L".Lock").c_str());
             request=CreateEventW(nullptr,FALSE,FALSE,(prefix+L".Request").c_str());
             response=CreateEventW(nullptr,FALSE,FALSE,(prefix+L".Response").c_str());
@@ -45,7 +45,7 @@ private:
     }
 };
 inline HANDLE tagHostProcess() {
-    HANDLE map=OpenFileMappingW(FILE_MAP_READ,FALSE,L"Local\\MicNoiseReducer.TagLink.v1");
+    HANDLE map=OpenFileMappingW(FILE_MAP_READ,FALSE,L"Local\\MicNoize.TagLink.v1");
     if(map) {CloseHandle(map);return nullptr;}
     const auto exe=projectRoot()/L"bin/mic_tag_host.exe";
     std::wstring command=L"\""+exe.wstring()+L"\"";
@@ -59,10 +59,10 @@ inline void ensureTagHost() {
     HANDLE process=tagHostProcess();
     // The mapping is published after TAG opens; wait for protocol initialization too.
     for(unsigned i=0;i<200;++i) {
-        HANDLE map=OpenFileMappingW(FILE_MAP_READ,FALSE,L"Local\\MicNoiseReducer.TagLink.v1");
+        HANDLE map=OpenFileMappingW(FILE_MAP_READ,FALSE,L"Local\\MicNoize.TagLink.v1");
         if(map) {
             const auto p=static_cast<const TagPacket*>(MapViewOfFile(map,FILE_MAP_READ,0,0,sizeof(TagPacket)));
-            HANDLE lock=OpenMutexW(SYNCHRONIZE|MUTEX_MODIFY_STATE,FALSE,L"Local\\MicNoiseReducer.TagLink.Lock");
+            HANDLE lock=OpenMutexW(SYNCHRONIZE|MUTEX_MODIFY_STATE,FALSE,L"Local\\MicNoize.TagLink.Lock");
             bool ready=false;
             if(p && lock) {
                 const auto wait=WaitForSingleObject(lock,10);

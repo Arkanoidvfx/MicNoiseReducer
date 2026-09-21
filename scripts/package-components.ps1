@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory)][ValidateSet('core','rvc')][string]$Kind,
     [Parameter(Mandatory)][string]$Version,
-    [string]$SourceRoot = 'D:\Projects\Audio\MicNoiseReducer',
+    [string]$SourceRoot = 'D:\Projects\Audio\MicNoize',
     [string]$SigningKeyPath = ''
 )
 
@@ -54,7 +54,7 @@ try {
         } finally { $part.Dispose() }
         $file = Get-Item $path
         $parts += [ordered]@{
-            url = "https://github.com/Arkanoidvfx/MicNoiseReducer/releases/download/runtime-$Kind-v$Version/$name"
+            url = "https://github.com/Arkanoidvfx/MicNoize/releases/download/runtime-$Kind-v$Version/$name"
             size = $file.Length
             sha256 = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
         }

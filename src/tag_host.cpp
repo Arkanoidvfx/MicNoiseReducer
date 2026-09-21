@@ -6,7 +6,7 @@
 #include <memory>
 
 int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int) {
-    HANDLE owner=CreateMutexW(nullptr,FALSE,L"Local\\MicNoiseReducer.TagHost");
+    HANDLE owner=CreateMutexW(nullptr,FALSE,L"Local\\MicNoize.TagHost");
     if(!owner) return 1;
     if(GetLastError()==ERROR_ALREADY_EXISTS){CloseHandle(owner);return 0;}
     int result=0;

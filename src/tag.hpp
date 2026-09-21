@@ -6,6 +6,7 @@
 #include <ksmedia.h>
 #include <winioctl.h>
 #include <cmath>
+#include <fstream>
 #include <stdexcept>
 #define _Debug 0
 #define _BuildMode 2
@@ -32,6 +33,13 @@ class TagOutput {
             throw std::runtime_error(s);
         }
     }
+    static void logLineFailure(const char* action,unsigned id,HRESULT hr) noexcept {
+        try {
+            const auto dir=projectRoot()/L"results";std::filesystem::create_directories(dir);
+            std::ofstream(dir/L"tag-host.log",std::ios::app)<<"TAG "<<action<<" line "<<id
+                <<": HRESULT 0x"<<std::hex<<static_cast<unsigned long>(hr)<<'\n';
+        } catch(...) {}
+    }
 public:
     explicit TagOutput(const std::filesystem::path& root,HANDLE event,bool capture=true,TagOutput* shared=nullptr) {
         using namespace ThinAudioGateway;
@@ -52,16 +60,28 @@ public:
             std::vector<VirtualLineDesc> lines(std::max(1u,info.NumLines)); unsigned count=0;
             ok(driver_->GetLineList(lines.data(),static_cast<unsigned>(lines.size()*sizeof(VirtualLineDesc)),count),"TAG line list");
             if(count>lines.size()) throw std::runtime_error("Invalid TAG line count");
-            unsigned id=0,next=1;
+            unsigned id=0,fallback=0,next=1;
             for(unsigned i=0;i<count;++i) {
                 next=std::max(next,lines[i].Id+1);
-                if(!id && (capture?lines[i].Capture:(!lines[i].Capture && !wcscmp(lines[i].KsName,L"MicNoiseReducer Headphones")))) id=lines[i].Id;
+                const auto* wanted=capture?L"MicNoize Microphone":L"MicNoize Headphones";
+                if(!id && lines[i].Capture==capture && !wcscmp(lines[i].KsName,wanted)) id=lines[i].Id;
+                if(capture && !fallback && lines[i].Capture) fallback=lines[i].Id;
             }
+            bool newLine=id!=0;
             if(!id) {
                 VirtualLineDesc line{}; line.Id=next; line.Capture=capture; line.Type=capture?VLT_Microphone:VLT_Headphones;
-                wcscpy_s(line.KsName,capture?L"MicNoiseReducer TAG":L"MicNoiseReducer Headphones");
-                wcscpy_s(line.EpName,capture?L"MicNoiseReducer":L"MicNoiseReducer Headphones");
-                ok(driver_->CreateLine(line),"TAG create microphone"); id=next;
+                wcscpy_s(line.KsName,capture?L"MicNoize Microphone":L"MicNoize Headphones");
+                wcscpy_s(line.EpName,capture?L"Mic Noize":L"Mic Noize Headphones");
+                const auto hr=driver_->CreateLine(line);
+                if(SUCCEEDED(hr)){id=next;newLine=true;}
+                else if(capture && fallback){id=fallback;logLineFailure("create",next,hr);}
+                else ok(hr,"TAG create line");
+            }
+            if(capture && newLine) {
+                constexpr wchar_t legacy[]=L"MicNoiseReducer"; // Legacy name, migration only.
+                for(unsigned i=0;i<count;++i)
+                    if(!wcsncmp(lines[i].KsName,legacy,std::size(legacy)-1))
+                        if(const auto hr=driver_->DeleteLine(lines[i].Id);FAILED(hr)) logLineFailure("delete legacy",lines[i].Id,hr);
             }
             ok(driver_->CreatePipe(pipe_,id,capture),"TAG open audio pipe");
             // 32-bit integer PCM; conversion from NVIDIA float happens only at the output.

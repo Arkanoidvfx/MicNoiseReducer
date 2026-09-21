@@ -2,6 +2,13 @@
 
 Хронология изменений и результаты проверок. Поведение программы описано в [README.md](README.md); здесь — что и когда менялось, какие проверки прошли и что осталось непроверенным. Логи и снимки лежат в `results/` (не в Git). Исторические логи описывают прошлые прогоны, а не свежую валидацию текущей сборки.
 
+## 2026-09-21 — Mic Noize 0.2.0: внутренний rename, шаг 1
+
+- Пакет и dev EXE переименованы в `micnoize` / `bin\MicNoize.exe`; удалён старый Win32 UI и его CMake target. Velopack теперь использует `packId MicNoize`, `MicNoize.exe` и версию 0.2.0; URL приложения и runtime переведены на `Arkanoidvfx/MicNoize`, core manifest — на `runtime-core-v2`.
+- Постоянные данные перенесены в `%APPDATA%\Mic Noize`; `settings.ini` при отсутствии копируется сначала из legacy `%LOCALAPPDATA%\MicNoiseReducer`, затем из dev-репозитория. Dev-сборка всегда использует repository `vendor`, установленная — `%APPDATA%\Mic Noize\Components`. `MNR` трактуется как Mic Noize Runtime; ABI, переменные окружения, sidecar и IPC `.v1` не менялись.
+- Win32 mutex/mapping/window-class и TAG-линии переименованы в `MicNoize.*`; новый хост создаёт `MicNoize Microphone` до попытки удалить legacy-линии, а ошибки удаления пишет в `results/tag-host.log`. Автозапуск мигрирует `MicNoiseReducer.TagHost` в `MicNoize.TagHost`.
+- `verify.ps1` прошёл: CTest 3/3, Rust 17/17, строгий Clippy; лог `results/mic-noize-0.2.0-step1-verify.log`. Собран `bin\MicNoize.exe`; старые dev EXE восстановимо перенесены в `.tmp\archive`. Живой legacy `mic_tag_host.exe` не останавливался и не заменялся. Не проверены: сборка/запуск нового хоста, миграция физических TAG endpoint, Discord, аппаратные `--tag-reconnect`/`--persistent-tag`, установка/удаление 0.2.0, telemetry worker и публикация.
+
 ## 2026-09-21 — проверка обновления 0.1.1 → 0.1.2 на этом ПК
 
 Первая проверка полного пользовательского пути с опубликованными артефактами, без песочницы агентов (Setup и приложение запускал пользователь из Проводника; см. заметку о MSIX-виртуализации в `workflow.md`).

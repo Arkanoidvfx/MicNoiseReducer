@@ -207,13 +207,15 @@ std::wstring wide(const std::string& s) {
 std::filesystem::path projectRoot() {
     if(const auto* configured=_wgetenv(L"MNR_RUNTIME_ROOT"); configured && *configured)
         return std::filesystem::path(configured);
-    if(const auto* local=_wgetenv(L"LOCALAPPDATA"); local && *local) {
-        auto components=std::filesystem::path(local)/L"MicNoiseReducer/Components";
-        if(std::filesystem::is_directory(components/L"vendor")) return components;
-    }
     std::wstring path(32768,0); auto n=GetModuleFileNameW(nullptr,path.data(),static_cast<DWORD>(path.size()));
     if(!n || n==path.size()) throw std::runtime_error("Cannot resolve executable path");
-    path.resize(n); return std::filesystem::path(path).parent_path().parent_path();
+    path.resize(n);const auto app=std::filesystem::path(path).parent_path(),project=app.parent_path();
+    if(app.filename()==L"bin" && std::filesystem::is_directory(project/L"vendor/nvidia-afx-3.0.0")) return project;
+    if(const auto* roaming=_wgetenv(L"APPDATA"); roaming && *roaming) {
+        auto components=std::filesystem::path(roaming)/L"Mic Noize/Components";
+        if(std::filesystem::is_directory(components/L"vendor")) return components;
+    }
+    return project;
 }
 std::vector<Device> devices(bool capture) {
     Com com; ComPtr<IMMDeviceEnumerator> e; ComPtr<IMMDeviceCollection> list;
@@ -642,7 +644,7 @@ void Engine::start(const Config& c) {
     if(c.tag) {
         for(const auto& device:devices(true)) if(device.id==c.input && device.name.find(L"Thin Audio Gateway")!=std::wstring::npos)
             throw std::runtime_error("Select the physical microphone, not TAG's own output");
-        HANDLE owner=CreateMutexW(nullptr,FALSE,L"Local\\MicNoiseReducer.TAG");
+        HANDLE owner=CreateMutexW(nullptr,FALSE,L"Local\\MicNoize.TAG");
         if(!owner) throw std::runtime_error("Cannot create TAG ownership mutex");
         if(GetLastError()==ERROR_ALREADY_EXISTS) {CloseHandle(owner);throw std::runtime_error("TAG is already running in another Mic Noize instance");}
         tagOwner_=owner;
@@ -1037,9 +1039,9 @@ void Headphones::start(const std::wstring& output,bool denoise) {
     if(found==list.end())throw std::runtime_error("Выберите подключённые физические наушники.");
     auto name=found->name;
     std::transform(name.begin(),name.end(),name.begin(),[](wchar_t c){return static_cast<wchar_t>(towlower(c));});
-    for(auto forbidden:{L"thin audio",L"micnoisereducer",L"cable",L"voicemeeter",L"broadcast"})
+    for(auto forbidden:{L"thin audio",L"mic noize",L"cable",L"voicemeeter",L"broadcast"})
         if(name.find(forbidden)!=std::wstring::npos)throw std::runtime_error("Выберите физические наушники, не виртуальное устройство.");
-    owner_=CreateMutexW(nullptr,FALSE,L"Local\\MicNoiseReducer.HeadphoneOwner");
+    owner_=CreateMutexW(nullptr,FALSE,L"Local\\MicNoize.HeadphoneOwner");
     if(!owner_)throw std::runtime_error("Headphone ownership lock failed");
     if(GetLastError()==ERROR_ALREADY_EXISTS){CloseHandle(owner_);owner_=nullptr;throw std::runtime_error("Headphones already in use by another instance");}
     ResetEvent(stop_);ResetEvent(data_);ResetEvent(ready_);++epoch_;processed=0;drops=0;
