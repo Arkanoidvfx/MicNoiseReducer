@@ -101,8 +101,10 @@ fn decode_ini(bytes: &[u8]) -> Result<String, String> {
             return Err("Повреждён UTF-16 settings.ini".into());
         }
         let words: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| u16::from_le_bytes(*bytes))
             .collect();
         String::from_utf16(&words).map_err(|e| e.to_string())
     } else {
