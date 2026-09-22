@@ -8,6 +8,8 @@ use iced::{Border, Color, Length};
 
 // Keep an off-screen keyboard target mounted without mounting every row on the way to it.
 fn sound_rows(count: usize, scroll: f32, viewport: f32, pitch: f32, focus: Option<usize>) -> Vec<usize> {
+    // The stored offset can outlive a shorter section/filter until Iced clamps its scrollable.
+    let scroll = scroll.min((count as f32 * pitch - viewport).max(0.0));
     let first = (((scroll - 96.0) / pitch).floor().max(0.0) as usize).min(count);
     let last = (((scroll + viewport + 96.0) / pitch).ceil() as usize).min(count).max(first);
     let mut rows: Vec<_> = (first..last).collect();
@@ -1785,9 +1787,9 @@ mod tests {
         assert_eq!(sound_rows(1000, 0.0, 640.0, 32.0, Some(999)),
             (0..23).chain(std::iter::once(999)).collect::<Vec<_>>());
         assert_eq!(sound_rows(1000, 0.0, 640.0, 32.0, Some(2)), (0..23).collect::<Vec<_>>());
-        // Filtering can shrink the list before the scrollable reports its clamped offset.
-        assert!(sound_rows(3, 12_800.0, 640.0, 32.0, None).is_empty());
-        assert_eq!(sound_rows(3, 12_800.0, 640.0, 32.0, Some(1)), vec![1]);
+        // Filtering or selecting a short section must mount its clips immediately.
+        assert_eq!(sound_rows(3, 12_800.0, 640.0, 32.0, None), vec![0, 1, 2]);
+        assert_eq!(sound_rows(3, 12_800.0, 640.0, 32.0, Some(1)), vec![0, 1, 2]);
         assert!(sound_rows(0, 0.0, 640.0, 32.0, Some(0)).is_empty());
     }
     #[test]
