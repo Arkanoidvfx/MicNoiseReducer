@@ -32,6 +32,10 @@
 
 Драйвер **установлен и загружен** на текущей Windows 11; C++-хост передаёт PCM в `Microphone (Thin Audio Gateway)`, WASAPI-клиент принимает поток. Защита Windows и параметры подписи не изменялись. Это проверка текущей конфигурации, не сертификация всех режимов HVCI. Пакет обозначен demo. В прочитанных документах не установлены все ограничения демоверсии, цена и права на постоянное использование/распространение. Из наличия скачивания не следует бессрочная бесплатная лицензия.
 
+### Уровень виртуального микрофона (проверка 2026-09-22)
+
+У текущего capture endpoint `GetVolumeRange` возвращает −96…+30 дБ, а `QueryHardwareSupport` — 0: Windows применяет программную регулировку. Поэтому системные 100 % усиливают PCM в общем режиме захвата. В заголовке TAG есть `IoCtl_Line_SetVolumeControlParams`, но установленный demo-драйвер отклонил попытки объявить фиксированные 0 дБ (диапазоны 0…0 и −1…0 дБ) с `HRESULT 0x80070001`. После обеих попыток исходный `mic_tag_host.exe` восстановлен; диапазон остался −96…+30 дБ. В коде приложения реализована компенсация этого усиления и удержание системного уровня на 100 % во время обработки; в релиз это не выпускалось. Эксклюзивный захват обходит программную громкость Windows и получит ослабленный PCM; он не покрыт этим решением. Для устранения самой системной крутилки нужен новый подписанный пакет драйвера: фиксированный аппаратный узел или настройки программного диапазона в INF (последнее документировано для Windows 11 24H2+). Возможность получить такой вариант у поставщика не проверялась.
+
 ### План прототипа
 
 `QuadCast → WASAPI capture → неизменённый NVIDIA SDK → ограниченная очередь → TAG capture buffer → Discord`
@@ -62,6 +66,8 @@
 - [Варианты подписи, attestation и HLK](https://learn.microsoft.com/en-us/windows-hardware/drivers/dashboard/driver-signing-offerings)
 - [SysVAD, проверенная версия исходника](https://github.com/microsoft/Windows-driver-samples/blob/97429c5623590d52f001249460daf43e6749d777/audio/sysvad/EndpointsCommon/minwavertstream.cpp)
 - [Thin Audio Gateway](https://software.muzychenko.net/en/thin-audio-gateway/)
+- [Программная регулировка Windows при отсутствии аппаратной](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/software-volume-control-support)
+- [Максимальный уровень программной регулировки через INF](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/pkey-audioendpoint-max-volumeindb)
 - [Описание TAG на русском](https://software.muzychenko.net/ru/)
 - [VirtualDrivers](https://github.com/VirtualDrivers/Virtual-Audio-Driver)
 - [E2ESOFT VSC SDK](https://www.e2esoft.com/sdk/vsc-sdk/)

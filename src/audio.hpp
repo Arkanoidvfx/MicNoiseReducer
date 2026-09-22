@@ -207,7 +207,8 @@ class Engine {
     HANDLE stop_ = nullptr, data_ = nullptr, ready_ = nullptr;
     HANDLE tagOwner_ = nullptr;
     Config config_;
-    std::thread io_, dsp_, desktopThread_;
+    std::thread io_, dsp_, desktopThread_, tagLevelThread_;
+    std::atomic<float> tagLevelCompensation_{1};
     Ring<16384> captured_, desktop_;
     Ring<16384,RoutedSample> cleaned_;
     Ring<16384,RoutedSample> preview_;
@@ -283,6 +284,8 @@ public:
     std::wstring status() const;
 };
 void checkDiscordCapture(unsigned seconds);
+void checkTagLevel();
+void checkTagLevelWatch();
 void checkRvc();
 void checkRvcIdle();
 struct StereoSample {float left=0,right=0; unsigned epoch=0;};

@@ -182,6 +182,8 @@ int main(int argc,char** argv) {
         }
         if(argc==2 && std::string(argv[1])=="--discord-capture") { mic::checkDiscordCapture(5); return 0; }
         if(argc==2 && std::string(argv[1])=="--self-test") { selfTest(); return 0; }
+        if(argc==2 && std::string(argv[1])=="--tag-level-check") { mic::checkTagLevel(); return 0; }
+        if(argc==2 && std::string(argv[1])=="--tag-level-watch-check") { mic::checkTagLevelWatch(); return 0; }
         if(argc==2 && std::string(argv[1])=="--rvc-check") { mic::checkRvc(); return 0; }
         if(argc==6 && std::string(argv[1])=="--bench-afx") {
             std::ifstream input(mic::wide(argv[2]),std::ios::binary);

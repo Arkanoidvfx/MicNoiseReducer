@@ -1,6 +1,7 @@
 #include "audio.hpp"
 #include <audioclient.h>
 #include <mmdeviceapi.h>
+#include <endpointvolume.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <avrt.h>
 #include <wrl/client.h>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <future>
 #include "tag_link.hpp"
 #include "tag.hpp"
 #include "effects.hpp"
@@ -246,6 +248,90 @@ std::vector<Device> devices(bool capture) {
         }
     }
     return out;
+}
+
+static ComPtr<IAudioEndpointVolume> tagEndpointLevel() {
+    for(const auto& device:devices(true)) {
+        if(device.name.find(L"Mic Noize")==std::wstring::npos || device.name.find(L"Thin Audio Gateway")==std::wstring::npos) continue;
+        ComPtr<IMMDeviceEnumerator> enumerator; ComPtr<IMMDevice> endpoint; ComPtr<IAudioEndpointVolume> level;
+        check(CoCreateInstance(__uuidof(MMDeviceEnumerator),nullptr,CLSCTX_ALL,IID_PPV_ARGS(&enumerator)),"TAG level enumerator");
+        check(enumerator->GetDevice(device.id.c_str(),&endpoint),"TAG level endpoint");
+        check(endpoint->Activate(__uuidof(IAudioEndpointVolume),CLSCTX_ALL,nullptr,reinterpret_cast<void**>(level.GetAddressOf())),"TAG level control");
+        return level;
+    }
+    throw std::runtime_error("Mic Noize TAG microphone endpoint not found");
+}
+
+static float holdTagEndpointLevel(IAudioEndpointVolume* level,bool unmute=true) {
+    float minimum=0,maximum=0,step=0;
+    check(level->GetVolumeRange(&minimum,&maximum,&step),"TAG level range");
+    if(!std::isfinite(maximum) || minimum>0 || maximum<0) throw std::runtime_error("TAG level range excludes 0 dB");
+    UINT channels=0; check(level->GetChannelCount(&channels),"TAG level channels");
+    if(!channels || channels>32) throw std::runtime_error("Invalid TAG level channel count");
+    for(UINT channel=0;channel<channels;++channel) {
+        float current=0;check(level->GetChannelVolumeLevel(channel,&current),"TAG channel level");
+        if(std::abs(current-maximum)>0.1f) check(level->SetChannelVolumeLevel(channel,maximum,nullptr),"TAG lock channel level");
+    }
+    float current=0;check(level->GetMasterVolumeLevel(&current),"TAG current level");
+    if(std::abs(current-maximum)>0.1f) check(level->SetMasterVolumeLevel(maximum,nullptr),"TAG lock master level");
+    BOOL mute=FALSE;check(level->GetMute(&mute),"TAG current mute");
+    if(mute && unmute) check(level->SetMute(FALSE,nullptr),"TAG unmute virtual microphone");
+    return std::pow(10.0f,-maximum/20.0f);
+}
+
+void checkTagLevel() {
+    Com com;auto level=tagEndpointLevel();
+    float original=0;BOOL originalMute=FALSE;UINT count=0;
+    check(level->GetMasterVolumeLevel(&original),"TAG test original level");
+    check(level->GetMute(&originalMute),"TAG test original mute");
+    check(level->GetChannelCount(&count),"TAG test channels");
+    std::vector<float> channels(count);
+    for(UINT i=0;i<count;++i) check(level->GetChannelVolumeLevel(i,&channels[i]),"TAG test channel");
+    float compensation=0,locked=0;
+    {
+        struct Restore {
+            IAudioEndpointVolume* level;float master;BOOL mute;const std::vector<float>& channels;
+            ~Restore() {
+                for(UINT i=0;i<channels.size();++i) level->SetChannelVolumeLevel(i,channels[i],nullptr);
+                level->SetMasterVolumeLevel(master,nullptr);level->SetMute(mute,nullptr);
+            }
+        } restore{level.Get(),original,originalMute,channels};
+        check(level->SetMute(TRUE,nullptr),"TAG test mute");
+        check(level->SetMasterVolumeLevel(0,nullptr),"TAG test change level");
+        compensation=holdTagEndpointLevel(level.Get(),false);
+        check(level->GetMasterVolumeLevel(&locked),"TAG test locked level");
+        if(std::abs(compensation*std::pow(10.0f,locked/20.0f)-1.0f)>0.01f)
+            throw std::runtime_error("TAG level compensation mismatch");
+        for(UINT i=0;i<count;++i) {
+            float channel=0;check(level->GetChannelVolumeLevel(i,&channel),"TAG test locked channel");
+            if(std::abs(channel-locked)>0.1f) throw std::runtime_error("TAG channel level not locked");
+        }
+    }
+    float restored=0;BOOL restoredMute=FALSE;
+    check(level->GetMasterVolumeLevel(&restored),"TAG test restored level");
+    check(level->GetMute(&restoredMute),"TAG test restored mute");
+    if(std::abs(restored-original)>0.1f || restoredMute!=originalMute) throw std::runtime_error("TAG level was not restored");
+    for(UINT i=0;i<count;++i) {
+        float channel=0;check(level->GetChannelVolumeLevel(i,&channel),"TAG test restored channel");
+        if(std::abs(channel-channels[i])>0.1f) throw std::runtime_error("TAG channel level was not restored");
+    }
+    std::cout<<"PASS: TAG max="<<locked<<" dB compensation="<<compensation<<"; original level restored\n";
+}
+
+void checkTagLevelWatch() {
+    Com com;auto level=tagEndpointLevel();
+    float minimum=0,maximum=0,step=0;
+    check(level->GetVolumeRange(&minimum,&maximum,&step),"TAG watch test range");
+    try {
+        check(level->SetMute(TRUE,nullptr),"TAG watch test mute");
+        check(level->SetMasterVolumeLevel(0,nullptr),"TAG watch test level");
+        Sleep(250);
+        float current=0;BOOL mute=TRUE;
+        check(level->GetMasterVolumeLevel(&current),"TAG watch test current level");
+        check(level->GetMute(&mute),"TAG watch test current mute");
+        if(std::abs(current-maximum)>0.1f || mute) throw std::runtime_error("TAG level guard did not restore 100% and unmute");
+        std::cout<<"PASS: TAG guard restored "<<current<<" dB and unmuted after external change\n";
+    } catch(...) {level->SetMute(FALSE,nullptr);throw;}
 }
 
 class Afx {
@@ -676,6 +762,24 @@ void Engine::start(const Config& c) {
     stats.rvcState=rvcEnabled?1:0;stats.rvcLatencyMs=0;
     intensity=c.intensity; releaseEffects(); running_=true; state=1; status(L"Loading NVIDIA model...");
     try {
+        if(c.tag) {
+            std::promise<float> ready;auto result=ready.get_future();
+            tagLevelThread_=std::thread([this,ready=std::move(ready)]() mutable {
+                bool initialized=false;
+                try {
+                    Com com;
+                    auto level=tagEndpointLevel();
+                    const float compensation=holdTagEndpointLevel(level.Get());
+                    ready.set_value(compensation);initialized=true;
+                    while(WaitForSingleObject(stop_,50)==WAIT_TIMEOUT) tagLevelCompensation_=holdTagEndpointLevel(level.Get());
+                } catch(const std::exception& error) {
+                    if(initialized) fail(error);
+                    else ready.set_exception(std::current_exception());
+                }
+            });
+            tagLevelCompensation_=result.get();
+            if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0) throw std::runtime_error("TAG level guard stopped");
+        }
         dsp_=std::thread([this,c]{dspLoop(c);});
         io_=std::thread([this,c]{ioLoop(c);});
         desktopThread_=std::thread([this]{desktopLoop();});
@@ -686,7 +790,7 @@ void Engine::stop() {
     if(hadSession) state=4;
     releaseEffects();
     SetEvent(stop_);
-    if(io_.joinable()) io_.join(); if(dsp_.joinable()) dsp_.join();if(desktopThread_.joinable())desktopThread_.join();
+    if(io_.joinable()) io_.join(); if(dsp_.joinable()) dsp_.join();if(desktopThread_.joinable())desktopThread_.join();if(tagLevelThread_.joinable())tagLevelThread_.join();
     if(tagOwner_) {CloseHandle(tagOwner_);tagOwner_=nullptr;}
     soundPlaying=0;soundPosition=0;soundLength=0;
     if(running_.exchange(false)) status(L"Stopped");
@@ -946,11 +1050,15 @@ void Engine::tagLoop(Config c) {
                     output[i]*=fade;
                     effectOnly[i]*=fade;
                 }
+                const float outputPeak=peak(output.data(),frames);
+                // Windows software endpoint gain applies to shared-mode capture only.
+                const float compensation=tagLevelCompensation_.load();
+                for(unsigned i=0;i<frames;++i) output[i]*=compensation;
                 if(tag.write(output.data(),frames)) {
                     stats.tagFrames+=frames;
                     preview(effectOnly.data(),routed.data(),modified.data(),frames);
                     if(muted && fade==0) stats.outputPeak=0;
-                    else peakHold(stats.outputPeak,peak(output.data(),frames));
+                    else peakHold(stats.outputPeak,outputPeak);
                 } else {
                     // The host dropped us during a stall and filled it with silence: discard the
                     // clock debt and re-prime exactly as on a client transition.
