@@ -25,6 +25,25 @@ const EXIT_EVENT: u32 = 2;
 const RESTART_EVENT: u32 = 4;
 /// Mirrors `mic::rvcSlack` (src/audio.hpp): RVC output is a fixed delay line of chunk + slack.
 const RVC_SLACK_MS: u32 = 200;
+const DISCORD_VOLUME_AT_100: f32 = 0.08;
+const DISCORD_VOLUME_MAX_PERCENT: f32 = 200.0;
+
+fn discord_volume_gain(percent: f32) -> f32 {
+    percent.clamp(0.0, DISCORD_VOLUME_MAX_PERCENT) * DISCORD_VOLUME_AT_100 / 100.0
+}
+
+fn discord_volume_percent(gain: f32) -> f32 {
+    (gain * 100.0 / DISCORD_VOLUME_AT_100).clamp(0.0, DISCORD_VOLUME_MAX_PERCENT)
+}
+
+fn load_discord_volume(settings: &Settings) -> f32 {
+    let percent = if settings.number("effects", "discord_volume_scale", 1, 1, 2) == 2 {
+        settings.number("effects", "discord_volume", 100, 0, 200) as f32
+    } else {
+        settings.number("effects", "discord_volume", 8, 0, 100) as f32 * 12.5
+    };
+    discord_volume_gain(percent)
+}
 
 /// Keyboard focus targets. Values overlap between pages (each page has its own Tab order) and
 /// are asserted literally by the controller tests, so they must never change.
@@ -381,7 +400,7 @@ impl App {
             volume: 1.0,
             boost: settings.number("effects", "boost", 300, 100, 2000) as f32 / 100.0,
             overload: settings.number("effects", "overload", 0, 0, 1) != 0,
-            discord_volume: settings.number("effects", "discord_volume", 50, 0, 100) as f32 / 100.0,
+            discord_volume: load_discord_volume(&settings),
             pitch: settings.number("effects", "pitch", -5, -12, 12),
             intensity: settings.number("audio", "intensity", 100, 0, 200) as f32 / 100.0,
             alternate_intensity: settings.number("audio", "alternate_intensity", 15, 0, 200) as f32
@@ -616,8 +635,9 @@ impl App {
             ("overload", self.controls.overload as i32),
             (
                 "discord_volume",
-                (self.controls.discord_volume * 100.0).round() as i32,
+                discord_volume_percent(self.controls.discord_volume).round() as i32,
             ),
+            ("discord_volume_scale", 2),
             ("pitch", self.controls.pitch),
             ("boost_key", self.keys[0] as i32),
             ("pitch_key", self.keys[1] as i32),
@@ -1230,7 +1250,7 @@ impl App {
                 self.changed();
             }
             Msg::DiscordVolume(v) => {
-                self.controls.discord_volume = v / 100.0;
+                self.controls.discord_volume = discord_volume_gain(v);
                 self.focus = focus::effects::DISCORD_VOLUME;
                 self.changed();
             }
@@ -1843,7 +1863,7 @@ impl App {
                 }
                 OVERLOAD if activate => Msg::Overload(!self.controls.overload),
                 DISCORD_VOLUME if delta != 0 => Msg::DiscordVolume(
-                    (self.controls.discord_volume * 100.0 + delta as f32).clamp(0.0, 100.0),
+                    discord_volume_percent(self.controls.discord_volume) + delta as f32,
                 ),
                 INTENSITY if delta != 0 => Msg::Intensity(
                     (self.controls.intensity * 100.0 + delta as f32).clamp(0.0, 200.0),
@@ -1944,6 +1964,33 @@ fn main() {
 #[cfg(test)]
 mod controller_tests {
     use super::*;
+    #[test]
+    fn discord_volume_uses_the_new_scale_and_migrates_legacy_eight_percent() {
+        let (defaults, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        assert_eq!(defaults.controls.boost, 3.0);
+        assert!(!defaults.controls.overload);
+        assert!((defaults.controls.discord_volume - 0.08).abs() < 0.0001);
+        assert_eq!(
+            discord_volume_percent(defaults.controls.discord_volume),
+            100.0
+        );
+
+        let (legacy, _) = App::from_settings(Settings::for_test("[effects]\ndiscord_volume=8"))
+            .unwrap()
+            .unwrap();
+        assert!((legacy.controls.discord_volume - 0.08).abs() < 0.0001);
+
+        let (new_scale, _) = App::from_settings(Settings::for_test(
+            "[effects]\ndiscord_volume=200\ndiscord_volume_scale=2",
+        ))
+        .unwrap()
+        .unwrap();
+        assert!((new_scale.controls.discord_volume - 0.16).abs() < 0.0001);
+
+        let (mut clamped, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let _ = clamped.update(Msg::DiscordVolume(250.0));
+        assert!((clamped.controls.discord_volume - 0.16).abs() < 0.0001);
+    }
     #[test]
     fn noise_presets_and_hotkey_roundtrip() {
         use keyboard::{Key, Modifiers, key::Named};
@@ -2192,9 +2239,9 @@ mod controller_tests {
         let _ = app.update(Msg::AcceptBind);
         assert_eq!(app.keys[11], 119 | 256);
         app.focus = 22;
-        app.controls.discord_volume = 0.5;
+        app.controls.discord_volume = discord_volume_gain(100.0);
         let _ = app.key(Key::Named(Named::ArrowLeft), Modifiers::empty(), false);
-        assert!((app.controls.discord_volume - 0.49).abs() < 0.0001);
+        assert!((discord_volume_percent(app.controls.discord_volume) - 99.0).abs() < 0.0001);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 31);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);

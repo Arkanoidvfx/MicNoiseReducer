@@ -435,15 +435,18 @@ impl App {
                 label("Громкость Discord", 13, DIM),
                 Space::new().width(Length::Fill),
                 label(
-                    format!("{:.0}%", self.controls.discord_volume * 100.0),
+                    format!(
+                        "{:.0}%",
+                        discord_volume_percent(self.controls.discord_volume)
+                    ),
                     13,
                     INK
                 )
             ],
             frame(
                 slider(
-                    0.0..=100.0,
-                    self.controls.discord_volume * 100.0,
+                    0.0..=DISCORD_VOLUME_MAX_PERCENT,
+                    discord_volume_percent(self.controls.discord_volume),
                     Msg::DiscordVolume
                 )
                 .step(1.0_f32)

@@ -37,8 +37,8 @@ int main() {try {
             mic::OutputEffects output;
             for(int i=0;i<2;++i){data.fill(0.5f);output.process(data.data(),480,1,1,false,false,sources.data(),0,modified.data(),mic.data(),only.data());}
             require(data[479]==0.25f && only[479]==0,"Discord volume muted microphone or leaked it into effects monitor");
-            data.fill(0.5f);output.process(data.data(),480,1,1,false,false,sources.data(),0.5f,modified.data(),mic.data(),only.data());
-            require(std::abs(data[479]-0.5f)<1e-6 && std::abs(only[479]-0.25f)<1e-6,"Microphone/Discord mix wrong");
+            data.fill(0.5f);output.process(data.data(),480,1,1,false,false,sources.data(),0.08f,modified.data(),mic.data(),only.data());
+            require(std::abs(data[479]-0.29f)<1e-6 && std::abs(only[479]-0.04f)<1e-6,"Microphone/Discord mix wrong");
         }
         std::cout<<"last_effect_replay=passed microphone_mix=passed\n";
     }
@@ -95,11 +95,14 @@ int main() {try {
         for(unsigned i=0;i<480;++i)sources[i]=static_cast<uint8_t>(i%2);
         for(bool overload:{false,true}){
             mic::OutputEffects reference,limited;
+            auto full=original;data=original;
+            reference.process(full.data(),480,1,20,true,overload);
+            limited.process(data.data(),480,1,20,true,overload,sources.data(),0.16f);
             for(int f=0;f<4;++f){
-                auto full=original;data=original;
+                full=original;data=original;
                 reference.process(full.data(),480,1,20,true,overload);
-                limited.process(data.data(),480,1,20,true,overload,sources.data(),0.5f);
-                for(unsigned i=0;i<480;++i)require(std::abs(data[i]-full[i]*(sources[i]?0.5f:1.0f))<1e-6,"Discord volume must apply after distortion without changing microphone");
+                limited.process(data.data(),480,1,20,true,overload,sources.data(),0.16f);
+                for(unsigned i=0;i<480;++i)require(std::abs(data[i]-full[i]*(sources[i]?0.16f:1.0f))<1e-6,"Discord volume must apply after distortion without changing microphone");
             }
             data=original;limited.process(data.data(),480,1,20,true,overload,sources.data(),0);
             data=original;limited.process(data.data(),480,1,20,true,overload,sources.data(),0);
@@ -109,7 +112,7 @@ int main() {try {
         mic::RoutedSample first[]={{1,0},{2,1},{3,1},{4,0}},last[]={{5,0},{6,1}},read[4]{};
         require(queue.push(first,4)&&queue.pop(read,2)&&queue.push(last,2),"Routed queue wrap failed");
         require(queue.pop(read,4)&&read[0].value==3&&read[0].discord==1&&read[1].value==4&&read[1].discord==0&&read[3].value==6&&read[3].discord==1,"Source metadata separated from queued audio");
-        std::cout<<"discord_volume=passed default=50% post_effects=true\n";
+        std::cout<<"discord_volume=passed default=100% gain=8% max=200% post_effects=true\n";
     }
     for(int semitones:{-12,-5,7,12}) {
         mic::PitchEffect p;unsigned crossings=0;float previous=0;double maxMs=0;

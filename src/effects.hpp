@@ -22,8 +22,8 @@ struct Ramp {
     }
 };
 struct OutputEffects {
-    Ramp gain{1},boost{3},wet{0},drive{0},discordGain{0.5f};
-    void process(float* data,size_t n,float volume,float multiplier,bool held,bool overload=false,const uint8_t* discord=nullptr,float discordVolume=0.5f,uint8_t* modified=nullptr,const float* microphone=nullptr,float* effectOnly=nullptr) {
+    Ramp gain{1},boost{3},wet{0},drive{0},discordGain{0.08f};
+    void process(float* data,size_t n,float volume,float multiplier,bool held,bool overload=false,const uint8_t* discord=nullptr,float discordVolume=0.08f,uint8_t* modified=nullptr,const float* microphone=nullptr,float* effectOnly=nullptr) {
         const bool enabled=held && multiplier>1;
         for(size_t i=0;i<n;++i) {
             const float x=(std::isfinite(data[i])?data[i]:0)*gain.next(volume);

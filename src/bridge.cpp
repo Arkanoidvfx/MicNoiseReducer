@@ -89,7 +89,7 @@ extern "C" void mnr_controls(Mnr* p,float volume,float boost,int32_t pitch,float
     if(!std::isfinite(volume)||!std::isfinite(boost)||!std::isfinite(intensity)||!std::isfinite(slow)||!std::isfinite(fast)||!std::isfinite(discordVolume)) return;
     p->engine.volume=std::clamp(volume,0.0f,1.0f); p->engine.boost=std::clamp(boost,1.0f,20.0f);
     p->engine.overload=overload!=0;
-    p->engine.discordVolume=std::clamp(discordVolume,0.0f,1.0f);
+    p->engine.discordVolume=std::clamp(discordVolume,0.0f,0.16f);
     p->engine.rvcEnabled=rvcEnabled!=0;
     p->engine.pitch=std::clamp(pitch,-12,12); p->engine.intensity=std::clamp(intensity,0.0f,2.0f);
     p->engine.slowSpeed=std::clamp(slow,0.5f,0.95f);p->engine.fastSpeed=std::clamp(fast,1.05f,2.0f);

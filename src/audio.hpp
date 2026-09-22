@@ -182,7 +182,7 @@ public:
     std::atomic<int> state{0}; // Stopped, Loading, WaitingClient, Running, Stopping, Error
     std::atomic<float> volume{1}, boost{3};
     std::atomic<bool> overload{false};
-    std::atomic<float> discordVolume{0.5f};
+    std::atomic<float> discordVolume{0.08f};
     std::atomic<float> slowSpeed{0.7f},fastSpeed{1.5f};
     std::atomic<unsigned> phraseCancel{0};
     std::atomic<unsigned> replayRequest{0};
