@@ -1,6 +1,7 @@
 #include "effects.hpp"
 #include "audio.hpp"
 #include <iostream>
+#include <memory>
 #include <array>
 #include <chrono>
 #include <limits>
@@ -14,23 +15,28 @@ int main() {try {
             return replay.process(data.data(),480,modified.data(),discord,held,false,valid,epoch,cancel,request);
         };
         run(0,0,0);require(!run(0,0,1),"Empty replay must do nothing");
+        // Boost is a gain change, not a clip: holding it records nothing to replay or save.
         run(0.3f,1,1);run(0,0,1);
-        require(run(0.1f,0,2) && data[100]==0.3f && !discord,"Microphone effect replay failed");
-        require(modified[100]==2,"Boost replay lost its monitor category");
-        require(run(0,0,3) && data[100]==0.3f,"Replay overwrote the saved clip");
-        discord=true;run(0.6f,32,3);run(0,0,3);discord=false;
-        require(run(0.1f,0,4) && data[100]==0.6f && discord,"Latest Discord effect did not replace microphone clip");
-        require(modified[100]==2,"Discord boost replay leaked into other effects");
-        run(0.2f,2,4);run(0,0,4,false);
-        require(!run(0,0,5),"Interrupted recording survived reset");
-        run(0.2f,2,5);run(0.2f,2,5);run(0,0,5);
-        require(run(0,0,6),"Replay did not start");
-        require(!run(0,0,6,true,1,1),"Cancel did not stop replay");
+        require(!run(0.1f,0,2) && !replay.finished(),"Boost must not be recorded");
+        run(0.3f,2,2);run(0,0,2);
+        require(replay.finished() && replay.count()==480,"Finished recording was not published");
+        require(!replay.finished(),"Reading a finished recording must clear it");
+        require(run(0.1f,0,3) && data[100]==0.3f && !discord,"Microphone effect replay failed");
+        require(modified[100]==1,"Replay lost its monitor category");
+        require(run(0,0,4) && data[100]==0.3f,"Replay overwrote the saved clip");
+        discord=true;run(0.6f,64,4);run(0,0,4);discord=false;
+        require(run(0.1f,0,5) && data[100]==0.6f && discord,"Latest Discord effect did not replace microphone clip");
+        require(modified[100]==1,"Discord replay leaked into another category");
+        run(0.2f,2,5);run(0,0,5,false);
+        require(!run(0,0,6),"Interrupted recording survived reset");
+        run(0.2f,2,6);run(0.2f,2,6);run(0,0,6);
+        require(run(0,0,7),"Replay did not start");
+        require(!run(0,0,7,true,1,1),"Cancel did not stop replay");
         // Long holds stay bounded; playback ends after the 20-second slot.
-        for(int i=0;i<2100;++i)run(0.2f,1,6,true,1,1);
-        run(0,0,6,true,1,1);
-        require(run(0,0,7,true,1,1),"Bounded replay failed to start");
-        int blocks=1;while(run(0,0,7,true,1,1)){require(++blocks<=2000,"Unbounded replay");}
+        for(int i=0;i<2100;++i)run(0.2f,2,7,true,1,1);
+        run(0,0,7,true,1,1);
+        require(run(0,0,8,true,1,1),"Bounded replay failed to start");
+        int blocks=1;while(run(0,0,8,true,1,1)){require(++blocks<=2000,"Unbounded replay");}
         require(blocks==2000,"Replay capacity changed");
         std::array<float,480> mic{},only{};std::array<uint8_t,480> sources{};sources.fill(1);mic.fill(0.25f);
         {
@@ -41,6 +47,41 @@ int main() {try {
             require(std::abs(data[479]-0.29f)<1e-6 && std::abs(only[479]-0.04f)<1e-6,"Microphone/Discord mix wrong");
         }
         std::cout<<"last_effect_replay=passed microphone_mix=passed\n";
+    }
+    {
+        // Soundpad: one clip at a time, quick double press restarts, same press stops, 5 ms fades,
+        // and the mix bypasses Discord gain while staying out of the effect-only preview.
+        mic::SoundPlayer player;std::array<float,480> sound{};
+        auto clip=std::make_shared<mic::SoundClip>();clip->samples.assign(4800,0.5f);clip->gain=1;
+        auto request=[&](unsigned id,uint64_t serial,bool restart){const auto packed=mic::SoundPlayer::pack(id,serial,restart);const auto lookup=player.request(packed);if(lookup){player.commit(packed);player.start(lookup,clip);}return lookup;};
+        player.render(sound.data(),480,1);require(sound[0]==0 && player.playing()==0,"Idle player produced audio");
+        require(request(3,1,false)==3,"First press must look up the clip");
+        require(request(3,1,false)==0,"Repeated serial must be ignored");
+        player.render(sound.data(),480,1.0f);require(sound[100]==0.5f && player.playing()==3 && player.length()==0.1f,"Clip did not play");
+        player.render(sound.data(),480,0.5f);require(std::abs(sound[100]-0.25f)<1e-6,"Volume ignored");
+        require(request(3,2,true)==3,"Quick double press must restart");
+        player.render(sound.data(),480,1);
+        require(sound[0]==0.5f && sound[239]<0.02f && sound[240]<0.001f && sound[241]==0.5f && player.position()<0.006f,"Restart must fade out then start from the beginning");
+        require(request(3,3,false)==0,"Second press of the playing clip must stop it");
+        player.render(sound.data(),480,1);require(sound[0]==0.5f && sound[120]<0.26f && sound[300]==0 && player.playing()==0,"Stop did not fade to silence");
+        request(3,4,false);for(int i=0;i<12;++i)player.render(sound.data(),480,1);require(player.playing()==0,"Clip did not end");
+        require(request(0,5,false)==0 && request(0,5,false)==0,"Stop request must not look anything up");
+        mic::OutputEffects output;std::array<uint8_t,480> sources{};sources.fill(1);std::array<float,480> only{},mixed{};mixed.fill(0.25f);
+        for(int i=0;i<2;++i){data.fill(0.5f);output.process(data.data(),480,1,1,false,false,sources.data(),0.08f,nullptr,nullptr,only.data(),mixed.data());}
+        require(std::abs(data[479]-0.29f)<1e-6 && std::abs(only[479]-0.04f)<1e-6,"Soundpad must bypass Discord gain and stay out of the effect preview");
+        mic::RoutedSample routed{0.1f,0,0,7,0,0.3f};
+        require(mic::previewSample(routed,mic::ModifiedSound,7,true)==0,"ModifiedSound is a monitor mask bit, never a sample category");
+        // Producer + consumer of the effects-only monitor: "hear sounds" must survive the second filter.
+        for(uint8_t mask:{4,5,6,7}){
+            const auto queued=mic::previewQueued(0.1f,0,7,0.3f,mask,7,true);
+            require(mic::previewSample(queued,mask,7,true)==0.3f,"Clip sample dropped by the monitor consumer");
+            require(mic::previewSample(queued,static_cast<uint8_t>(mask&3),7,true)==0,"Clip audible without the sound mask");
+        }
+        const auto effect=mic::previewQueued(0.1f,1,7,0.3f,5,7,true);
+        require(std::abs(mic::previewSample(effect,5,7,true)-0.4f)<1e-6,"Effect + clip preview mix");
+        require(mic::previewSample(mic::previewQueued(0.1f,0,7,0.3f,4,7,false),4,7,true)==0,"Muted clip leaked into preview");
+        require(mic::previewSample(mic::previewQueued(0.1f,0,7,0.3f,1,7,true),1,7,true)==0,"Clip leaked into effects-only preview");
+        std::cout<<"soundpad=passed double_press_restart=passed fade_samples=240\n";
     }
     for(unsigned i=0;i<480;++i) original[i]=std::sin(i*0.17f)*0.9f;
     {
@@ -169,7 +210,9 @@ int main() {try {
     pressed[0]=pressed[1]=false;keys[1]=120;latch.update(2,true,keys,pressed,0,false);
     pressed[0]=pressed[1]=true;require(latch.update(2,true,keys,pressed,0,false)==3,"Simultaneous effects failed");
     latch.update(2,false,keys,pressed,0,false);require(latch.update(2,true,keys,pressed,0,false)==0,"Mute/lock rearmed held keys");
-    mic::Engine e; e.heldSample=mic::packHeld(GetTickCount64(),0,15);require(e.held()==0,"Stopped engine accepted hold");
+    // Engine rings are ~800 KB: keep them off the 1 MB default stack.
+    auto engine=std::make_unique<mic::Engine>();auto& e=*engine;
+    e.heldSample=mic::packHeld(GetTickCount64(),0,15);require(e.held()==0,"Stopped engine accepted hold");
     auto epoch=e.effectEpoch.load();e.releaseEffects();require(e.heldSample==0&&e.effectEpoch==epoch+1,"Hold reset");
     for(float speed:{0.5f,0.7f,1.5f,2.0f}) {
         mic::PhraseEffect phrase;const unsigned key=speed<1?4:8;

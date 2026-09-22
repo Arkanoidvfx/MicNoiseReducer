@@ -5,7 +5,9 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
-    path::Path,
+    os::windows::process::CommandExt,
+    path::{Path, PathBuf},
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -14,6 +16,13 @@ const CORE_MANIFEST_URL: &str =
 const RVC_MANIFEST_URL: &str =
     "https://github.com/Arkanoidvfx/MicNoize/releases/download/runtime-rvc-v2.1.4/components.json";
 const PUBLIC_KEY: &str = "plpoEiomh7k+cZtpxNJX9Zq2RNv0ugQruiH4lZGazHg=";
+/// Device node, instance and hardware id of the signed TAG driver that ships inside the core
+/// component; identical to `install-tag.ps1`, which stays the developer path with SDK checks.
+const DRIVER_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Enum\Root\ThinAudioGateway_4d699d4a\0000";
+const DRIVER_INSTANCE: &str = r"Root\ThinAudioGateway_4d699d4a\0000";
+const DRIVER_HARDWARE_ID: &str = "ThinAudioGateway_4d699d4a-65a5-40ec-9875-8e6d5fc01e0c";
+const DRIVER_DIR: &str = "vendor/tag-2.0.0.1903-demo";
+const NO_WINDOW: u32 = 0x08000000; // A GUI parent would otherwise flash a console.
 static DONE: AtomicU64 = AtomicU64::new(0);
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 
@@ -49,6 +58,67 @@ pub fn core_installed(root: &Path) -> bool {
             .join("vendor/tag-2.0.0.1903-demo/apidll/x64/tagapi.dll")
             .is_file()
         && root.join("bin/mic_tag_host.exe").is_file()
+}
+
+pub fn driver_installed() -> bool {
+    Command::new("reg")
+        .args(["query", DRIVER_KEY, "/v", "Service"])
+        .creation_flags(NO_WINDOW)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Installs the signed TAG driver that came with the core component. The user confirms one UAC
+/// prompt; no Windows security setting is changed. `install-tag.ps1` stays the developer path.
+pub fn install_driver(root: &Path) -> Result<(), String> {
+    let manager = root.join(DRIVER_DIR).join("wdmdrvmgr/x64/wdmdrvmgr.exe");
+    let inf = root
+        .join(DRIVER_DIR)
+        .join("driver/ThinAudioGateway_4d699d4a.inf");
+    for file in [&manager, &inf] {
+        if !file.is_file() {
+            return Err(format!("Файл драйвера не найден: {}", file.display()));
+        }
+    }
+    let status = Command::new(powershell())
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
+        .arg(install_script(&manager, &inf))
+        .creation_flags(NO_WINDOW)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err("Виртуальный микрофон не установлен: нужны права администратора. \
+                    Перезапустите Mic Noize и подтвердите запрос Windows."
+            .into());
+    }
+    if !driver_installed() {
+        return Err("Установщик драйвера завершился, но устройство не появилось".into());
+    }
+    Ok(())
+}
+
+fn powershell() -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()))
+        .join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// `Start-Process -Verb RunAs` is the only elevation path without a service. The INF argument
+/// carries its own quotes: Windows PowerShell does not quote list items that contain spaces,
+/// and the component path (`%APPDATA%\Mic Noize\Components`) has one.
+fn install_script(manager: &Path, inf: &Path) -> String {
+    format!(
+        "$ErrorActionPreference='Stop';\
+         $p=Start-Process -FilePath '{}' -ArgumentList @('-q','-h','{}','-i','{}','\"{}\"') \
+         -Verb RunAs -WindowStyle Hidden -PassThru -Wait;exit $p.ExitCode",
+        quoted(manager),
+        DRIVER_INSTANCE,
+        DRIVER_HARDWARE_ID,
+        quoted(inf)
+    )
+}
+
+fn quoted(path: &Path) -> String {
+    path.display().to_string().replace('\'', "''")
 }
 
 pub fn progress() -> Option<u8> {
@@ -266,5 +336,16 @@ mod tests {
         std::fs::write(&path, b"corrupt").unwrap();
         assert!(!cached_part_is_valid(&part, &path));
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn driver_install_script_quotes_paths_with_spaces() {
+        let script = install_script(
+            Path::new(r"C:\Program Files\wdmdrvmgr.exe"),
+            Path::new(r"C:\Users\a\AppData\Roaming\Mic Noize\Components\tag.inf"),
+        );
+        assert!(script.contains(r"-FilePath 'C:\Program Files\wdmdrvmgr.exe'"));
+        assert!(script.contains(r#"'"C:\Users\a\AppData\Roaming\Mic Noize\Components\tag.inf"'"#));
+        assert!(script.contains(DRIVER_HARDWARE_ID));
+        assert_eq!(quoted(Path::new(r"C:\it's\x.inf")), r"C:\it''s\x.inf");
     }
 }

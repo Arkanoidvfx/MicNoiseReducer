@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -114,7 +116,49 @@ struct Stats {
     std::atomic<unsigned> tagLateTicks{0}, tagReconnects{0};
     std::atomic<float> tagMaxWakeMs{0};
 };
-struct RoutedSample {float value=0;uint8_t discord=0,modified=0;unsigned epoch=0;float microphone=0;};
+struct RoutedSample {float value=0;uint8_t discord=0,modified=0;unsigned epoch=0;float microphone=0;float sound=0;};
+// Soundpad clip: decoded by the UI to 48 kHz mono, owned here so playback never touches files.
+struct SoundClip {std::vector<float> samples;std::atomic<float> gain{1};};
+constexpr uint64_t soundDoublePressMs=170;
+// One clip at a time in the DSP thread: a request replaces, restarts (quick double press) or
+// stops (same clip pressed again). Stop and replace ramp over 5 ms so Discord hears no click.
+class SoundPlayer {
+    std::shared_ptr<const SoundClip> clip_;
+    size_t position_=0;
+    unsigned id_=0;
+    uint64_t serial_=0;
+    float fade_=1,fadeStep_=0;
+    std::shared_ptr<const SoundClip> next_;unsigned nextId_=0;
+public:
+    static uint64_t pack(unsigned id,uint64_t serial,bool restart){return (serial<<33)|(restart?1ull<<32:0)|id;}
+    unsigned playing() const {return clip_?id_:0;}
+    float position() const {return position_/48000.0f;}
+    float length() const {return clip_?clip_->samples.size()/48000.0f:0;}
+    // Returns the clip id to fetch from the library, or 0 when the request is consumed here.
+    // A returned id is consumed only by commit(): a caller that cannot look it up yet retries.
+    unsigned request(uint64_t packed) {
+        const auto serial=packed>>33;if(serial==serial_)return 0;
+        const unsigned id=static_cast<unsigned>(packed&0xffffffffu);const bool restart=(packed>>32)&1;
+        if(id==0 || (!restart && clip_ && id==id_)){serial_=serial;stop();return 0;}
+        return id;
+    }
+    void commit(uint64_t packed){serial_=packed>>33;}
+    void stop(){if(clip_&&fade_>0){fadeStep_=-1.0f/240;}}
+    void start(unsigned id,std::shared_ptr<const SoundClip> clip){
+        if(!clip||clip->samples.empty()){stop();return;}
+        if(clip_&&fade_>0){next_=std::move(clip);nextId_=id;fadeStep_=-1.0f/240;return;}
+        clip_=std::move(clip);id_=id;position_=0;fade_=1;fadeStep_=0;
+    }
+    void render(float* out,unsigned count,float volume) {
+        for(unsigned i=0;i<count;++i){
+            out[i]=0;
+            if(!clip_)continue;
+            if(position_>=clip_->samples.size()){clip_.reset();if(next_){start(nextId_,std::move(next_));next_.reset();}continue;}
+            out[i]=std::clamp(clip_->samples[position_++]*clip_->gain.load(std::memory_order_relaxed)*volume*fade_,-1.0f,1.0f);
+            if(fadeStep_){fade_+=fadeStep_;if(fade_<=0){fade_=0;fadeStep_=0;clip_.reset();if(next_){start(nextId_,std::move(next_));next_.reset();}}}
+        }
+    }
+};
 // RVC audio crosses the worker boundary tagged with a generation: both rings are aligned
 // streams of the same sample index space, so a new generation starts at index 0 on both sides.
 struct RvcSample {float sample=0;unsigned generation=0;};
@@ -149,6 +193,14 @@ struct RvcPlayout {
 inline float previewSample(const RoutedSample& sample,uint8_t mask,unsigned epoch,bool audible) {
     return audible && (sample.modified&mask) && sample.epoch==epoch?sample.value:0;
 }
+// Producer side of the effects-only monitor: what goes into the preview queue for one output
+// sample. The consumer applies previewSample again, so a soundpad clip sample must carry
+// ModifiedSound here (preview queue only; routed samples never do).
+inline RoutedSample previewQueued(float effectOnly,uint8_t modified,unsigned sampleEpoch,float sound,uint8_t mask,unsigned epoch,bool audible) {
+    const bool clip=(mask&ModifiedSound) && sound!=0;
+    const RoutedSample sample{effectOnly,0,modified,sampleEpoch};
+    return {previewSample(sample,mask,epoch,audible)+(clip&&audible?sound:0),0,static_cast<uint8_t>(modified|(clip?ModifiedSound:0)),epoch};
+}
 class Engine {
     friend void checkDiscordCapture(unsigned seconds);
     friend class Monitor;
@@ -161,6 +213,13 @@ class Engine {
     Ring<16384,RoutedSample> preview_;
     std::atomic<uint8_t> previewMask_{0};
     void preview(const float* audio,const RoutedSample* routed,const uint8_t* modified,unsigned count);
+    std::mutex soundMutex_,soundRequestMutex_;
+    std::unordered_map<unsigned,std::shared_ptr<SoundClip>> sounds_;
+    // Newest finished hold-effect recording, for the UI to save as a file. The DSP thread
+    // only try-locks this slot: a contended block publishes on the next one.
+    std::mutex clipMutex_;
+    std::vector<float> clip_;
+    uint64_t soundSerial_=0,soundPressTick_=0;unsigned soundPressId_=0;
     std::atomic<bool> resetEffect_{false}, running_{false};
     mutable std::mutex statusMutex_;
     std::wstring status_ = L"Stopped";
@@ -187,6 +246,20 @@ public:
     std::atomic<unsigned> phraseCancel{0};
     std::atomic<unsigned> replayRequest{0};
     std::atomic<int> pitch{-5};
+    // Soundpad: library writes happen off the DSP thread; the DSP thread only try-locks.
+    std::atomic<uint64_t> soundRequest{0};
+    std::atomic<float> soundVolume{1};
+    std::atomic<unsigned> soundPlaying{0};
+    std::atomic<float> soundPosition{0},soundLength{0};
+    void soundLoad(unsigned id,std::vector<float> samples,float gain);
+    bool soundGain(unsigned id,float gain);
+    void soundClear();
+    void soundPlay(unsigned id);
+    std::shared_ptr<const SoundClip> soundClip(unsigned id);
+    // Bumped once per published recording; 0 means nothing was recorded yet.
+    std::atomic<unsigned> clipGeneration{0};
+    // Samples of the published recording, copying at most `capacity` of them into `out`.
+    unsigned clipCopy(float* out,unsigned capacity,unsigned* generation);
     unsigned held() const {
         const auto sample=heldSample.load();
         return heldFlags(sample,effectEpoch.load(),GetTickCount64(),running_ && stats.outputActive && !muted);
@@ -246,7 +319,7 @@ class Monitor {
 public:
     std::atomic<int> state{0}; // Off, Starting, Listening, Error
     std::atomic<uint64_t> frames{0};
-    std::atomic<float> renderedPeak{0};
+    std::atomic<float> renderedPeak{0}; // Held maximum; the reader exchanges it back to 0.
     explicit Monitor(Engine& engine);
     ~Monitor();
     void start(const std::wstring& route,uint8_t effectsMask=0);

@@ -4,15 +4,18 @@ mod engine;
 mod paths;
 mod rvc;
 mod settings;
+mod smooth;
+mod soundpad;
 mod telemetry;
 mod updater;
 mod view;
 use engine::{Config, Controls, Device, Engine, Reply, Snapshot};
 use iced::{Element, Font, Size, Subscription, Task, Theme, keyboard, window};
 use settings::{Settings, key_name};
+use soundpad::{Section, Sound, Sort as SoundSort, State as SoundState};
 use std::{
     os::windows::process::CommandExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -21,12 +24,77 @@ use std::{
 const TAG_HOST_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const TAG_HOST_RUN_NAME: &str = "MicNoize.TagHost";
 const LEGACY_TAG_HOST_RUN_NAME: &str = "MicNoiseReducer.TagHost"; // Legacy name, migration only.
+const DRIVER_INSTALL_MESSAGE: &str =
+    "Устанавливаем виртуальный микрофон: подтвердите запрос Windows…";
 const EXIT_EVENT: u32 = 2;
 const RESTART_EVENT: u32 = 4;
 /// Mirrors `mic::rvcSlack` (src/audio.hpp): RVC output is a fixed delay line of chunk + slack.
 const RVC_SLACK_MS: u32 = 200;
 const DISCORD_VOLUME_AT_100: f32 = 0.08;
 const DISCORD_VOLUME_MAX_PERCENT: f32 = 200.0;
+/// `Msg::Bind` targets above the 13 effect keys: the soundpad stop key and one per clip.
+const SOUND_STOP_BIND: usize = 99;
+/// Displayed 100 % soundpad volume as physical gain. Clips are normalised media near 0 dBFS
+/// while processed speech peaks around -18 dBFS; -14 dB puts a clip at voice level.
+const SOUND_VOLUME_AT_100: f32 = 0.2;
+const SOUND_BIND_BASE: usize = 100;
+/// Engine clip ids of the recordings list; above every soundpad clip id.
+const CLIP_ID_BASE: u32 = 900_000;
+/// How many recordings the microphone page keeps on disk.
+const CLIPS_KEPT: usize = 6;
+
+/// Local wall clock for recording names: std has no local time, `GetLocalTime` does.
+#[repr(C)]
+#[derive(Default)]
+struct LocalTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetLocalTime(time: *mut LocalTime);
+}
+fn clip_name() -> String {
+    let mut t = LocalTime::default();
+    unsafe { GetLocalTime(&mut t) };
+    format!(
+        "Запись {:04}-{:02}-{:02} {:02}-{:02}-{:02}.wav",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
+}
+/// A recording name -> "14:05:12"; any other name keeps its stem.
+fn clip_label(name: &str) -> String {
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let Some((date, time)) = stem
+        .trim_start_matches("Запись ")
+        .split_once(' ')
+    else {
+        return stem.to_owned();
+    };
+    match (date.split('-').count(), time.split('-').count()) {
+        (3, 3) => time.replace('-', ":"),
+        _ => stem.to_owned(),
+    }
+}
+/// `folder/name`, with " (n)" appended while that file exists: neither two recordings in the
+/// same second nor a second save into the same folder may overwrite anything.
+fn unique_path(folder: &Path, name: &str) -> PathBuf {
+    let (stem, extension) = name.rsplit_once('.').unwrap_or((name, "wav"));
+    let mut path = folder.join(name);
+    for n in 2..100 {
+        if !path.exists() {
+            break;
+        }
+        path = folder.join(format!("{stem} ({n}).{extension}"));
+    }
+    path
+}
 
 fn discord_volume_gain(percent: f32) -> f32 {
     percent.clamp(0.0, DISCORD_VOLUME_MAX_PERCENT) * DISCORD_VOLUME_AT_100 / 100.0
@@ -51,10 +119,29 @@ mod focus {
     pub const NONE: usize = usize::MAX;
     /// Page tabs: `TAB_BASE + page` (0 microphone, 1 voice changer, 2 settings, 3 headphones).
     pub const TAB_BASE: usize = 40;
-    pub mod bind {
-        pub const ACCEPT: usize = 0;
-        pub const CLEAR: usize = 1;
-        pub const CANCEL: usize = 2;
+    /// Page 4 lives outside `TAB_BASE + page`: 44 already belongs to `rvc::NAME`.
+    pub const TAB_SOUNDPAD: usize = 60;
+    /// Update banner above every page; it only exists while an update is downloaded.
+    pub const UPDATE_BANNER: usize = 74;
+    pub fn tab(page: u8) -> usize {
+        if page == 4 { TAB_SOUNDPAD } else { TAB_BASE + page as usize }
+    }
+    pub mod soundpad {
+        pub const FOLDER: usize = 61;
+        pub const ADD: usize = 62;
+        pub const REFRESH: usize = 63;
+        pub const VOLUME: usize = 64;
+        pub const HEAR: usize = 65;
+        pub const STOP_BIND: usize = 66;
+        pub const FILTER: usize = 67;
+        pub const SORT: usize = 68;
+        pub const SECTION_ADD: usize = 69;
+        pub const SECTION_NAME: usize = 70;
+        pub const SECTION_DELETE: usize = 71;
+        /// Row `i`: `ROW_BASE + 3 * i` play, `+ 1` volume, `+ 2` hotkey.
+        pub const ROW_BASE: usize = 1000;
+        /// Sidebar entry `i` of `App::section_items`.
+        pub const SECTION_BASE: usize = 20000;
     }
     pub mod settings {
         pub const INPUT: usize = 0;
@@ -67,6 +154,8 @@ mod focus {
         pub const AUTOSTART: usize = 8;
         pub const UPDATE: usize = 57;
         pub const APPLY_UPDATE: usize = 58;
+        pub const DRIVER: usize = 72;
+        pub const REPORT: usize = 73;
     }
     pub mod effects {
         pub const INPUT: usize = 35;
@@ -89,6 +178,11 @@ mod focus {
         pub const MONITOR: usize = 9;
         pub const MONITOR_BIND: usize = 23;
         pub const REPLAY_BIND: usize = 32;
+        /// Save menu of the recording opened in `App::clip_menu`.
+        pub const CLIP_TO_SOUNDPAD: usize = 1990;
+        pub const CLIP_TO_FOLDER: usize = 1991;
+        /// Recording `i`: `CLIP_BASE + 2 * i` play, `+ 1` save.
+        pub const CLIP_BASE: usize = 2000;
         pub const DISCORD_VOLUME: usize = 22;
         pub const EFFECTS_MONITOR: usize = 31;
         pub const BOOST_MONITOR: usize = 36;
@@ -236,11 +330,53 @@ enum Msg {
     RvcInstall,
     RvcInstalled(Result<String, String>),
     CoreInstalled(Result<String, String>),
+    InstallDriver,
+    DriverInstalled(Result<(), String>),
+    SendReport,
+    ReportSent(Result<String, String>),
     UpdateCheck,
     UpdateChecked(updater::Status),
     ApplyUpdate,
     CancelPhrase,
     Bind(usize),
+    SoundpadFolder,
+    SoundpadPicked(bool, Result<Vec<PathBuf>, String>),
+    SoundpadAdd,
+    SoundpadRefresh,
+    SoundpadVolume(f32),
+    SoundpadHear(bool),
+    SoundpadFilter(String),
+    SoundpadSort(SoundSort),
+    /// Absolute scroll offset and viewport height of the body: the clip list renders only
+    /// the rows near the viewport.
+    SoundpadScroll(f32, f32),
+    SoundHover(usize, bool),
+    /// Mouse wheel over a scrollable (by id), in pixels; eased by `smooth`.
+    Wheel(&'static str, f32),
+    ScrollProbe(&'static str, Option<(f32, f32, f32)>),
+    ScrollFrame(Instant),
+    SoundpadStop,
+    SectionSelect(usize),
+    SectionAdd,
+    SectionName(String),
+    SectionRename,
+    SectionDelete,
+    DragStart(usize),
+    DragOver(Option<usize>),
+    DragEnd,
+    SoundUnassign(usize),
+    SoundPlay(usize),
+    SoundVolume(usize, f32),
+    SoundLoaded(usize, u32, Result<f32, String>),
+    /// A finished hold-effect recording was written to the recordings folder.
+    ClipRecorded(Result<(), String>),
+    ClipPlay(usize),
+    ClipLoaded(usize, u32, Result<f32, String>),
+    /// Open (or close) the "where to save" menu of recording `i`.
+    ClipMenu(Option<usize>),
+    /// Save recording `i` into the soundpad folder (`true`) or a folder picked now.
+    ClipSave(usize, bool),
+    ClipPicked(usize, bool, Result<Vec<PathBuf>, String>),
     CancelBind,
     ClearBind,
     AcceptBind,
@@ -248,7 +384,57 @@ enum Msg {
     Noop,
     Screenshot(window::Screenshot),
 }
+/// Which sidebar entry filters the clip list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Selection {
+    All,
+    /// Automatic group by name prefix (lowercase key).
+    Group(String),
+    /// Index into `App::sections`.
+    Custom(usize),
+}
+struct SectionItem {
+    label: String,
+    count: usize,
+    selection: Selection,
+}
 struct App {
+    soundpad_page: bool,
+    sound_folder: Option<PathBuf>,
+    sounds: Vec<Sound>,
+    sound_volume: f32,
+    sound_monitor: bool,
+    sound_filter: String,
+    sound_sort: SoundSort,
+    sound_scroll: (f32, f32),
+    sound_hover: Option<usize>,
+    scroll_anims: std::collections::HashMap<&'static str, smooth::Anim>,
+    scroll_pending: std::collections::HashMap<&'static str, f32>,
+    sections: Vec<Section>,
+    section: Selection,
+    section_name: String,
+    /// Clip index being dragged from the list, and the custom section under the cursor.
+    dragging: Option<usize>,
+    drag_over: Option<usize>,
+    sound_stop_key: u32,
+    /// Bumped on every rescan so a decode finishing for an old list is ignored.
+    sound_generation: u32,
+    sound_pending_play: Option<usize>,
+    sound_playing: (u32, f32, f32),
+    sound_note: String,
+    sound_dialog: bool,
+    /// The six newest hold-effect recordings, newest first, and their folder.
+    clips: Vec<Sound>,
+    clips_folder: PathBuf,
+    /// Generation of the recording last taken from the engine.
+    clip_generation: u32,
+    /// Bumped on every recordings rescan so a decode for an old list is ignored.
+    clip_loads: u32,
+    clip_menu: Option<usize>,
+    clip_pending_play: Option<usize>,
+    clip_note: String,
+    /// Decayed peak of the monitor's own output: shows that "hear sounds" really renders.
+    monitor_peak: f32,
     headphone_page: bool,
     headphone_output: Option<Device>,
     headphone_denoise: bool,
@@ -273,6 +459,9 @@ struct App {
     runtime_root: PathBuf,
     component_root: PathBuf,
     core_installing: bool,
+    driver_installing: bool,
+    driver_ready: bool,
+    report_sending: bool,
     rvc_runtime_installed: bool,
     rvc_runtime_installing: bool,
     keys: [u32; 13],
@@ -305,8 +494,11 @@ struct App {
     apply_after_quit: bool,
     busy: bool,
     quitting: bool,
+    /// `Msg::Bind` target whose button is capturing a key in place.
     binding: Option<usize>,
     candidate: u32,
+    /// Captured key that another binding already uses; shown on the capturing button.
+    bind_conflict: Option<u32>,
     auto_started: bool,
     focus: usize,
     dirty: Option<Instant>,
@@ -321,6 +513,17 @@ struct App {
     benchmark: bool,
     usage: (Instant, u64),
     measurements: String,
+}
+/// The [`CLIPS_KEPT`] newest recordings of `folder`, newest first; older files are deleted.
+fn newest_clips(folder: &Path) -> Vec<Sound> {
+    let mut clips = soundpad::scan(folder, &[]).unwrap_or_default();
+    clips.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| b.name.cmp(&a.name)));
+    if clips.len() > CLIPS_KEPT {
+        for extra in clips.drain(CLIPS_KEPT..) {
+            let _ = std::fs::remove_file(&extra.path);
+        }
+    }
+    clips
 }
 fn timer(visible: bool) -> Task<Msg> {
     Task::perform(
@@ -435,6 +638,29 @@ impl App {
             }
         }
         engine.bindings(keys);
+        let sound_folder = settings
+            .get("soundpad", "folder")
+            .filter(|f| !f.is_empty())
+            .map(PathBuf::from);
+        let sound_volume = settings.number("soundpad", "volume", 100, 0, 200) as f32 / 100.0;
+        let sound_monitor = settings.number("soundpad", "monitor", 0, 0, 1) != 0;
+        let sound_stop_key = settings.number("soundpad", "stop_key", 0, 0, 2046) as u32;
+        let sound_sort = SoundSort::from_code(settings.number("soundpad", "sort", 0, 0, 3));
+        let sections = soundpad::sections(&settings);
+        let (sounds, sound_note) = match &sound_folder {
+            Some(folder) => match soundpad::scan(folder, &soundpad::entries(&settings)) {
+                Ok(sounds) => (sounds, String::new()),
+                Err(e) => (vec![], format!("Папка недоступна: {e}")),
+            },
+            None => (vec![], String::new()),
+        };
+        engine.sound_volume(sound_volume * SOUND_VOLUME_AT_100);
+        let clips_folder = settings
+            .path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("Записи");
+        let clips = newest_clips(&clips_folder);
         if !cfg!(test) {
             engine.refresh();
         }
@@ -463,6 +689,11 @@ impl App {
             (Some(id), task)
         };
         let core_installing = !cfg!(test) && !components::core_installed(&runtime_root);
+        // The TAG driver is machine-wide and absent on a fresh install; the core component
+        // carries its files, so this can only run once they are on disk.
+        let driver_ready = cfg!(test) || components::driver_installed();
+        let driver_installing = !core_installing && !driver_ready;
+        let driver_root = runtime_root.clone();
         let rvc_runtime_installed = cfg!(test) || components::rvc_installed(&runtime_root);
         let rvc_models = if cfg!(test) {
             vec![]
@@ -474,8 +705,37 @@ impl App {
             .find(|model| model.slot == controls.rvc_options.slot)
             .map(|model| model.name.clone())
             .unwrap_or_default();
-        Ok(Some((
-            Self {
+        let mut app = Self {
+                soundpad_page: args.iter().any(|s| s == "--ui-soundpad"),
+                sound_folder,
+                sounds,
+                sound_volume,
+                sound_monitor,
+                sound_filter: String::new(),
+                sound_sort,
+                sound_scroll: (0.0, 800.0),
+                sound_hover: None,
+                scroll_anims: std::collections::HashMap::new(),
+                scroll_pending: std::collections::HashMap::new(),
+                sections,
+                section: Selection::All,
+                section_name: String::new(),
+                dragging: None,
+                drag_over: None,
+                sound_stop_key,
+                sound_generation: 0,
+                sound_pending_play: None,
+                sound_playing: (0, 0.0, 0.0),
+                sound_note,
+                sound_dialog: false,
+                clips,
+                clips_folder,
+                clip_generation: 0,
+                clip_loads: 0,
+                clip_menu: None,
+                clip_pending_play: None,
+                clip_note: String::new(),
+                monitor_peak: 0.0,
                 engine,
                 settings,
                 window,
@@ -500,6 +760,9 @@ impl App {
                 runtime_root,
                 component_root: component_root.clone(),
                 core_installing,
+                driver_installing,
+                driver_ready,
+                report_sending: false,
                 rvc_runtime_installed,
                 rvc_runtime_installing: false,
                 keys,
@@ -520,6 +783,8 @@ impl App {
                 monitor_message: String::new(),
                 message: if core_installing {
                     "Устанавливаем основной NVIDIA/TAG runtime…".into()
+                } else if driver_installing {
+                    DRIVER_INSTALL_MESSAGE.into()
                 } else {
                     String::new()
                 },
@@ -542,6 +807,7 @@ impl App {
                 quitting: false,
                 binding: None,
                 candidate: 0,
+                bind_conflict: None,
                 auto_started: false,
                 focus: focus::NONE,
                 dirty: None,
@@ -556,10 +822,15 @@ impl App {
                 benchmark: cfg!(test) || args.iter().any(|s| s == "--ui-benchmark"),
                 usage: (Instant::now(), 0),
                 measurements: "state,cpu_one_core_percent,working_set_mb\n".into(),
-            },
+        };
+        app.sanitize_sound_keys();
+        let preload = app.sync_sound_bindings();
+        Ok(Some((
+            app,
             Task::batch([
                 open,
                 timer(true),
+                preload,
                 if cfg!(test) {
                     Task::none()
                 } else {
@@ -569,6 +840,14 @@ impl App {
                     Task::perform(
                         async move { components::install_core(&component_root) },
                         Msg::CoreInstalled,
+                    )
+                } else {
+                    Task::none()
+                },
+                if driver_installing {
+                    Task::perform(
+                        async move { components::install_driver(&driver_root) },
+                        Msg::DriverInstalled,
                     )
                 } else {
                     Task::none()
@@ -661,6 +940,25 @@ impl App {
             self.settings.set("effects", k, v);
         }
         self.settings.set("ui", "tray_hint", self.hint_shown as i32);
+        if let Some(folder) = &self.sound_folder {
+            self.settings
+                .set("soundpad", "folder", folder.to_string_lossy());
+        }
+        self.settings
+            .set("soundpad", "volume", (self.sound_volume * 100.0).round() as i32);
+        self.settings
+            .set("soundpad", "monitor", self.sound_monitor as i32);
+        self.settings
+            .set("soundpad", "stop_key", self.sound_stop_key as i32);
+        self.settings
+            .set("soundpad", "sort", self.sound_sort.code());
+        self.settings.set(
+            "soundpad",
+            "sections",
+            soundpad::serialize_sections(&self.sections),
+        );
+        self.settings
+            .set("soundpad", "sounds", soundpad::serialize(&self.sounds));
         self.controls.rvc_options.save(&mut self.settings);
         self.engine
             .save(self.settings.path.clone(), self.settings.text());
@@ -704,17 +1002,244 @@ impl App {
     fn ui_active(&self) -> bool {
         self.window.is_some() && self.window_focused
     }
+    /// Native monitor mode: 1 is the full voice, otherwise 1 + mask (1 effects, 2 boost, 4 sounds).
     fn monitor_mode(&self) -> i32 {
         if self.monitor_all {
-            1
-        } else {
-            match (self.effects_monitor, self.boost_monitor) {
-                (false, false) => 0,
-                (true, false) => 2,
-                (false, true) => 3,
-                (true, true) => 4,
+            return 1;
+        }
+        let mask = self.effects_monitor as i32 | (self.boost_monitor as i32) << 1
+            | (self.sound_monitor as i32) << 2;
+        if mask == 0 { 0 } else { 1 + mask }
+    }
+    fn effect_monitoring(&self) -> bool {
+        self.effects_monitor || self.boost_monitor || self.sound_monitor
+    }
+    /// Every hotkey in use, as (`Msg::Bind` target, key).
+    fn all_keys(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
+        self.keys
+            .iter()
+            .enumerate()
+            .map(|(i, &k)| (i, k))
+            .chain(std::iter::once((SOUND_STOP_BIND, self.sound_stop_key)))
+            .chain(
+                self.sounds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (SOUND_BIND_BASE + i, s.key)),
+            )
+    }
+    fn key_taken(&self, target: usize, key: u32) -> bool {
+        key != 0 && self.all_keys().any(|(t, k)| t != target && k == key)
+    }
+    fn sanitize_sound_keys(&mut self) {
+        let valid = |k: u32| (3..=254).contains(&(k & 255));
+        if self.sound_stop_key != 0
+            && (!valid(self.sound_stop_key) || self.keys.contains(&self.sound_stop_key))
+        {
+            self.sound_stop_key = 0;
+        }
+        for i in 0..self.sounds.len() {
+            let key = self.sounds[i].key;
+            if key != 0 && (!valid(key) || self.key_taken(SOUND_BIND_BASE + i, key)) {
+                self.sounds[i].key = 0;
             }
         }
+    }
+    fn sound_id(index: usize) -> u32 {
+        index as u32 + 1
+    }
+    /// Push the clip hotkeys to the engine and start decoding every bound clip not yet loaded.
+    fn sync_sound_bindings(&mut self) -> Task<Msg> {
+        let mut bindings: Vec<(u32, u32)> = self
+            .sounds
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.key != 0)
+            .map(|(i, s)| (Self::sound_id(i), s.key))
+            .collect();
+        if self.sound_stop_key != 0 {
+            bindings.push((0, self.sound_stop_key));
+        }
+        if !self.engine.sound_bindings(&bindings) {
+            self.message = "Хоткеи звуков отклонены движком".into();
+        }
+        let bound: Vec<usize> = (0..self.sounds.len())
+            .filter(|&i| self.sounds[i].key != 0 && self.sounds[i].state == SoundState::Unloaded)
+            .collect();
+        Task::batch(bound.into_iter().map(|i| self.load_sound(i)))
+    }
+    fn clip_id(index: usize) -> u32 {
+        CLIP_ID_BASE + index as u32
+    }
+    /// Re-read the recordings folder; older files beyond [`CLIPS_KEPT`] are deleted.
+    fn rescan_clips(&mut self) {
+        self.clip_loads += 1;
+        self.clip_menu = None;
+        self.clip_note.clear();
+        self.clip_pending_play = None;
+        self.clips = newest_clips(&self.clips_folder);
+    }
+    fn load_clip(&mut self, index: usize) -> Task<Msg> {
+        let Some(clip) = self.clips.get_mut(index) else {
+            return Task::none();
+        };
+        if clip.state == SoundState::Loading {
+            return Task::none();
+        }
+        clip.state = SoundState::Loading;
+        let path = clip.path.clone();
+        let (loader, id, generation) = (
+            self.engine.sound_loader(),
+            Self::clip_id(index),
+            self.clip_loads,
+        );
+        Task::perform(
+            async move {
+                let pcm = soundpad::decode(&path)?;
+                loader.load(id, &pcm, 1.0)?;
+                Ok(pcm.len() as f32 / soundpad::RATE as f32)
+            },
+            move |result| Msg::ClipLoaded(index, generation, result),
+        )
+    }
+    /// Copy recording `index` into `folder` under its own name.
+    fn copy_clip(&mut self, index: usize, folder: &Path) {
+        let Some(clip) = self.clips.get(index) else {
+            return;
+        };
+        let target = unique_path(folder, &clip.name);
+        self.clip_note = match std::fs::copy(&clip.path, &target) {
+            Ok(_) => format!(
+                "Сохранено: {}",
+                target.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            Err(e) => format!(
+                "Не удалось сохранить: {e}"
+            ),
+        };
+    }
+    fn load_sound(&mut self, index: usize) -> Task<Msg> {
+        let Some(sound) = self.sounds.get_mut(index) else {
+            return Task::none();
+        };
+        if sound.state == SoundState::Loading {
+            return Task::none();
+        }
+        sound.state = SoundState::Loading;
+        let (path, gain) = (sound.path.clone(), sound.gain());
+        let (loader, id, generation) = (
+            self.engine.sound_loader(),
+            Self::sound_id(index),
+            self.sound_generation,
+        );
+        Task::perform(
+            async move {
+                let pcm = soundpad::decode(&path)?;
+                loader.load(id, &pcm, gain)?;
+                Ok(pcm.len() as f32 / soundpad::RATE as f32)
+            },
+            move |result| Msg::SoundLoaded(index, generation, result),
+        )
+    }
+    /// Re-read the folder, keeping keys and gains of clips that are still there.
+    fn rescan_sounds(&mut self) -> Task<Msg> {
+        self.sound_generation += 1;
+        self.sound_pending_play = None;
+        self.engine.sound_clear();
+        // sound_clear drops the loaded recordings too; they decode again on the next play.
+        self.clip_pending_play = None;
+        for clip in &mut self.clips {
+            clip.state = SoundState::Unloaded;
+        }
+        let Some(folder) = self.sound_folder.clone() else {
+            self.sounds.clear();
+            return Task::none();
+        };
+        let saved: Vec<soundpad::Entry> = self
+            .sounds
+            .iter()
+            .map(|s| soundpad::Entry {
+                name: s.name.clone(),
+                key: s.key,
+                volume: s.volume,
+                played: s.played,
+            })
+            .collect();
+        match soundpad::scan(&folder, &saved) {
+            Ok(sounds) => {
+                self.sounds = sounds;
+                self.sound_note = if self.sounds.is_empty() {
+                    "В папке нет mp3, wav или ogg. Нажмите «Добавить звуки».".into()
+                } else {
+                    String::new()
+                };
+            }
+            Err(e) => {
+                self.sounds.clear();
+                self.sound_note = format!("Папка недоступна: {e}");
+            }
+        }
+        self.sanitize_sound_keys();
+        self.dirty = Some(Instant::now());
+        self.sync_sound_bindings()
+    }
+    /// Indices of the clips shown by the sidebar selection and the text filter, in the
+    /// selected order.
+    fn visible_sounds(&self) -> Vec<usize> {
+        let filter = self.sound_filter.trim().to_lowercase();
+        let custom = match &self.section {
+            Selection::Custom(i) => self.sections.get(*i),
+            _ => None,
+        };
+        soundpad::order(&self.sounds, self.sound_sort)
+            .into_iter()
+            .filter(|&i| {
+                let sound = &self.sounds[i];
+                (filter.is_empty() || sound.name.to_lowercase().contains(&filter))
+                    && match &self.section {
+                        Selection::All => true,
+                        Selection::Group(key) => {
+                            soundpad::prefix(&sound.name).is_some_and(|(_, k)| k == *key)
+                        }
+                        Selection::Custom(_) => {
+                            custom.is_some_and(|s| s.files.contains(&sound.name))
+                        }
+                    }
+            })
+            .collect()
+    }
+    /// Sidebar entries: everything, automatic prefix groups, then the user's sections.
+    fn section_items(&self) -> Vec<SectionItem> {
+        let mut items = vec![SectionItem {
+            label: "Все звуки".into(),
+            count: self.sounds.len(),
+            selection: Selection::All,
+        }];
+        items.extend(soundpad::groups(&self.sounds).into_iter().map(|g| SectionItem {
+            label: g.label,
+            count: g.count,
+            selection: Selection::Group(g.key),
+        }));
+        items.extend(self.sections.iter().enumerate().map(|(i, s)| SectionItem {
+            label: s.name.clone(),
+            count: s
+                .files
+                .iter()
+                .filter(|f| self.sounds.iter().any(|sound| sound.name == **f))
+                .count(),
+            selection: Selection::Custom(i),
+        }));
+        items
+    }
+    fn custom_section(&self) -> Option<usize> {
+        match self.section {
+            Selection::Custom(i) if i < self.sections.len() => Some(i),
+            _ => None,
+        }
+    }
+    fn select_section(&mut self, selection: Selection) {
+        self.section_name.clear();
+        self.section = selection;
     }
     fn auto_start(&mut self) {
         if self.auto_started
@@ -722,6 +1247,7 @@ impl App {
             || self.busy
             || self.running()
             || self.core_installing
+            || self.driver_installing
         {
             return;
         }
@@ -739,6 +1265,14 @@ impl App {
         self.engine.start(c);
     }
     fn update(&mut self, msg: Msg) -> Task<Msg> {
+        if matches!(&msg, Msg::Page(_) | Msg::Hide | Msg::Minimize
+            | Msg::WindowFocus(_, false) | Msg::SoundpadFilter(_) | Msg::SoundpadSort(_)
+            | Msg::SectionSelect(_) | Msg::SoundpadRefresh | Msg::SoundpadPicked(_, _))
+        {
+            self.scroll_anims.clear();
+            self.scroll_pending.clear();
+            self.sound_hover = None;
+        }
         match msg {
             Msg::Tick => {
                 self.ticks += 1;
@@ -800,7 +1334,7 @@ impl App {
                             if let Err(e) = result {
                                 self.message = e;
                                 self.snapshot.state = 5;
-                            } else if self.effects_monitor || self.boost_monitor {
+                            } else if self.effect_monitoring() {
                                 self.engine.monitor(self.monitor_mode());
                             }
                         }
@@ -867,12 +1401,16 @@ impl App {
                                     .map(|d| d.id.as_str())
                                     .or(self.settings.get("audio", "output"))
                                     .unwrap_or("TAG");
-                                self.input = i
-                                    .iter()
-                                    .find(|d| {
-                                        input_id.map_or(d.name.contains("HyperX"), |id| d.id == id)
-                                    })
-                                    .cloned();
+                                // A saved microphone must match exactly or stay unselected; without
+                                // one, prefer HyperX, then the Windows default (first in the list).
+                                self.input = match input_id {
+                                    Some(id) => i.iter().find(|d| d.id == id),
+                                    None => i
+                                        .iter()
+                                        .find(|d| d.name.contains("HyperX"))
+                                        .or_else(|| i.first()),
+                                }
+                                .cloned();
                                 self.output = o.iter().find(|d| d.id == output_id).cloned();
                                 self.inputs = i;
                                 if self.headphone_output.is_none() {
@@ -908,6 +1446,15 @@ impl App {
                     self.discord_source,
                     self.discord_message,
                 ) = self.engine.discord_state();
+                let playing = self.engine.sound_state();
+                // Hotkey starts happen natively: the engine state is the one source of "played".
+                if playing.0 != 0 && playing.0 != self.sound_playing.0
+                    && let Some(sound) = self.sounds.get_mut(playing.0 as usize - 1)
+                {
+                    sound.played = soundpad::now();
+                    self.dirty = Some(Instant::now());
+                }
+                self.sound_playing = playing;
                 let (monitor, monitor_message) = self.engine.monitor_state();
                 if monitor == 3 && self.monitor != 3 {
                     self.message = format!("Прослушивание: {monitor_message}");
@@ -919,6 +1466,7 @@ impl App {
                 }
                 if self.ui_active() {
                     self.peak = snapshot.output_peak.max(self.peak * 0.80);
+                    self.monitor_peak = self.engine.monitor_peak().max(self.monitor_peak * 0.80);
                 }
                 if snapshot.captured_key != 0 && self.binding.is_some() {
                     if snapshot.captured_key == u32::MAX {
@@ -927,7 +1475,9 @@ impl App {
                             timer(self.ui_active()),
                         ]);
                     }
+                    // Capture happens on the button itself: a valid key is taken at once.
                     self.candidate = snapshot.captured_key;
+                    return Task::batch([self.update(Msg::AcceptBind), timer(self.ui_active())]);
                 }
                 let events = self.engine.events();
                 if events & 16 != 0 {
@@ -955,6 +1505,20 @@ impl App {
                 let next = timer(self.ui_active() && self.running());
                 if events & 17 != 0 {
                     return Task::batch([next, self.update(Msg::Show)]);
+                }
+                if let Some((generation, samples)) = self.engine.last_clip(self.clip_generation) {
+                    self.clip_generation = generation;
+                    let (folder, name) = (self.clips_folder.clone(), clip_name());
+                    return Task::batch([
+                        next,
+                        Task::perform(
+                            async move {
+                                std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+                                soundpad::write_wav(&unique_path(&folder, &name), &samples)
+                            },
+                            Msg::ClipRecorded,
+                        ),
+                    ]);
                 }
                 if self.capture_path.is_some() && !self.capture_started && self.ticks >= 12 {
                     self.capture_started = true;
@@ -1091,8 +1655,9 @@ impl App {
             }
             Msg::Page(page) => {
                 if self.binding.is_some() {
-                    return Task::none();
+                    let _ = self.update(Msg::CancelBind);
                 }
+                self.soundpad_page = page == 4;
                 self.headphone_page = page == 3;
                 self.details = page == 2;
                 self.rvc_page = page == 1;
@@ -1320,8 +1885,68 @@ impl App {
                         self.rvc_runtime_installed = components::rvc_installed(&self.runtime_root);
                         self.message = format!("Основной runtime {version} установлен");
                         self.engine.refresh();
+                        if !components::driver_installed() {
+                            self.driver_installing = true;
+                            self.message = DRIVER_INSTALL_MESSAGE.into();
+                            let root = self.runtime_root.clone();
+                            return Task::perform(
+                                async move { components::install_driver(&root) },
+                                Msg::DriverInstalled,
+                            );
+                        }
                     }
                     Err(error) => self.message = format!("Основной runtime: {error}"),
+                }
+            }
+            Msg::InstallDriver => {
+                self.focus = focus::settings::DRIVER;
+                if !self.driver_installing && !self.driver_ready && !self.core_installing {
+                    self.driver_installing = true;
+                    self.message = DRIVER_INSTALL_MESSAGE.into();
+                    let root = self.runtime_root.clone();
+                    return Task::perform(
+                        async move { components::install_driver(&root) },
+                        Msg::DriverInstalled,
+                    );
+                }
+            }
+            Msg::SendReport => {
+                self.focus = focus::settings::REPORT;
+                if !self.report_sending {
+                    // The note carries what the log files cannot: what the UI last showed.
+                    let note = format!(
+                        "state={} driver={} core={} message={}",
+                        self.snapshot.state, self.driver_ready, !self.core_installing, self.message
+                    );
+                    self.report_sending = true;
+                    self.message = "Отправляем логи…".into();
+                    let runtime = self.runtime_root.clone();
+                    return Task::perform(
+                        async move {
+                            telemetry::report(&paths::Paths::resolve()?.data, &runtime, &note)
+                        },
+                        Msg::ReportSent,
+                    );
+                }
+            }
+            Msg::ReportSent(result) => {
+                self.report_sending = false;
+                self.message = match result {
+                    Ok(text) => text,
+                    Err(error) => error,
+                };
+            }
+            Msg::DriverInstalled(result) => {
+                self.driver_installing = false;
+                match result {
+                    // The virtual microphone appears only after the driver exists; the host
+                    // opens it on the next engine start.
+                    Ok(()) => {
+                        self.driver_ready = true;
+                        self.message = "Виртуальный микрофон Mic Noize установлен".into();
+                        self.engine.refresh();
+                    }
+                    Err(error) => self.message = error,
                 }
             }
             Msg::RvcModel(model) => {
@@ -1480,37 +2105,435 @@ impl App {
                 self.focus = focus::effects::CANCEL_PHRASE;
             }
             Msg::Bind(i) => {
+                if i >= SOUND_BIND_BASE && i - SOUND_BIND_BASE >= self.sounds.len() {
+                    return Task::none();
+                }
+                if self.binding == Some(i) {
+                    return self.update(Msg::CancelBind); // second click on the same button
+                }
                 self.binding = Some(i);
                 self.candidate = 0;
-                self.focus = focus::bind::ACCEPT;
+                self.bind_conflict = None;
+                self.focus = Self::bind_focus(i);
                 self.engine.capture(true);
+            }
+            Msg::SoundpadFolder | Msg::SoundpadAdd => {
+                let folder = matches!(msg, Msg::SoundpadFolder);
+                self.focus = if folder {
+                    focus::soundpad::FOLDER
+                } else {
+                    focus::soundpad::ADD
+                };
+                if self.sound_dialog {
+                    return Task::none();
+                }
+                if !folder && self.sound_folder.is_none() {
+                    self.sound_note = "Сначала выберите папку со звуками.".into();
+                    return Task::none();
+                }
+                self.sound_dialog = true;
+                return Task::perform(async move { engine::pick_paths(folder) }, move |r| {
+                    Msg::SoundpadPicked(folder, r)
+                });
+            }
+            Msg::SoundpadPicked(folder, result) => {
+                self.sound_dialog = false;
+                match result {
+                    Ok(paths) if paths.is_empty() => {}
+                    Ok(paths) if folder => {
+                        self.sound_folder = paths.into_iter().next();
+                        self.sounds.clear();
+                        return self.rescan_sounds();
+                    }
+                    Ok(paths) => {
+                        let Some(target) = self.sound_folder.clone() else {
+                            return Task::none();
+                        };
+                        match soundpad::import(&target, &paths) {
+                            Ok((copied, skipped)) => {
+                                let task = self.rescan_sounds();
+                                if self.sound_note.is_empty() {
+                                    self.sound_note = format!(
+                                        "Добавлено: {copied}{}",
+                                        if skipped > 0 {
+                                            format!(", пропущено (уже есть): {skipped}")
+                                        } else {
+                                            String::new()
+                                        }
+                                    );
+                                }
+                                return task;
+                            }
+                            Err(e) => self.sound_note = format!("Не удалось добавить: {e}"),
+                        }
+                    }
+                    Err(e) => self.sound_note = format!("Диалог не открылся: {e}"),
+                }
+            }
+            Msg::SoundpadRefresh => {
+                self.focus = focus::soundpad::REFRESH;
+                return self.rescan_sounds();
+            }
+            Msg::SoundpadVolume(v) => {
+                self.sound_volume = (v / 100.0).clamp(0.0, 2.0);
+                self.engine.sound_volume(self.sound_volume * SOUND_VOLUME_AT_100);
+                self.focus = focus::soundpad::VOLUME;
+                self.dirty = Some(Instant::now());
+            }
+            Msg::SoundpadHear(enabled) => {
+                self.sound_monitor = enabled;
+                self.focus = focus::soundpad::HEAR;
+                self.dirty = Some(Instant::now());
+                if !matches!(self.monitor, 1 | 2) {
+                    self.monitor_all = false;
+                }
+                if !self.monitor_all && !self.busy && !self.quitting && self.running() {
+                    self.message.clear();
+                    self.engine.monitor(self.monitor_mode());
+                }
+            }
+            Msg::SoundpadFilter(text) => {
+                self.sound_filter = text.chars().take(80).collect();
+                self.focus = focus::soundpad::FILTER;
+            }
+            Msg::SoundpadSort(sort) => {
+                self.sound_sort = sort;
+                self.focus = focus::soundpad::SORT;
+                self.dirty = Some(Instant::now());
+            }
+            Msg::SoundpadScroll(offset, height) => {
+                self.sound_scroll = (offset, height);
+            }
+            Msg::SoundHover(i, entered) => {
+                if entered && i < self.sounds.len() {
+                    self.sound_hover = Some(i);
+                } else if self.sound_hover == Some(i) {
+                    self.sound_hover = None;
+                }
+            }
+            Msg::Wheel(id, delta) => {
+                if let Some(anim) = self.scroll_anims.get_mut(id) {
+                    anim.push(delta);
+                    return Task::none(); // the running frame loop picks the new target up
+                }
+                // First notch: measure the real offset before easing away from it.
+                let pending = self.scroll_pending.entry(id).or_insert(0.0);
+                let first = *pending == 0.0;
+                *pending += delta;
+                if first {
+                    return smooth::probe(id, move |r| Msg::ScrollProbe(id, r));
+                }
+            }
+            Msg::ScrollProbe(id, result) => {
+                let Some((offset, viewport, content)) = result else {
+                    self.scroll_anims.remove(id);
+                    self.scroll_pending.remove(id);
+                    return Task::none();
+                };
+                if let Some(delta) = self.scroll_pending.remove(id) {
+                    if id == "body" && self.soundpad_page {
+                        self.sound_scroll = (offset, viewport);
+                    }
+                    let mut anim = smooth::Anim {
+                        current: offset,
+                        target: offset,
+                        viewport,
+                        content,
+                        last_frame: Instant::now(),
+                    };
+                    anim.push(delta);
+                    self.scroll_anims.insert(id, anim);
+                }
+            }
+            Msg::ScrollFrame(now) => {
+                let mut tasks = Vec::with_capacity(self.scroll_anims.len());
+                self.scroll_anims.retain(|&id, anim| {
+                    let active = anim.step(now);
+                    if id == "body" && self.soundpad_page {
+                        self.sound_scroll = (anim.current, anim.viewport);
+                    }
+                    tasks.push(iced::widget::operation::scroll_to(id,
+                        iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(anim.current) }));
+                    active
+                });
+                return Task::batch(tasks);
+            }
+            Msg::SectionSelect(i) => {
+                let items = self.section_items();
+                if let Some(item) = items.get(i) {
+                    self.select_section(item.selection.clone());
+                    self.focus = focus::soundpad::SECTION_BASE + i;
+                    return iced::widget::operation::snap_to(
+                        "body",
+                        iced::widget::scrollable::RelativeOffset::START,
+                    );
+                }
+            }
+            Msg::SectionAdd => {
+                self.focus = focus::soundpad::SECTION_ADD;
+                let mut name = "Новый раздел".to_string();
+                let mut n = 2;
+                while self.sections.iter().any(|s| s.name == name) {
+                    name = format!("Новый раздел {n}");
+                    n += 1;
+                }
+                self.sections.push(Section {
+                    name,
+                    files: vec![],
+                });
+                self.select_section(Selection::Custom(self.sections.len() - 1));
+                self.section_name.clear(); // the field starts empty; the placeholder shows the name
+                self.dirty = Some(Instant::now());
+                self.focus = focus::soundpad::SECTION_NAME;
+                return Task::batch([
+                    iced::widget::operation::focus("section-name"),
+                    iced::widget::operation::snap_to(
+                        "sections",
+                        iced::widget::scrollable::RelativeOffset::END,
+                    ),
+                ]);
+            }
+            Msg::SectionName(name) => {
+                self.section_name = name.chars().take(40).collect();
+                self.focus = focus::soundpad::SECTION_NAME;
+            }
+            Msg::SectionRename => {
+                self.focus = focus::soundpad::SECTION_NAME;
+                let Some(i) = self.custom_section() else {
+                    return Task::none();
+                };
+                let name = soundpad::section_name(&self.section_name);
+                if name.is_empty() || name == self.sections[i].name {
+                    self.section_name.clear();
+                } else if self.sections.iter().enumerate().any(|(j, s)| j != i && s.name == name) {
+                    self.sound_note = "Раздел с таким именем уже есть.".into();
+                } else {
+                    self.sections[i].name = name;
+                    self.section_name.clear();
+                    self.dirty = Some(Instant::now());
+                }
+            }
+            Msg::SectionDelete => {
+                self.focus = focus::soundpad::SECTION_DELETE;
+                if let Some(i) = self.custom_section() {
+                    self.sections.remove(i);
+                    self.select_section(Selection::All);
+                    self.dirty = Some(Instant::now());
+                }
+            }
+            Msg::DragStart(i) => {
+                if i < self.sounds.len() {
+                    self.dragging = Some(i);
+                    self.drag_over = None;
+                }
+            }
+            Msg::DragOver(section) => {
+                if self.dragging.is_some() {
+                    self.drag_over = section.filter(|&s| s < self.sections.len());
+                }
+            }
+            Msg::DragEnd => {
+                if let (Some(i), Some(section)) = (self.dragging.take(), self.drag_over.take())
+                    && let Some(sound) = self.sounds.get(i)
+                    && let Some(target) = self.sections.get_mut(section)
+                    && !target.files.contains(&sound.name)
+                {
+                    target.files.push(sound.name.clone());
+                    self.sound_note = format!("«{}» добавлен в «{}»", sound.name, target.name);
+                    self.dirty = Some(Instant::now());
+                }
+                self.dragging = None;
+                self.drag_over = None;
+            }
+            Msg::SoundUnassign(i) => {
+                if let Some(section) = self.custom_section()
+                    && let Some(sound) = self.sounds.get(i)
+                {
+                    self.sections[section].files.retain(|f| *f != sound.name);
+                    self.dirty = Some(Instant::now());
+                }
+            }
+            Msg::SoundpadStop => {
+                self.engine.sound_play(0);
+                self.sound_pending_play = None;
+            }
+            Msg::SoundPlay(i) => {
+                let Some(sound) = self.sounds.get(i) else {
+                    return Task::none();
+                };
+                self.focus = focus::soundpad::ROW_BASE + 3 * i;
+                match sound.state {
+                    SoundState::Loaded(_) => self.engine.sound_play(Self::sound_id(i)),
+                    SoundState::Loading => self.sound_pending_play = Some(i),
+                    SoundState::Unloaded | SoundState::Failed(_) => {
+                        self.sound_pending_play = Some(i);
+                        return self.load_sound(i);
+                    }
+                }
+            }
+            Msg::SoundVolume(i, v) => {
+                let Some(sound) = self.sounds.get_mut(i) else {
+                    return Task::none();
+                };
+                sound.volume = v.round().clamp(0.0, 200.0) as u32;
+                if matches!(sound.state, SoundState::Loaded(_)) {
+                    self.engine.sound_gain(Self::sound_id(i), sound.gain());
+                }
+                self.focus = focus::soundpad::ROW_BASE + 3 * i + 1;
+                self.dirty = Some(Instant::now());
+            }
+            Msg::SoundLoaded(i, generation, result) => {
+                if generation != self.sound_generation {
+                    return Task::none();
+                }
+                let Some(sound) = self.sounds.get_mut(i) else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(seconds) => {
+                        sound.state = SoundState::Loaded(seconds);
+                        // The gain may have moved while the clip was decoding.
+                        self.engine.sound_gain(Self::sound_id(i), sound.gain());
+                        if self.sound_pending_play == Some(i) {
+                            self.sound_pending_play = None;
+                            self.engine.sound_play(Self::sound_id(i));
+                        }
+                    }
+                    Err(e) => {
+                        sound.state = SoundState::Failed(e);
+                        if self.sound_pending_play == Some(i) {
+                            self.sound_pending_play = None;
+                        }
+                    }
+                }
+            }
+            Msg::ClipRecorded(result) => match result {
+                Ok(()) => self.rescan_clips(),
+                Err(e) => {
+                    self.clip_note = format!(
+                        "Запись не сохранена: {e}"
+                    )
+                }
+            },
+            Msg::ClipPlay(i) => {
+                let Some(clip) = self.clips.get(i) else {
+                    return Task::none();
+                };
+                self.focus = focus::effects::CLIP_BASE + 2 * i;
+                match clip.state {
+                    SoundState::Loaded(_) => self.engine.sound_play(Self::clip_id(i)),
+                    SoundState::Loading => self.clip_pending_play = Some(i),
+                    SoundState::Unloaded | SoundState::Failed(_) => {
+                        self.clip_pending_play = Some(i);
+                        return self.load_clip(i);
+                    }
+                }
+            }
+            Msg::ClipLoaded(i, generation, result) => {
+                if generation != self.clip_loads {
+                    return Task::none();
+                }
+                let Some(clip) = self.clips.get_mut(i) else {
+                    return Task::none();
+                };
+                clip.state = match result {
+                    Ok(seconds) => SoundState::Loaded(seconds),
+                    Err(e) => {
+                        self.clip_note = e.chars().take(70).collect();
+                        SoundState::Failed(e)
+                    }
+                };
+                if self.clip_pending_play == Some(i) {
+                    self.clip_pending_play = None;
+                    if matches!(self.clips[i].state, SoundState::Loaded(_)) {
+                        self.engine.sound_play(Self::clip_id(i));
+                    }
+                }
+            }
+            Msg::ClipMenu(at) => {
+                self.clip_note.clear();
+                self.clip_menu = if self.clip_menu == at { None } else { at };
+                if let Some(i) = at {
+                    self.focus = focus::effects::CLIP_BASE + 2 * i + 1;
+                }
+            }
+            Msg::ClipSave(i, to_soundpad) => {
+                self.clip_menu = None;
+                if i >= self.clips.len() {
+                    return Task::none();
+                }
+                self.focus = focus::effects::CLIP_BASE + 2 * i + 1;
+                match self.sound_folder.clone().filter(|_| to_soundpad) {
+                    Some(folder) => {
+                        self.copy_clip(i, &folder);
+                        return self.rescan_sounds();
+                    }
+                    None => {
+                        if self.sound_dialog {
+                            return Task::none();
+                        }
+                        self.sound_dialog = true;
+                        if to_soundpad {
+                            self.clip_note = "Выберите папку саундпада…".into();
+                        }
+                        return Task::perform(async { engine::pick_paths(true) }, move |r| {
+                            Msg::ClipPicked(i, to_soundpad, r)
+                        });
+                    }
+                }
+            }
+            Msg::ClipPicked(i, to_soundpad, result) => {
+                self.sound_dialog = false;
+                let folder = match result {
+                    Ok(paths) => match paths.into_iter().next() {
+                        Some(folder) => folder,
+                        None => {
+                            self.clip_note.clear();
+                            return Task::none();
+                        }
+                    },
+                    Err(e) => {
+                        self.clip_note = format!(
+                            "Диалог не открылся: {e}"
+                        );
+                        return Task::none();
+                    }
+                };
+                self.copy_clip(i, &folder);
+                if to_soundpad {
+                    // The picked folder becomes the library, with the copy already inside it.
+                    self.sound_folder = Some(folder);
+                    self.sounds.clear();
+                    self.dirty = Some(Instant::now());
+                    return self.rescan_sounds();
+                }
             }
             Msg::CancelBind => {
                 self.binding = None;
+                self.candidate = 0;
+                self.bind_conflict = None;
                 self.engine.capture(false);
-                self.focus = focus::NONE;
             }
             Msg::ClearBind => {
                 if let Some(i) = self.binding {
-                    self.keys[i] = 0;
-                    self.engine.bindings(self.keys);
-                    self.changed();
+                    let task = self.set_key(i, 0);
+                    return Task::batch([task, self.update(Msg::CancelBind)]);
                 }
                 return self.update(Msg::CancelBind);
             }
             Msg::AcceptBind => {
                 if let Some(i) = self.binding
                     && self.candidate != 0
-                    && !self
-                        .keys
-                        .iter()
-                        .enumerate()
-                        .any(|(j, &k)| j != i && k == self.candidate)
                 {
-                    self.keys[i] = self.candidate;
-                    self.engine.bindings(self.keys);
-                    self.changed();
-                    return self.update(Msg::CancelBind);
+                    if self.key_taken(i, self.candidate) {
+                        // Stay on the button, show the clash and wait for the next key.
+                        self.bind_conflict = Some(self.candidate);
+                        self.candidate = 0;
+                        self.engine.capture(true);
+                    } else {
+                        let task = self.set_key(i, self.candidate);
+                        return Task::batch([task, self.update(Msg::CancelBind)]);
+                    }
                 }
             }
             Msg::Key(key, mods, repeat) => return self.key(key, mods, repeat),
@@ -1536,6 +2559,40 @@ impl App {
         }
         Task::none()
     }
+    /// Keyboard focus target of a `Msg::Bind` button.
+    fn bind_focus(target: usize) -> usize {
+        use focus::effects::*;
+        match target {
+            0 => BOOST_BIND,
+            1 => PITCH_BIND,
+            2 => SLOW_BIND,
+            3 => FAST_BIND,
+            4 => REVERSE_BIND,
+            5..=9 => DISCORD_BIND_BASE + target - 5,
+            10 => MONITOR_BIND,
+            11 => REPLAY_BIND,
+            12 => NOISE_BIND,
+            SOUND_STOP_BIND => focus::soundpad::STOP_BIND,
+            t => focus::soundpad::ROW_BASE + 3 * (t - SOUND_BIND_BASE) + 2,
+        }
+    }
+    /// Store a validated key for an effect, the soundpad stop key or a clip, then push it native.
+    fn set_key(&mut self, target: usize, key: u32) -> Task<Msg> {
+        if target == SOUND_STOP_BIND {
+            self.sound_stop_key = key;
+        } else if target >= SOUND_BIND_BASE {
+            if let Some(sound) = self.sounds.get_mut(target - SOUND_BIND_BASE) {
+                sound.key = key;
+            }
+        } else {
+            self.keys[target] = key;
+            self.engine.bindings(self.keys);
+            self.changed();
+            return Task::none();
+        }
+        self.dirty = Some(Instant::now());
+        self.sync_sound_bindings()
+    }
     fn rvc_has_index(&self) -> bool {
         self.rvc_models
             .iter()
@@ -1554,26 +2611,38 @@ impl App {
         if self.window.is_none() {
             return Task::none();
         }
-        if self.binding.is_some() && self.candidate == 0 {
+        if self.binding.is_some() {
+            // The native capture owns the keyboard while a button waits for a key.
             if key == Key::Named(Named::Escape) {
                 return self.update(Msg::CancelBind);
             }
             return Task::none();
         }
         if key == Key::Named(Named::Tab) {
-            // Visual order of the page tabs: microphone, headphones, voice changer, settings.
+            // Visual order of the page tabs: microphone, headphones, voice changer, soundpad, settings.
             let tabs = [
                 focus::TAB_BASE,
                 focus::TAB_BASE + 3,
                 focus::TAB_BASE + 1,
+                focus::TAB_SOUNDPAD,
                 focus::TAB_BASE + 2,
             ];
-            let order = if self.binding.is_some() {
-                use focus::bind::*;
-                vec![ACCEPT, CLEAR, CANCEL]
-            } else if self.headphone_page {
+            let order = if self.headphone_page {
                 use focus::headphones::*;
                 let mut items = vec![OUTPUT, TOGGLE, MUTE, NOISE, INTENSITY, VOLUME, PITCH];
+                items.extend(tabs);
+                items
+            } else if self.soundpad_page {
+                use focus::soundpad::*;
+                let mut items = vec![FOLDER, ADD, REFRESH, VOLUME, HEAR, STOP_BIND, FILTER, SORT];
+                items.extend((0..self.section_items().len()).map(|i| SECTION_BASE + i));
+                items.push(SECTION_ADD);
+                if self.custom_section().is_some() {
+                    items.extend([SECTION_NAME, SECTION_DELETE]);
+                }
+                for i in self.visible_sounds() {
+                    items.extend([ROW_BASE + 3 * i, ROW_BASE + 3 * i + 1, ROW_BASE + 3 * i + 2]);
+                }
                 items.extend(tabs);
                 items
             } else if self.details {
@@ -1585,9 +2654,13 @@ impl App {
                         INPUT, OUTPUT, VERSION, BUFFER, AUTOSTART, REFRESH, UPDATE, QUIT, DONE,
                     ]
                 };
+                if !self.driver_ready {
+                    items.insert(items.len() - 3, DRIVER);
+                }
                 if self.update_ready {
                     items.insert(items.len() - 2, APPLY_UPDATE);
                 }
+                items.insert(items.len() - 2, REPORT);
                 items.extend(tabs);
                 items
             } else if self.rvc_page {
@@ -1643,14 +2716,24 @@ impl App {
                 items.extend([
                     MONITOR,
                     MONITOR_BIND,
-                    REPLAY_BIND,
-                    DISCORD_VOLUME,
                     EFFECTS_MONITOR,
                     BOOST_MONITOR,
+                    REPLAY_BIND,
+                    DISCORD_VOLUME,
                 ]);
+                for i in 0..self.clips.len() {
+                    items.extend([CLIP_BASE + 2 * i, CLIP_BASE + 2 * i + 1]);
+                    if self.clip_menu == Some(i) {
+                        items.extend([CLIP_TO_SOUNDPAD, CLIP_TO_FOLDER]);
+                    }
+                }
                 items.extend(tabs);
                 items
             };
+            let mut order = order;
+            if self.update_ready {
+                order.insert(0, focus::UPDATE_BANNER);
+            }
             self.focus = match order.iter().position(|&v| v == self.focus) {
                 Some(i) => {
                     order[(i + if mods.shift() { order.len() - 1 } else { 1 }) % order.len()]
@@ -1665,42 +2748,72 @@ impl App {
             };
             return Task::batch([
                 view::reveal_focus(),
-                iced::widget::operation::focus(if self.focus == focus::rvc::NAME {
-                    "rvc-name"
-                } else {
-                    "no-text-input"
+                iced::widget::operation::focus(match self.focus {
+                    focus::rvc::NAME => "rvc-name",
+                    focus::soundpad::FILTER => "sound-filter",
+                    focus::soundpad::SECTION_NAME => "section-name",
+                    _ => "no-text-input",
                 }),
             ]);
         }
-        if key == Key::Named(Named::Escape) {
-            if self.binding.is_some() {
-                return self.update(Msg::CancelBind);
-            }
-            if self.details || self.rvc_page {
-                return self.update(Msg::Page(0));
-            }
+        if key == Key::Named(Named::Escape) && (self.details || self.rvc_page || self.soundpad_page) {
+            return self.update(Msg::Page(0));
         }
         let activate = matches!(key, Key::Named(Named::Enter | Named::Space)) && !repeat;
-        if activate
-            && self.binding.is_none()
-            && (focus::TAB_BASE..focus::TAB_BASE + 4).contains(&self.focus)
-        {
-            return self.update(Msg::Page((self.focus - focus::TAB_BASE) as u8));
+        if activate && self.focus == focus::UPDATE_BANNER && self.update_ready {
+            return self.update(Msg::ApplyUpdate);
+        }
+        if activate {
+            if (focus::TAB_BASE..focus::TAB_BASE + 4).contains(&self.focus) {
+                return self.update(Msg::Page((self.focus - focus::TAB_BASE) as u8));
+            }
+            if self.focus == focus::TAB_SOUNDPAD {
+                return self.update(Msg::Page(4));
+            }
         }
         let delta = match key {
             Key::Named(Named::ArrowLeft | Named::ArrowDown) => -1,
             Key::Named(Named::ArrowRight | Named::ArrowUp) => 1,
             _ => 0,
         };
-        let message = if self.binding.is_some() {
-            if activate {
-                match self.focus {
-                    focus::bind::ACCEPT => Msg::AcceptBind,
-                    focus::bind::CLEAR => Msg::ClearBind,
-                    _ => Msg::CancelBind,
+        let message = if self.soundpad_page {
+            use focus::soundpad::*;
+            match self.focus {
+                FOLDER if activate => Msg::SoundpadFolder,
+                ADD if activate => Msg::SoundpadAdd,
+                REFRESH if activate => Msg::SoundpadRefresh,
+                VOLUME if delta != 0 => {
+                    Msg::SoundpadVolume(self.sound_volume * 100.0 + delta as f32)
                 }
-            } else {
-                Msg::Noop
+                HEAR if activate => Msg::SoundpadHear(!self.sound_monitor),
+                STOP_BIND if activate => Msg::Bind(SOUND_STOP_BIND),
+                SORT if delta != 0 || activate => {
+                    let i = SoundSort::ALL
+                        .iter()
+                        .position(|&v| v == self.sound_sort)
+                        .unwrap_or(0);
+                    Msg::SoundpadSort(
+                        SoundSort::ALL[(i as i32 + if delta == 0 { 1 } else { delta }).rem_euclid(4)
+                            as usize],
+                    )
+                }
+                SECTION_ADD if activate => Msg::SectionAdd,
+                SECTION_DELETE if activate => Msg::SectionDelete,
+                f if activate && f >= SECTION_BASE && f - SECTION_BASE < self.section_items().len() => {
+                    Msg::SectionSelect(f - SECTION_BASE)
+                }
+                f if f >= ROW_BASE && (f - ROW_BASE) / 3 < self.sounds.len() => {
+                    let (i, column) = ((f - ROW_BASE) / 3, (f - ROW_BASE) % 3);
+                    match column {
+                        0 if activate => Msg::SoundPlay(i),
+                        1 if delta != 0 => {
+                            Msg::SoundVolume(i, self.sounds[i].volume as f32 + delta as f32 * 5.0)
+                        }
+                        2 if activate => Msg::Bind(SOUND_BIND_BASE + i),
+                        _ => Msg::Noop,
+                    }
+                }
+                _ => Msg::Noop,
             }
         } else if self.headphone_page {
             use focus::headphones::*;
@@ -1783,6 +2896,8 @@ impl App {
                 REFRESH if activate => Msg::Refresh,
                 UPDATE if activate => Msg::UpdateCheck,
                 APPLY_UPDATE if activate => Msg::ApplyUpdate,
+                DRIVER if activate => Msg::InstallDriver,
+                REPORT if activate => Msg::SendReport,
                 DONE if activate => Msg::Settings,
                 QUIT if activate => Msg::Quit,
                 AUTOSTART if activate => Msg::Autostart(!self.autostart),
@@ -1880,6 +2995,21 @@ impl App {
                     Msg::Pitch((self.controls.pitch + delta).clamp(-12, 12) as f32)
                 }
                 PITCH_BIND if activate => Msg::Bind(1),
+                CLIP_TO_SOUNDPAD if activate => match self.clip_menu {
+                    Some(i) => Msg::ClipSave(i, true),
+                    None => Msg::Noop,
+                },
+                CLIP_TO_FOLDER if activate => match self.clip_menu {
+                    Some(i) => Msg::ClipSave(i, false),
+                    None => Msg::Noop,
+                },
+                f if activate && f >= CLIP_BASE && (f - CLIP_BASE) / 2 < self.clips.len() => {
+                    if (f - CLIP_BASE).is_multiple_of(2) {
+                        Msg::ClipPlay((f - CLIP_BASE) / 2)
+                    } else {
+                        Msg::ClipMenu(Some((f - CLIP_BASE) / 2))
+                    }
+                }
                 _ => Msg::Noop,
             }
         };
@@ -1887,6 +3017,11 @@ impl App {
     }
     fn subscription(&self) -> Subscription<Msg> {
         Subscription::batch([
+            if self.scroll_anims.is_empty() {
+                Subscription::none()
+            } else {
+                window::frames().map(Msg::ScrollFrame)
+            },
             window::close_requests().map(|_| Msg::Hide),
             iced::event::listen_with(|event, _, id| {
                 match event {
@@ -1898,16 +3033,17 @@ impl App {
                     }
                     _ => {}
                 }
-                if let iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                    key,
-                    modifiers,
-                    repeat,
-                    ..
-                }) = event
-                {
-                    Some(Msg::Key(key, modifiers, repeat))
-                } else {
-                    None
+                match event {
+                    iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                        key,
+                        modifiers,
+                        repeat,
+                        ..
+                    }) => Some(Msg::Key(key, modifiers, repeat)),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )) => Some(Msg::DragEnd),
+                    _ => None,
                 }
             }),
         ])
@@ -1965,6 +3101,30 @@ fn main() {
 mod controller_tests {
     use super::*;
     #[test]
+    fn scrolling_advances_on_frames_and_cancels_on_navigation() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.soundpad_page = true;
+        let _ = app.update(Msg::Wheel("body", 96.0));
+        let _ = app.update(Msg::ScrollProbe("body", Some((0.0, 500.0, 5000.0))));
+        let start = app.scroll_anims["body"].last_frame;
+        let _ = app.update(Msg::ScrollFrame(start + Duration::from_millis(16)));
+        assert!(app.sound_scroll.0 > 30.0 && app.sound_scroll.0 < 33.0);
+        assert!(app.scroll_pending.is_empty(), "frames must not need another probe");
+        let _ = app.update(Msg::Wheel("body", 96.0));
+        assert_eq!(app.scroll_anims["body"].target, 192.0);
+        for frame in 2..60 {
+            let _ = app.update(Msg::ScrollFrame(start + Duration::from_millis(frame * 16)));
+        }
+        assert!(app.scroll_anims.is_empty());
+        assert_eq!(app.sound_scroll.0, 192.0);
+        let _ = app.update(Msg::Wheel("body", 96.0));
+        let _ = app.update(Msg::Page(0));
+        let before = app.sound_scroll;
+        let _ = app.update(Msg::ScrollProbe("body", Some((0.0, 500.0, 5000.0))));
+        assert!(app.scroll_anims.is_empty());
+        assert_eq!(app.sound_scroll, before, "ignore cancelled measurement");
+    }
+    #[test]
     fn discord_volume_uses_the_new_scale_and_migrates_legacy_eight_percent() {
         let (defaults, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
         assert_eq!(defaults.controls.boost, 3.0);
@@ -2016,6 +3176,7 @@ mod controller_tests {
         app.candidate = app.keys[11];
         let _ = app.update(Msg::AcceptBind);
         assert_eq!(app.binding, Some(12));
+        assert_eq!(app.bind_conflict, Some(app.keys[11]));
         app.candidate = 120 | 256;
         let _ = app.update(Msg::AcceptBind);
         assert_eq!(app.keys[12], 120 | 256);
@@ -2074,6 +3235,37 @@ mod controller_tests {
         assert!(!app.ui_active());
         let _ = app.update(Msg::WindowFocus(id, true));
         assert!(app.ui_active());
+    }
+    #[test]
+    fn ready_update_is_reachable_from_any_page() {
+        use keyboard::{Key, Modifiers, key::Named};
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.window = Some(App::open(1.0).0);
+        let tab = |app: &mut App| {
+            let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        };
+        // Without an update the banner is not in anyone's Tab order.
+        app.focus = focus::NONE;
+        for _ in 0..80 {
+            tab(&mut app);
+            assert_ne!(app.focus, focus::UPDATE_BANNER);
+        }
+        app.update_ready = true;
+        app.update_status = "Версия 0.2.1 скачана и готова".into();
+        for page in [false, true] {
+            app.details = page;
+            app.focus = focus::NONE;
+            let mut seen = false;
+            for _ in 0..80 {
+                tab(&mut app);
+                seen |= app.focus == focus::UPDATE_BANNER;
+            }
+            assert!(seen, "the update banner is missing from the Tab order (details={page})");
+        }
+        app.details = false;
+        app.focus = focus::UPDATE_BANNER;
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert!(app.apply_after_quit, "Enter on the banner must apply the update");
     }
     #[test]
     fn boost_monitor_is_independent_and_defaults_off() {
@@ -2177,6 +3369,230 @@ mod controller_tests {
         assert!(app.headphone_denoise);
     }
     #[test]
+    fn recordings_keep_six_play_and_save() {
+        use keyboard::{Key, Modifiers, key::Named};
+        assert_eq!(
+            clip_label("Запись 2026-09-22 14-05-12.wav"),
+            "14:05:12"
+        );
+        assert_eq!(clip_label("airhorn.mp3"), "airhorn");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".tmp/clips-controller-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (folder, library) = (dir.join("clips"), dir.join("library"));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(&library).unwrap();
+        // Eight recordings of the same second: only the six newest names survive a rescan.
+        for i in 0..8 {
+            let name = format!("Запись 2026-09-2{i} 14-05-1{i}.wav");
+            soundpad::write_wav(&folder.join(name), &[0.25; 480]).unwrap();
+        }
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.clips_folder = folder.clone();
+        app.rescan_clips();
+        assert_eq!(app.clips.len(), CLIPS_KEPT);
+        assert!(app.clips[0].name.contains("2026-09-27"));
+        assert!(app.clips[5].name.contains("2026-09-22"));
+        assert!(!folder.join("Запись 2026-09-20 14-05-10.wav").exists());
+        assert_eq!(soundpad::decode(&app.clips[0].path).unwrap().len(), 480);
+        app.window = Some(App::open(1.0).0);
+        let _ = app.update(Msg::ClipPlay(0));
+        assert_eq!(app.clips[0].state, SoundState::Loading);
+        assert_eq!(app.clip_pending_play, Some(0));
+        let _ = app.update(Msg::ClipLoaded(0, app.clip_loads, Ok(0.01)));
+        assert_eq!(app.clips[0].state, SoundState::Loaded(0.01));
+        assert_eq!(app.clip_pending_play, None);
+        let _ = app.update(Msg::ClipLoaded(1, app.clip_loads + 1, Ok(1.0)));
+        assert_eq!(
+            app.clips[1].state,
+            SoundState::Unloaded,
+            "a decode finishing for an older list must be ignored"
+        );
+        // Save through the row menu: the two targets are reachable only while it is open.
+        app.sound_folder = Some(library.clone());
+        app.focus = focus::effects::CLIP_BASE + 1;
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert_eq!(app.clip_menu, Some(0));
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::effects::CLIP_TO_SOUNDPAD);
+        let saved = app.clips[0].name.clone();
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert_eq!(app.clip_menu, None);
+        assert!(library.join(&saved).exists());
+        assert!(app.clip_note.starts_with("Сохранено"));
+        assert_eq!(app.sounds.len(), 1, "the copy joins the soundpad library at once");
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_ne!(app.focus, focus::effects::CLIP_TO_FOLDER, "the closed menu leaves the Tab order");
+        let _ = app.update(Msg::ClipSave(0, true));
+        assert!(app.clip_note.contains(" (2).wav"), "a second save must not overwrite the first");
+        assert!(matches!(app.clips[0].state, SoundState::Unloaded), "a library rescan unloads recordings");
+        let _ = app.update(Msg::ClipSave(9, true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn soundpad_keys_volumes_and_keyboard() {
+        use keyboard::{Key, Modifiers, key::Named};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".tmp/soundpad-controller-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        soundpad::test_wav(&dir.join("boom.wav"), 48_000, 1, 480);
+        soundpad::test_wav(&dir.join("airhorn.mp3.wav"), 48_000, 1, 480);
+        let (mut app, _) = App::from_settings(Settings::for_test(&format!(
+            "[effects]
+boost_key=119
+[soundpad]
+folder={}
+volume=150
+monitor=1
+stop_key=120
+sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
+            dir.display()
+        )))
+        .unwrap()
+        .unwrap();
+        assert_eq!(app.sounds.len(), 2);
+        assert_eq!(app.sounds[0].name, "airhorn.mp3.wav");
+        assert_eq!((app.sounds[0].key, app.sounds[0].volume), (121, 30));
+        assert_eq!(app.sounds[1].key, 0, "clip key colliding with an effect key must be dropped");
+        assert_eq!(app.sounds[1].volume, 80);
+        assert_eq!(app.sound_stop_key, 120);
+        assert_eq!(app.sound_volume, 1.5);
+        assert!(app.sound_monitor);
+        assert_eq!(app.monitor_mode(), 5);
+        app.effects_monitor = true;
+        assert_eq!(app.monitor_mode(), 6);
+        app.monitor_all = true;
+        assert_eq!(app.monitor_mode(), 1);
+        app.monitor_all = false;
+        app.effects_monitor = false;
+        app.window = Some(App::open(1.0).0);
+        let _ = app.update(Msg::Page(4));
+        assert!(app.soundpad_page && !app.details);
+        let _ = app.update(Msg::SoundHover(0, true));
+        let _ = app.update(Msg::SoundHover(1, false));
+        assert_eq!(app.sound_hover, Some(0), "another row's exit keeps the active hover");
+        let _ = app.update(Msg::SoundHover(0, false));
+        assert_eq!(app.sound_hover, None);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, 61);
+        for expected in [62, 63, 64, 65, 66, 67, 68, 20000, 69, 1000, 1001, 1002, 1003, 1004, 1005, 40] {
+            let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+            assert_eq!(app.focus, expected);
+        }
+        app.focus = 68;
+        let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
+        assert_eq!(app.sound_sort, SoundSort::Hotkey);
+        assert_eq!(app.visible_sounds(), [0, 1]);
+        app.sounds[1].played = 5;
+        let _ = app.update(Msg::SoundpadSort(SoundSort::Recent));
+        assert_eq!(app.visible_sounds(), [1, 0]);
+        let _ = app.update(Msg::SoundpadSort(SoundSort::Name));
+        let _ = app.update(Msg::SoundpadFilter("BOOM".into()));
+        app.focus = 69;
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, 1003, "filter hides the first clip from the Tab order");
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
+        assert_eq!(app.sounds[1].volume, 85);
+        let _ = app.update(Msg::SoundVolume(1, 500.0));
+        assert_eq!(app.sounds[1].volume, 200);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        let _ = app.key(Key::Named(Named::Space), Modifiers::empty(), false);
+        assert_eq!(app.binding, Some(SOUND_BIND_BASE + 1));
+        app.candidate = 119;
+        let _ = app.update(Msg::AcceptBind);
+        assert_eq!(app.binding, Some(SOUND_BIND_BASE + 1), "effect key must be rejected");
+        app.candidate = 121;
+        let _ = app.update(Msg::AcceptBind);
+        assert_eq!(app.binding, Some(SOUND_BIND_BASE + 1), "other clip key must be rejected");
+        app.candidate = 120;
+        let _ = app.update(Msg::AcceptBind);
+        assert_eq!(app.binding, Some(SOUND_BIND_BASE + 1), "stop key must be rejected");
+        app.candidate = 122 | 256;
+        let _ = app.update(Msg::AcceptBind);
+        assert!(app.binding.is_none());
+        assert_eq!(app.sounds[1].key, 122 | 256);
+        let _ = app.update(Msg::Bind(1));
+        app.candidate = 121;
+        let _ = app.update(Msg::AcceptBind);
+        assert_eq!(app.keys[1], 0, "effect binding must not take a clip key");
+        let _ = app.update(Msg::Bind(SOUND_STOP_BIND));
+        let _ = app.update(Msg::ClearBind);
+        assert_eq!(app.sound_stop_key, 0);
+        let _ = app.update(Msg::SoundpadVolume(-5.0));
+        assert_eq!(app.sound_volume, 0.0);
+        let _ = app.update(Msg::SoundpadHear(false));
+        assert_eq!(app.monitor_mode(), 0);
+        app.benchmark = false;
+        app.settings.path = dir.join("settings.ini");
+        app.save();
+        assert_eq!(
+            app.settings.get("soundpad", "sounds"),
+            Some("121:30:0:airhorn.mp3.wav\t378:200:5:boom.wav")
+        );
+        assert_eq!(app.settings.get("soundpad", "sort"), Some("0"));
+        assert_eq!(app.settings.get("soundpad", "stop_key"), Some("0"));
+        let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
+        assert!(!app.soundpad_page);
+        let _ = app.update(Msg::SoundpadPicked(true, Ok(vec![])));
+        assert_eq!(app.sounds.len(), 2, "cancelled picker keeps the library");
+        // Sidebar: automatic groups need two clips with the same prefix; custom sections
+        // take drops, rename, unassign and delete.
+        let _ = app.update(Msg::SoundpadFilter(String::new()));
+        assert_eq!(app.section_items().len(), 1);
+        let _ = app.update(Msg::SectionAdd);
+        let _ = app.update(Msg::SectionAdd);
+        assert_eq!(app.sections.len(), 2);
+        assert_eq!(app.sections[1].name, "Новый раздел 2");
+        assert_eq!(app.section, Selection::Custom(1));
+        assert!(app.visible_sounds().is_empty());
+        let _ = app.update(Msg::SectionName("Мемы:|".into()));
+        let _ = app.update(Msg::SectionRename);
+        assert_eq!(app.sections[1].name, "Мемы");
+        let _ = app.update(Msg::SectionName("Новый раздел".into()));
+        let _ = app.update(Msg::SectionRename);
+        assert_eq!(app.sections[1].name, "Мемы", "duplicate name rejected");
+        let _ = app.update(Msg::DragStart(0));
+        let _ = app.update(Msg::DragOver(Some(1)));
+        let _ = app.update(Msg::DragEnd);
+        assert_eq!(app.sections[1].files, ["airhorn.mp3.wav"]);
+        assert_eq!(app.visible_sounds(), [0]);
+        let _ = app.update(Msg::DragStart(1));
+        let _ = app.update(Msg::DragOver(None));
+        let _ = app.update(Msg::DragEnd);
+        assert_eq!(app.sections[1].files.len(), 1, "drop outside a section does nothing");
+        assert!(app.dragging.is_none());
+        let _ = app.update(Msg::DragEnd);
+        let _ = app.update(Msg::SectionSelect(2));
+        assert_eq!(app.section, Selection::Custom(1));
+        let _ = app.update(Msg::SoundUnassign(0));
+        assert!(app.sections[1].files.is_empty());
+        let _ = app.update(Msg::SectionDelete);
+        assert_eq!(app.sections.len(), 1);
+        assert_eq!(app.section, Selection::All);
+        app.sections[0].files.push("boom.wav".into());
+        app.save();
+        assert_eq!(
+            app.settings.get("soundpad", "sections"),
+            Some("Новый раздел:boom.wav")
+        );
+        let _ = app.update(Msg::SoundLoaded(0, app.sound_generation + 1, Ok(1.0)));
+        assert_eq!(app.sounds[0].state, soundpad::State::Loading, "stale decode ignored");
+        for _ in 0..100 {
+            if let Some(Reply::Saved(result)) = app.engine.reply() {
+                result.unwrap();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
     fn restart_event_does_not_override_session_exit() {
         assert!(restart_requested(RESTART_EVENT));
         assert!(!restart_requested(EXIT_EVENT));
@@ -2231,8 +3647,10 @@ mod controller_tests {
         let _ = app.update(Msg::AcceptBind);
         assert_eq!(app.keys[10], 200);
         app.focus = 23;
-        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, 32);
+        for expected in [31, 36, 32] {
+            let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+            assert_eq!(app.focus, expected, "Tab follows the visual order of the bottom block");
+        }
         let _ = app.key(Key::Named(Named::Space), Modifiers::empty(), false);
         assert_eq!(app.binding, Some(11));
         app.candidate = 119 | 256;
@@ -2242,10 +3660,6 @@ mod controller_tests {
         app.controls.discord_volume = discord_volume_gain(100.0);
         let _ = app.key(Key::Named(Named::ArrowLeft), Modifiers::empty(), false);
         assert!((discord_volume_percent(app.controls.discord_volume) - 99.0).abs() < 0.0001);
-        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, 31);
-        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, 36);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 40);
         let _ = app.update(Msg::Page(1));

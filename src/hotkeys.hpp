@@ -10,7 +10,7 @@ enum Hold : unsigned {
     DiscordShift=5, HoldMicMask=31, HoldAllMask=1023
 };
 // Per-sample effect categories carried through the output queues for effects-only monitoring.
-enum Modified : uint8_t { ModifiedEffects=1, ModifiedBoost=2 };
+enum Modified : uint8_t { ModifiedEffects=1, ModifiedBoost=2, ModifiedSound=4 }; // ModifiedSound: monitor mask bit; set only on preview-queue samples
 inline uint64_t packHeld(uint64_t now,unsigned epoch,unsigned flags,bool eligible=true) {
     return (now<<27)|((static_cast<uint64_t>(epoch)&65535)<<11)|(eligible?1024:0)|(flags&HoldAllMask);
 }

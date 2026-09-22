@@ -15,12 +15,18 @@ hmac = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "wav", "ogg", "vorbis", "pcm", "aac", "isomp4", "opt-simd"] }
 ureq = "3"
 uuid = { version = "1", features = ["v4"] }
 velopack = "=1.2.110-ge826545"
 
 [build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+# Already used by Iced; reproduce its damage-based CPU rendering without a window.
+iced_tiny_skia = { version = "=0.14.1", default-features = false }
+tiny-skia = { version = "=0.11.4", default-features = false, features = ["std", "simd"] }
 
 [profile.release]
 lto = "thin"

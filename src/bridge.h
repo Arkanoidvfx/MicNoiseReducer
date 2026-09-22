@@ -19,10 +19,11 @@ void mnr_stop(Mnr*);
 int32_t mnr_headphones(Mnr*,int32_t enabled,const char* output,uint32_t length,int32_t denoise,char* error,uint32_t capacity);
 void mnr_headphone_controls(Mnr*,float intensity,float volume,int32_t pitch,int32_t muted);
 int32_t mnr_headphone_state(Mnr*,char* text,uint32_t capacity);
-// mode: 0 off, 1 entire virtual microphone, 2 modified samples only.
-// 0 off, 1 full voice, 2 other effects, 3 boost, 4 both effect groups.
+// mode: 0 off, 1 full voice, otherwise 1 + mask (1 other effects, 2 boost, 4 soundpad): 2..8.
 int32_t mnr_monitor(Mnr*,int32_t mode,char* error,uint32_t capacity);
 int32_t mnr_monitor_state(Mnr*,char* text,uint32_t capacity);
+// Peak of what the monitor actually rendered since the previous call (0 when idle).
+float mnr_monitor_peak(Mnr*);
 void mnr_controls(Mnr*,float volume,float boost,int32_t pitch,float intensity,int32_t muted,float slow,float fast,int32_t overload,float discordVolume,int32_t rvcEnabled);
 void mnr_rvc_settings(Mnr*,uint32_t slot,int32_t pitch,uint32_t index,uint32_t chunk_ms,uint32_t gain);
 int32_t mnr_phrase_state(Mnr*,float* seconds);
@@ -38,6 +39,22 @@ int32_t mnr_shell_start(Mnr*,char* error,uint32_t capacity);
 void mnr_tray_hint(Mnr*);
 int32_t mnr_replace_file(const char* from,uint32_t from_len,const char* to,uint32_t to_len);
 void mnr_usage(uint64_t* cpu_100ns,uint64_t* working_set);
+// Soundpad. Clips are 48 kHz mono float, at most 5 minutes; id 0 means "stop" everywhere.
+int32_t mnr_sound_load(Mnr*,uint32_t id,const float* samples,uint32_t count,float gain);
+int32_t mnr_sound_gain(Mnr*,uint32_t id,float gain);
+void mnr_sound_clear(Mnr*);
+void mnr_sound_play(Mnr*,uint32_t id);
+void mnr_sound_volume(Mnr*,float volume);
+// Hotkeys for clips: keys use the effect binding encoding; an entry with id 0 is the stop key.
+int32_t mnr_sound_bindings(Mnr*,const uint32_t* ids,const uint32_t* keys,uint32_t count);
+// Returns the playing clip id (0 idle) and fills position/length in seconds.
+uint32_t mnr_sound_state(Mnr*,float* position,float* length);
+// Newest finished hold-effect recording (48 kHz mono float). Returns how many samples it has
+// and reports its generation; `out` may be null to ask for the size only.
+uint32_t mnr_last_clip(Mnr*,float* out,uint32_t capacity,uint32_t* generation);
+// Modal picker on the calling thread: mode 0 folder, 1 audio files (multi-select).
+// Writes newline-separated UTF-8 paths; returns 1, 0 when cancelled, -1 on error.
+int32_t mnr_pick_paths(int32_t mode,char* result,uint32_t capacity);
 #ifdef __cplusplus
 }
 #endif

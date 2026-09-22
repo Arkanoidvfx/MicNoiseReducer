@@ -44,6 +44,11 @@ private:
         if(response) CloseHandle(response);
     }
 };
+// False while the core component is still downloading: bin/mic_tag_host.exe arrives with it.
+inline bool tagHostInstalled() noexcept {
+    try {return std::filesystem::is_regular_file(projectRoot()/L"bin/mic_tag_host.exe");}
+    catch(...) {return false;}
+}
 inline HANDLE tagHostProcess() {
     HANDLE map=OpenFileMappingW(FILE_MAP_READ,FALSE,L"Local\\MicNoize.TagLink.v1");
     if(map) {CloseHandle(map);return nullptr;}
@@ -52,7 +57,7 @@ inline HANDLE tagHostProcess() {
     STARTUPINFOW startup{};startup.cb=sizeof(startup);startup.dwFlags=STARTF_USESHOWWINDOW;startup.wShowWindow=SW_HIDE;
     PROCESS_INFORMATION process{};
     if(!CreateProcessW(exe.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,exe.parent_path().c_str(),&startup,&process))
-        throw std::runtime_error("Cannot start mic_tag_host.exe; run build.ps1");
+        throw std::runtime_error("Не удалось запустить фоновый процесс виртуального микрофона");
     CloseHandle(process.hThread);return process.hProcess;
 }
 inline void ensureTagHost() {

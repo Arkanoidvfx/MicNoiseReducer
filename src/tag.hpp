@@ -52,7 +52,7 @@ public:
             if(!create) throw std::runtime_error("TAG Driver_Create export missing");
             const GUID product={0x4d699d4a,0x65a5,0x40ec,{0x98,0x75,0x8e,0x6d,0x5f,0xc0,0x1e,0x0c}};
             ok(create(reinterpret_cast<void**>(&driver_),&product),"TAG create interface");
-            ok(driver_->Find(),"TAG driver not found (run install-tag.ps1)");
+            ok(driver_->Find(),"Виртуальный аудиодрайвер не установлен");
             ok(driver_->Open(),"TAG open driver");
             }
             DriverInfo info{}; ok(driver_->GetInfo(info),"TAG driver info");

@@ -23,7 +23,7 @@ struct Ramp {
 };
 struct OutputEffects {
     Ramp gain{1},boost{3},wet{0},drive{0},discordGain{0.08f};
-    void process(float* data,size_t n,float volume,float multiplier,bool held,bool overload=false,const uint8_t* discord=nullptr,float discordVolume=0.08f,uint8_t* modified=nullptr,const float* microphone=nullptr,float* effectOnly=nullptr) {
+    void process(float* data,size_t n,float volume,float multiplier,bool held,bool overload=false,const uint8_t* discord=nullptr,float discordVolume=0.08f,uint8_t* modified=nullptr,const float* microphone=nullptr,float* effectOnly=nullptr,const float* sound=nullptr) {
         const bool enabled=held && multiplier>1;
         for(size_t i=0;i<n;++i) {
             const float x=(std::isfinite(data[i])?data[i]:0)*gain.next(volume);
@@ -39,6 +39,8 @@ struct OutputEffects {
             }
             data[i]=std::clamp(effect,-1.0f,1.0f)*(discord && discord[i]?sourceGain:1.0f);
             if(effectOnly)effectOnly[i]=data[i];
+            // Soundpad and the background microphone bypass effects and Discord gain.
+            if(sound)data[i]=std::clamp(data[i]+sound[i],-1.0f,1.0f);
             if(microphone)data[i]=std::clamp(data[i]+microphone[i]*gain.value,-1.0f,1.0f);
         }
     }
@@ -63,10 +65,18 @@ class LastEffect {
     std::vector<uint8_t> modified_=std::vector<uint8_t>(48000*20);
     size_t count_=0,position_=0;
     unsigned epoch_=0,cancel_=0,request_=0,previous_=0;
-    bool capturing_=false,playing_=false,discord_=false;
+    bool capturing_=false,playing_=false,discord_=false,finished_=false;
 public:
+    // Boost only changes gain: it neither starts a recording nor lands in one.
+    static constexpr unsigned recordable=HoldAllMask&~(HoldBoost|(HoldBoost<<DiscordShift));
+    // A capture that just ended, for the shell to publish; reading it clears the flag.
+    bool finished() {const bool was=finished_;finished_=false;return was;}
+    const float* audio() const {return audio_.data();}
+    size_t count() const {return count_;}
+    bool capturing() const {return capturing_;}
     bool process(float* data,size_t n,uint8_t* modified,bool& discord,
-                 unsigned held,bool phraseActive,bool valid,unsigned epoch,unsigned cancel,unsigned request) {
+                 unsigned allHeld,bool phraseActive,bool valid,unsigned epoch,unsigned cancel,unsigned request) {
+        const unsigned held=allHeld&recordable;
         if(epoch!=epoch_ || cancel!=cancel_ || !valid){
             if(capturing_)count_=0;
             capturing_=playing_=false;previous_=0;epoch_=epoch;cancel_=cancel;request_=request;
@@ -76,10 +86,10 @@ public:
         if(held && held!=previous_){count_=0;capturing_=true;playing_=false;discord_=discord;}
         previous_=held;
         if(capturing_){
-            for(size_t i=0;i<n;++i)if(modified[i] && count_<audio_.size()){
-                modified_[count_]=modified[i];audio_[count_++]=data[i];
+            for(size_t i=0;i<n;++i)if((modified[i]&~ModifiedBoost) && count_<audio_.size()){
+                modified_[count_]=static_cast<uint8_t>(modified[i]&~ModifiedBoost);audio_[count_++]=data[i];
             }
-            if(!active)capturing_=false;
+            if(!active){capturing_=false;finished_=count_>0;}
         }
         if(request!=request_){
             request_=request;

@@ -59,6 +59,7 @@ unsafe extern "C" {
     fn mnr_rvc_settings(p: usize, slot: u32, pitch: i32, index: u32, chunk_ms: u32, gain: u32);
     fn mnr_monitor(p: usize, enabled: i32, error: *mut c_char, cap: u32) -> i32;
     fn mnr_monitor_state(p: usize, text: *mut c_char, cap: u32) -> i32;
+    fn mnr_monitor_peak(p: usize) -> f32;
     fn mnr_controls(
         p: usize,
         volume: f32,
@@ -85,6 +86,39 @@ unsafe extern "C" {
     fn mnr_tray_hint(p: usize);
     fn mnr_replace_file(from: *const u8, fl: u32, to: *const u8, tl: u32) -> i32;
     fn mnr_usage(cpu: *mut u64, memory: *mut u64);
+    fn mnr_sound_load(p: usize, id: u32, samples: *const f32, count: u32, gain: f32) -> i32;
+    fn mnr_sound_gain(p: usize, id: u32, gain: f32) -> i32;
+    fn mnr_sound_clear(p: usize);
+    fn mnr_sound_play(p: usize, id: u32);
+    fn mnr_sound_volume(p: usize, volume: f32);
+    fn mnr_sound_bindings(p: usize, ids: *const u32, keys: *const u32, count: u32) -> i32;
+    fn mnr_sound_state(p: usize, position: *mut f32, length: *mut f32) -> u32;
+    fn mnr_pick_paths(mode: i32, result: *mut c_char, capacity: u32) -> i32;
+    fn mnr_last_clip(p: usize, out: *mut f32, capacity: u32, generation: *mut u32) -> u32;
+}
+/// Modal Windows picker; blocks the calling thread, so run it from a background task.
+pub fn pick_paths(folder: bool) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut b = vec![0u8; 65536];
+    match unsafe { mnr_pick_paths(if folder { 0 } else { 1 }, b.as_mut_ptr().cast(), b.len() as u32) } {
+        1 => Ok(decoded(&b)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(std::path::PathBuf::from)
+            .collect()),
+        0 => Ok(vec![]),
+        _ => Err(decoded(&b)),
+    }
+}
+/// Send-able handle for loading clips from a decode task without holding the controller.
+#[derive(Clone, Copy)]
+pub struct SoundLoader(usize);
+impl SoundLoader {
+    pub fn load(&self, id: u32, samples: &[f32], gain: f32) -> Result<(), String> {
+        if unsafe { mnr_sound_load(self.0, id, samples.as_ptr(), samples.len() as u32, gain) } == 0 {
+            return Err("Движок отклонил звук".into());
+        }
+        Ok(())
+    }
 }
 pub fn usage() -> (u64, u64) {
     let (mut cpu, mut memory) = (0, 0);
@@ -442,6 +476,9 @@ impl Engine {
     pub fn rvc(&self, enabled: bool, options: crate::rvc::Options) {
         let _ = self.tx.send(Command::Rvc(enabled, options));
     }
+    pub fn monitor_peak(&self) -> f32 {
+        unsafe { mnr_monitor_peak(self.p) }
+    }
     pub fn monitor_state(&self) -> (i32, String) {
         let mut text = [0u8; 4096];
         let state = unsafe { mnr_monitor_state(self.p, text.as_mut_ptr().cast(), 4096) };
@@ -482,6 +519,46 @@ impl Engine {
     }
     pub fn bindings(&self, keys: [u32; 13]) {
         unsafe { mnr_bindings(self.p, keys.as_ptr(), keys.len() as u32) }
+    }
+    pub fn sound_loader(&self) -> SoundLoader {
+        SoundLoader(self.p)
+    }
+    pub fn sound_gain(&self, id: u32, gain: f32) -> bool {
+        unsafe { mnr_sound_gain(self.p, id, gain) != 0 }
+    }
+    pub fn sound_clear(&self) {
+        unsafe { mnr_sound_clear(self.p) }
+    }
+    pub fn sound_play(&self, id: u32) {
+        unsafe { mnr_sound_play(self.p, id) }
+    }
+    pub fn sound_volume(&self, volume: f32) {
+        unsafe { mnr_sound_volume(self.p, volume) }
+    }
+    /// Pairs of (clip id, key); id 0 is the stop key. Rejected as a whole on any conflict.
+    pub fn sound_bindings(&self, bindings: &[(u32, u32)]) -> bool {
+        let ids: Vec<u32> = bindings.iter().map(|b| b.0).collect();
+        let keys: Vec<u32> = bindings.iter().map(|b| b.1).collect();
+        unsafe { mnr_sound_bindings(self.p, ids.as_ptr(), keys.as_ptr(), ids.len() as u32) != 0 }
+    }
+    /// (playing clip id or 0, position seconds, length seconds).
+    pub fn sound_state(&self) -> (u32, f32, f32) {
+        let (mut position, mut length) = (0.0, 0.0);
+        let id = unsafe { mnr_sound_state(self.p, &mut position, &mut length) };
+        (id, position, length)
+    }
+    /// The newest finished hold-effect recording and its generation, or `None` while the
+    /// engine has nothing newer than `known`.
+    pub fn last_clip(&self, known: u32) -> Option<(u32, Vec<f32>)> {
+        let mut generation = 0;
+        let count = unsafe { mnr_last_clip(self.p, std::ptr::null_mut(), 0, &mut generation) };
+        if generation == known || count == 0 {
+            return None;
+        }
+        let mut samples = vec![0.0; count as usize];
+        let written = unsafe { mnr_last_clip(self.p, samples.as_mut_ptr(), count, &mut generation) };
+        samples.truncate(written.min(count) as usize);
+        Some((generation, samples))
     }
     pub fn discord_state(&self) -> (i32, bool, String) {
         let mut text = [0u8; 2048];

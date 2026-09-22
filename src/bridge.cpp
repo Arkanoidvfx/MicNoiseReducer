@@ -2,6 +2,7 @@
 #include "audio.hpp"
 #include "tag_link.hpp"
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <wtsapi32.h>
 #include <cmath>
 #include <memory>
@@ -16,6 +17,9 @@ struct Mnr {
     HANDLE instance=nullptr;
     std::atomic<HWND> window{nullptr};
     std::atomic<unsigned> keys[13]{};
+    std::mutex soundKeysMutex;
+    std::vector<std::pair<unsigned,unsigned>> soundKeys; // id, key
+    std::atomic<unsigned> soundKeysGeneration{0};
     std::atomic<unsigned> events{0},captured{0};
     std::atomic<unsigned> captureGeneration{0};
     std::atomic<bool> capturing{false};
@@ -66,7 +70,7 @@ extern "C" int32_t mnr_headphone_state(Mnr* p,char* text,uint32_t cap) {
 }
 extern "C" int32_t mnr_monitor(Mnr* p,int32_t enabled,char* error,uint32_t cap) {
     try {
-        if(enabled<0 || enabled>4)throw std::runtime_error("Invalid monitor mode");
+        if(enabled<0 || enabled>8)throw std::runtime_error("Invalid monitor mode");
         if(enabled)p->monitor.start(p->outputRoute,static_cast<uint8_t>(enabled-1));else p->monitor.stop();return 1;
     }
     catch(const std::exception& e){copy(e.what(),error,cap);return 0;}catch(...){copy("Monitor failed",error,cap);return 0;}
@@ -74,6 +78,7 @@ extern "C" int32_t mnr_monitor(Mnr* p,int32_t enabled,char* error,uint32_t cap) 
 extern "C" int32_t mnr_monitor_state(Mnr* p,char* text,uint32_t cap) {
     try {copy(mic::utf8(p->monitor.message()),text,cap);return p->monitor.state.load();}catch(...){return 3;}
 }
+extern "C" float mnr_monitor_peak(Mnr* p) {return p->monitor.renderedPeak.exchange(0);}
 extern "C" int32_t mnr_phrase_state(Mnr* p,float* seconds) {*seconds=p->engine.stats.phraseSeconds;return p->engine.stats.phraseState;}
 extern "C" int32_t mnr_discord_state(Mnr* p,char* text,uint32_t cap,int32_t* active) {
     *active=p->engine.stats.desktopSource;
@@ -135,6 +140,72 @@ extern "C" void mnr_usage(uint64_t* cpu,uint64_t* memory) {
     *memory=counters.WorkingSetSize;
 }
 extern "C" uint32_t mnr_events(Mnr* p) {return p->events.exchange(0);}
+extern "C" int32_t mnr_sound_load(Mnr* p,uint32_t id,const float* samples,uint32_t count,float gain) {
+    if(!id || !samples || !count || count>mic::rate*300 || !std::isfinite(gain) || gain<0 || gain>2) return 0;
+    try {
+        std::vector<float> clip(samples,samples+count);
+        for(auto& v:clip) v=std::isfinite(v)?std::clamp(v,-1.0f,1.0f):0;
+        p->engine.soundLoad(id,std::move(clip),gain);return 1;
+    } catch(...) {return 0;}
+}
+extern "C" int32_t mnr_sound_gain(Mnr* p,uint32_t id,float gain) {
+    if(!id || !std::isfinite(gain) || gain<0 || gain>2) return 0;
+    return p->engine.soundGain(id,gain)?1:0;
+}
+extern "C" void mnr_sound_clear(Mnr* p) {p->engine.soundClear();}
+extern "C" void mnr_sound_play(Mnr* p,uint32_t id) {p->engine.soundPlay(id);}
+extern "C" void mnr_sound_volume(Mnr* p,float volume) {if(std::isfinite(volume)&&volume>=0&&volume<=2)p->engine.soundVolume=volume;}
+extern "C" int32_t mnr_sound_bindings(Mnr* p,const uint32_t* ids,const uint32_t* keys,uint32_t count) {
+    if(count && (!ids || !keys)) return 0;
+    if(count>4096) return 0;
+    std::vector<std::pair<unsigned,unsigned>> bindings;
+    for(unsigned i=0;i<count;++i) {
+        const unsigned k=keys[i];
+        if(!k || (k&255)<3 || (k&255)>254 || (k>>8)>7) return 0;
+        for(unsigned j=0;j<13;++j) if(p->keys[j]==k) return 0;
+        for(const auto& [id,key]:bindings) if(key==k || id==ids[i]) return 0;
+        bindings.emplace_back(ids[i],k);
+    }
+    std::lock_guard lock(p->soundKeysMutex);p->soundKeys=std::move(bindings);++p->soundKeysGeneration;return 1;
+}
+extern "C" uint32_t mnr_sound_state(Mnr* p,float* position,float* length) {
+    if(position)*position=p->engine.soundPosition;if(length)*length=p->engine.soundLength;return p->engine.soundPlaying;
+}
+extern "C" uint32_t mnr_last_clip(Mnr* p,float* out,uint32_t capacity,uint32_t* generation) {
+    if(!p)return 0;
+    try {return p->engine.clipCopy(out,capacity,generation);} catch(...) {return 0;}
+}
+extern "C" int32_t mnr_pick_paths(int32_t mode,char* result,uint32_t capacity) {
+    if(mode<0 || mode>1 || !result || !capacity) return -1;
+    struct Com {HRESULT hr;Com():hr(CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE)){}~Com(){if(SUCCEEDED(hr))CoUninitialize();}} com;
+    IFileOpenDialog* dialog=nullptr;
+    if(FAILED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&dialog)))) {copy("File dialog unavailable",result,capacity);return -1;}
+    struct Release {IFileOpenDialog* d;~Release(){d->Release();}} release{dialog};
+    DWORD options=0;dialog->GetOptions(&options);
+    options|=FOS_FORCEFILESYSTEM|FOS_PATHMUSTEXIST|FOS_FILEMUSTEXIST;
+    if(mode==0) {options|=FOS_PICKFOLDERS;dialog->SetTitle(L"Папка со звуками");}
+    else {
+        options|=FOS_ALLOWMULTISELECT;dialog->SetTitle(L"Добавить звуки");
+        COMDLG_FILTERSPEC filters[]={{L"Звуки (mp3, wav, ogg)",L"*.mp3;*.wav;*.ogg"},{L"Все файлы",L"*.*"}};
+        dialog->SetFileTypes(2,filters);
+    }
+    dialog->SetOptions(options);
+    const HRESULT shown=dialog->Show(nullptr);
+    if(shown==HRESULT_FROM_WIN32(ERROR_CANCELLED)) {copy("",result,capacity);return 0;}
+    if(FAILED(shown)) {copy("File dialog failed",result,capacity);return -1;}
+    IShellItemArray* items=nullptr;
+    if(FAILED(dialog->GetResults(&items))) {copy("File dialog result unavailable",result,capacity);return -1;}
+    struct ReleaseItems {IShellItemArray* a;~ReleaseItems(){a->Release();}} releaseItems{items};
+    DWORD count=0;items->GetCount(&count);std::string all;
+    for(DWORD i=0;i<count;++i) {
+        IShellItem* item=nullptr;if(FAILED(items->GetItemAt(i,&item))) continue;
+        PWSTR path=nullptr;
+        if(SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH,&path))) {try {all+=mic::utf8(path)+"\n";} catch(...) {} CoTaskMemFree(path);}
+        item->Release();
+    }
+    if(all.size()>=capacity) {copy("Too many files selected",result,capacity);return -1;}
+    copy(all,result,capacity);return all.empty()?0:1;
+}
 extern "C" void mnr_tray_hint(Mnr* p) {if(auto w=p->window.load()) PostMessageW(w,WM_APP+3,0,0);}
 extern "C" int32_t mnr_replace_file(const char* from,uint32_t fl,const char* to,uint32_t tl) {
     try {return MoveFileExW(string(from,fl).c_str(),string(to,tl).c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=FALSE;} catch(...) {return 0;}
@@ -206,7 +277,9 @@ extern "C" int32_t mnr_shell_start(Mnr* p,char* error,uint32_t cap) {
             return 0;
         }
         p->shell=std::jthread([p](std::stop_token stop) {
-            try {mic::ensureTagHost();} catch(const std::exception& e) {p->engine.reportError(e.what());}
+            // Skip silently while the core component is still downloading; the UI reports that.
+            if(mic::tagHostInstalled())
+                try {mic::ensureTagHost();} catch(const std::exception& e) {p->engine.reportError(e.what());}
             WNDCLASSW cls{};cls.lpfnWndProc=shellProc;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"MicNoize.Shell";
             RegisterClassW(&cls);
             HWND w=CreateWindowExW(0,cls.lpszClassName,L"Mic Noize background",0,0,0,0,0,nullptr,nullptr,cls.hInstance,p);
@@ -216,6 +289,7 @@ extern "C" int32_t mnr_shell_start(Mnr* p,char* error,uint32_t cap) {
             p->tray.cbSize=sizeof(p->tray);p->tray.hWnd=w;p->tray.uID=1;p->tray.uCallbackMessage=WM_APP+1;
             p->tray.hIcon=trayIcon();wcscpy_s(p->tray.szTip,L"Mic Noize");addTray(p);
             mic::HoldLatch latch,replayLatch,noiseLatch; unsigned previousReplay=0; bool monitorArmed=false,captureArmed=false,capturedThisSession=false;unsigned captureGeneration=0;
+            std::vector<std::pair<unsigned,unsigned>> soundKeys;std::vector<bool> soundArmed;unsigned soundGeneration=0;
             bool desktop=true;ULONGLONG lastDesktop=0,lastTick=GetTickCount64();
             while(!stop.stop_requested()) {
                 MsgWaitForMultipleObjects(0,nullptr,FALSE,p->engine.running()||p->capturing?8:250,QS_ALLINPUT);
@@ -242,6 +316,16 @@ extern "C" int32_t mnr_shell_start(Mnr* p,char* error,uint32_t cap) {
                 const auto noiseFlags=noiseLatch.update(epoch,eligible,noiseKeys,noisePressed,modifiers(),down(VK_LWIN)||down(VK_RWIN));
                 if(replayFlags && !previousReplay && epoch==p->engine.effectEpoch)++p->engine.replayRequest;
                 previousReplay=replayFlags;
+                if(soundGeneration!=p->soundKeysGeneration) {
+                    std::lock_guard lock(p->soundKeysMutex);soundKeys=p->soundKeys;soundGeneration=p->soundKeysGeneration;
+                    soundArmed.assign(soundKeys.size(),false);
+                }
+                for(size_t i=0;i<soundKeys.size();++i) {
+                    const auto [id,key]=soundKeys[i];const bool soundPressed=down(key&255);
+                    if(!eligible) soundArmed[i]=false;
+                    else if(!soundPressed) soundArmed[i]=true;
+                    else if(soundArmed[i] && modifiers()==(key>>8) && !down(VK_LWIN) && !down(VK_RWIN)) {p->engine.soundPlay(id);soundArmed[i]=false;}
+                }
                 const unsigned monitorKey=p->keys[10];
                 const bool monitorPressed=monitorKey&&down(monitorKey&255);
                 const bool monitorEligible=p->engine.running()&&p->engine.stats.outputActive&&!capture&&desktop&&!p->locked&&!p->suspended;

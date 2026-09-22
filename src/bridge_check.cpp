@@ -1,6 +1,7 @@
 #include "bridge.h"
 #include "audio.hpp"
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <cstring>
 static void require(bool ok,const char* message){if(!ok)throw std::runtime_error(message);}
@@ -17,7 +18,8 @@ int main(){try{
         require(!mnr_monitor(p,mode,error,sizeof(error)),"Stopped engine enabled effect preview");
         require(strstr(error,"Start processing before listening")!=nullptr,"Effect monitor mode rejected at ABI");
     }
-    require(!mnr_monitor(p,5,error,sizeof(error)) && strstr(error,"Invalid monitor mode"),"Invalid monitor mask accepted");
+    require(!mnr_monitor(p,9,error,sizeof(error)) && strstr(error,"Invalid monitor mode"),"Invalid monitor mask accepted");
+    require(!mnr_monitor(p,8,error,sizeof(error)) && strstr(error,"Start processing before listening"),"Soundpad monitor mask rejected at ABI");
     require(mnr_headphone_state(p,error,sizeof(error))==0,"Headphones must start off");
     require(mnr_headphones(p,0,"",0,0,error,sizeof(error))==1,"Headphone stop must be idempotent");
     require(mnr_headphones(p,2,"",0,0,error,sizeof(error))==0,"Invalid headphone mode accepted");
@@ -34,6 +36,22 @@ int main(){try{
     mnr_bindings(p,extended,13);mnr_snapshot(p,&s,error,sizeof(error),1);
     require(s.epoch==noiseEpoch,"Duplicate noise binding accepted");
     mnr_alternate_intensity(p,0.15f);
+    {
+        float clip[480];for(auto& v:clip)v=0.5f;float bad[1]{std::numeric_limits<float>::quiet_NaN()};
+        require(mnr_sound_load(p,0,clip,480,1)==0 && mnr_sound_load(p,1,nullptr,480,1)==0 && mnr_sound_load(p,1,clip,0,1)==0,"Invalid clip accepted");
+        require(mnr_sound_load(p,1,bad,1,1)==1 && mnr_sound_load(p,2,clip,480,1.5f)==1,"Clip load failed");
+        require(mnr_sound_gain(p,2,0.5f)==1 && mnr_sound_gain(p,9,0.5f)==0 && mnr_sound_gain(p,2,3)==0,"Clip gain validation");
+        uint32_t ids[]={1,2,0};uint32_t soundKeys[]={200,201,202};
+        require(mnr_sound_bindings(p,ids,soundKeys,3)==1,"Sound bindings rejected");
+        soundKeys[1]=extended[0];require(mnr_sound_bindings(p,ids,soundKeys,3)==0,"Sound key colliding with an effect key accepted");
+        soundKeys[1]=200;require(mnr_sound_bindings(p,ids,soundKeys,3)==0,"Duplicate sound key accepted");
+        soundKeys[1]=0;require(mnr_sound_bindings(p,ids,soundKeys,3)==0,"Empty sound key accepted");
+        require(mnr_sound_bindings(p,nullptr,nullptr,0)==1,"Clearing sound bindings failed");
+        float position=1,length=1;require(mnr_sound_state(p,&position,&length)==0 && position==0 && length==0,"Stopped engine reports a playing clip");
+        mnr_sound_play(p,2);mnr_sound_volume(p,1.5f);mnr_sound_clear(p);
+        require(mnr_sound_gain(p,2,0.5f)==0,"Clear kept clips");
+        require(mnr_pick_paths(2,error,sizeof(error))==-1,"Invalid picker mode accepted");
+    }
     require(!mnr_start(p,"",0,"TAG",3,2,40,5,-1,1,error,sizeof(error)),"Invalid input accepted");
     mnr_snapshot(p,&s,error,sizeof(error),1);require(s.state==5&&strstr(error,"Invalid audio settings"),"Error lost at ABI boundary");
     mnr_stop(p);mnr_snapshot(p,&s,error,sizeof(error),1);require(s.state==0&&s.muted==1,"Stop lost mute");

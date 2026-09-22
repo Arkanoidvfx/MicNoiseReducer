@@ -234,6 +234,17 @@ std::vector<Device> devices(bool capture) {
         }
         out.push_back(std::move(item));
     }
+    // The default communications microphone goes first: a fresh install on another PC must be
+    // able to select some microphone, not only a HyperX.
+    if(capture) {
+        ComPtr<IMMDevice> preferred; LPWSTR id=nullptr;
+        if(SUCCEEDED(e->GetDefaultAudioEndpoint(eCapture,eCommunications,&preferred))
+           && SUCCEEDED(preferred->GetId(&id))) {
+            const std::wstring wanted=id; CoTaskMemFree(id);
+            const auto it=std::find_if(out.begin(),out.end(),[&](const Device& d){return d.id==wanted;});
+            if(it!=out.end()) std::rotate(out.begin(),it,it+1);
+        }
+    }
     return out;
 }
 
@@ -598,7 +609,7 @@ void Monitor::start(const std::wstring& route,uint8_t effectsMask) {
                     BYTE* dest=nullptr;check(render->GetBuffer(n,&dest),"Monitor render buffer");
                     if(have)for(unsigned i=0;i<n;++i)for(unsigned ch=0;ch<output.channels;++ch)reinterpret_cast<float*>(dest)[i*output.channels+ch]=mono[i];
                     check(render->ReleaseBuffer(n,have?0:AUDCLNT_BUFFERFLAGS_SILENT),"Monitor render release");
-                    renderedPeak=have?peak(mono.data(),n):0;if(have)frames+=n;
+                    if(have){float previous=renderedPeak.load();const float now=peak(mono.data(),n);while(previous<now && !renderedPeak.compare_exchange_weak(previous,now)){} frames+=n;}
                 }
                 const auto now=std::chrono::steady_clock::now();
                 if(primed && now-adjusted>=std::chrono::milliseconds(100)){
@@ -677,6 +688,7 @@ void Engine::stop() {
     SetEvent(stop_);
     if(io_.joinable()) io_.join(); if(dsp_.joinable()) dsp_.join();if(desktopThread_.joinable())desktopThread_.join();
     if(tagOwner_) {CloseHandle(tagOwner_);tagOwner_=nullptr;}
+    soundPlaying=0;soundPosition=0;soundLength=0;
     if(running_.exchange(false)) status(L"Stopped");
     if(hadSession) {
         // Write only after audio threads have joined: no file I/O in the audio path.
@@ -702,7 +714,10 @@ void Engine::dspLoop(Config c) {
     try {
         Afx fx(c); PitchEffect pitchEffect; PhraseEffect phraseEffect; auto rvc=std::make_unique<RvcClient>(stats,rvcConfig); Mmcss priority;
         std::array<float,block> in{},out{},microphone{};
-        LastEffect lastEffect;OutputEffects boostEffect;
+        LastEffect lastEffect;OutputEffects boostEffect;SoundPlayer sounds;
+        bool clipPending=false;
+        {std::lock_guard lock(clipMutex_);clip_.clear();clip_.reserve(48000*20);} // publishing never allocates
+        std::array<float,block> sound{};
         std::array<RoutedSample,block> routed{};
         std::array<uint8_t,block> modified{};
         std::array<float,block+1> discord{};SourceRouting routing;Drift discordDrift;
@@ -712,6 +727,7 @@ void Engine::dspLoop(Config c) {
         for(unsigned j=0;j<block;++j) in[j]=0.02f*std::sin(j*0.07f)+0.01f*std::sin(j*0.21f);
         for(unsigned i=0;i<20;++i) { if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0) return; fx.process(in.data(),out.data()); }
         fx.reset();
+        soundRequest=0;soundPlaying=0;soundPosition=0;soundLength=0; // a press before start never plays later
         SetEvent(ready_);
         HANDLE events[]={stop_,data_};
         while(WaitForMultipleObjects(2,events,FALSE,INFINITE)==WAIT_OBJECT_0+1) {
@@ -776,7 +792,28 @@ void Engine::dspLoop(Config c) {
                 stats.boostActive=boosted && boost>1;
                 const bool replay=lastEffect.process(out.data(),block,modified.data(),fromDiscord,flags,
                     phraseWasActive || phraseEffect.state()!=0 || pitchEffect.active(),valid,epoch,phraseCancel.load(),replayRequest.load());
-                for(unsigned i=0;i<block;++i)routed[i]={out[i],static_cast<uint8_t>(fromDiscord),modified[i],epoch,(fromDiscord || replay)?microphone[i]:0};
+                // Hand a finished recording to the UI without allocating or waiting here.
+                if(lastEffect.finished())clipPending=true;
+                // A new hold already replaced the slot: that recording is gone, never publish half of it.
+                if(lastEffect.capturing())clipPending=false;
+                if(clipPending && lastEffect.count()){
+                    if(std::unique_lock lock(clipMutex_,std::try_to_lock);lock.owns_lock()){
+                        clip_.assign(lastEffect.audio(),lastEffect.audio()+lastEffect.count());
+                        ++clipGeneration;clipPending=false;
+                    }
+                }
+                // Soundpad: the library lock is only tried; a contended block retries the same request next time.
+                if(const auto request=soundRequest.load();request){
+                    if(const unsigned id=sounds.request(request)){
+                        if(std::unique_lock lock(soundMutex_,std::try_to_lock);lock.owns_lock()){
+                            const auto found=sounds_.find(id);sounds.commit(request);
+                            sounds.start(id,found==sounds_.end()?nullptr:found->second);
+                        }
+                    }
+                }
+                sounds.render(sound.data(),block,muted?0.0f:soundVolume.load());
+                soundPlaying=sounds.playing();soundPosition=sounds.position();soundLength=sounds.length();
+                for(unsigned i=0;i<block;++i)routed[i]={out[i],static_cast<uint8_t>(fromDiscord),modified[i],epoch,(fromDiscord || replay)?microphone[i]:0,sound[i]};
                 if(!cleaned_.push(routed.data(),block)) ++stats.drops;
                 ++stats.processed;
                 stats.inputQueue=static_cast<unsigned>(captured_.size());
@@ -794,12 +831,38 @@ void Engine::preview(const float* audio,const RoutedSample* routed,const uint8_t
         const auto n=std::min(block,count-offset);
         for(unsigned i=0;i<n;++i){
             const auto at=offset+i;
-            const RoutedSample sample{audio[at],0,modified[at],routed[at].epoch};
-            samples[i]={previewSample(sample,mask,epoch,audible),0,modified[at],epoch};
+            samples[i]=previewQueued(audio[at],modified[at],routed[at].epoch,routed[at].sound,mask,epoch,audible);
         }
         // Preview must never block or trim from the producer side.
         if(!preview_.push(samples.data(),n))break;
     }
+}
+void Engine::soundLoad(unsigned id,std::vector<float> samples,float gain) {
+    auto clip=std::make_shared<SoundClip>();clip->samples=std::move(samples);clip->gain=gain;
+    std::lock_guard lock(soundMutex_);sounds_[id]=std::move(clip);
+}
+bool Engine::soundGain(unsigned id,float gain) {
+    std::lock_guard lock(soundMutex_);const auto found=sounds_.find(id);
+    if(found==sounds_.end())return false;found->second->gain=gain;return true;
+}
+void Engine::soundClear() {std::lock_guard lock(soundMutex_);sounds_.clear();soundPlay(0);}
+std::shared_ptr<const SoundClip> Engine::soundClip(unsigned id) {
+    std::lock_guard lock(soundMutex_);const auto found=sounds_.find(id);return found==sounds_.end()?nullptr:found->second;
+}
+unsigned Engine::clipCopy(float* out,unsigned capacity,unsigned* generation) {
+    std::lock_guard lock(clipMutex_);
+    if(generation)*generation=clipGeneration.load();
+    const auto count=static_cast<unsigned>(clip_.size());
+    if(out&&capacity)std::copy_n(clip_.begin(),std::min(count,capacity),out);
+    return count;
+}
+// Called from the hotkey thread and the UI; a quick second press of the same clip restarts it.
+void Engine::soundPlay(unsigned id) {
+    std::lock_guard lock(soundRequestMutex_);
+    const auto now=GetTickCount64();
+    const bool restart=id && id==soundPressId_ && now-soundPressTick_<soundDoublePressMs;
+    soundPressId_=id;soundPressTick_=now;
+    soundRequest=SoundPlayer::pack(id,++soundSerial_,restart);
 }
 void Engine::tagLoop(Config c) {
     Event captureEvent;
@@ -812,7 +875,7 @@ void Engine::tagLoop(Config c) {
     std::array<RoutedSample,16384> routed{};
     std::array<uint8_t,16384> sources{};
     std::array<uint8_t,16384> modified{};
-    std::array<float,16384> microphone{},effectOnly{};
+    std::array<float,16384> microphone{},effectOnly{},sound{};
     HANDLE timer=CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);
     if(!timer) throw std::runtime_error("TAG high-resolution timer creation failed");
     struct Timer {HANDLE h; ~Timer(){CancelWaitableTimer(h);CloseHandle(h);}} closeTimer{timer};
@@ -876,8 +939,8 @@ void Engine::tagLoop(Config c) {
                 if(!primed && cleaned_.size()>=target+frames) primed=true;
                 const bool have=primed && cleaned_.pop(routed.data(),frames);
                 if(primed && !have){++stats.underruns;primed=false;fade=0;drift={};correction=0;}
-                for(unsigned i=0;i<frames;++i){output[i]=have?routed[i].value:0;sources[i]=have?routed[i].discord:0;modified[i]=have?routed[i].modified:0;microphone[i]=have?routed[i].microphone:0;}
-                effects.process(output.data(),frames,volume.load(),1,false,false,sources.data(),discordVolume.load(),modified.data(),microphone.data(),effectOnly.data());
+                for(unsigned i=0;i<frames;++i){output[i]=have?routed[i].value:0;sources[i]=have?routed[i].discord:0;modified[i]=have?routed[i].modified:0;microphone[i]=have?routed[i].microphone:0;sound[i]=have?routed[i].sound:0;}
+                effects.process(output.data(),frames,volume.load(),1,false,false,sources.data(),discordVolume.load(),modified.data(),microphone.data(),effectOnly.data(),sound.data());
                 for(unsigned i=0;i<frames;++i) {
                     fade+=std::clamp((muted?0.0f:1.0f)-fade,-1.0f/240,1.0f/240);
                     output[i]*=fade;
@@ -926,7 +989,7 @@ void Engine::ioLoop(Config c) {
         std::vector<RoutedSample> routed(output.capacity);
         std::vector<uint8_t> sources(output.capacity);
         std::vector<uint8_t> modified(output.capacity);
-        std::vector<float> microphone(output.capacity),effectOnly(output.capacity);
+        std::vector<float> microphone(output.capacity),effectOnly(output.capacity),sound(output.capacity);
         BYTE* initial=nullptr; check(render->GetBuffer(output.capacity,&initial),"Prime render buffer");
         check(render->ReleaseBuffer(output.capacity,AUDCLNT_BUFFERFLAGS_SILENT),"Prime render buffer release");
         Mmcss priority;
@@ -980,8 +1043,8 @@ void Engine::ioLoop(Config c) {
                 BYTE* dest=nullptr; check(render->GetBuffer(n,&dest),"Render buffer");
                 float outputPeak=0;
                 if(have) {
-                    for(unsigned i=0;i<n;++i){mono[i]=routed[i].value;sources[i]=routed[i].discord;modified[i]=routed[i].modified;microphone[i]=routed[i].microphone;}
-                    effects.process(mono.data(),n,volume.load(),1,false,false,sources.data(),discordVolume.load(),modified.data(),microphone.data(),effectOnly.data());
+                    for(unsigned i=0;i<n;++i){mono[i]=routed[i].value;sources[i]=routed[i].discord;modified[i]=routed[i].modified;microphone[i]=routed[i].microphone;sound[i]=routed[i].sound;}
+                    effects.process(mono.data(),n,volume.load(),1,false,false,sources.data(),discordVolume.load(),modified.data(),microphone.data(),effectOnly.data(),sound.data());
                     auto out=reinterpret_cast<float*>(dest);
                     for(unsigned i=0;i<n;++i) {
                         float goal=muted?0.0f:1.0f;

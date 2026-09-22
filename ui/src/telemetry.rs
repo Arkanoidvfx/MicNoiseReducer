@@ -8,7 +8,9 @@ use std::{
 };
 use uuid::Uuid;
 
-const ENDPOINT: &str = "https://moment-telemetry.arkanoidvfx.workers.dev/v1/ingest";
+// Mic Noize has its own Worker and its own D1 database; the Moment Player Worker keeps
+// accepting `app_id = mic_noize` only as a fallback while the new one is being deployed.
+const ENDPOINT: &str = "https://micnoize-telemetry.arkanoidvfx.workers.dev/v1/ingest";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 static SESSION: OnceLock<(Uuid, u64)> = OnceLock::new();
 
@@ -16,24 +18,66 @@ fn secret() -> &'static str {
     option_env!("MNR_TELEMETRY_SECRET").unwrap_or("")
 }
 
+fn enabled() -> bool {
+    !secret().is_empty() && std::env::var_os("MNR_DISABLE_TELEMETRY").is_none()
+}
+
 pub fn record(data: &Path, name: &str, details: serde_json::Value) {
-    if secret().is_empty() || std::env::var_os("MNR_DISABLE_TELEMETRY").is_some() {
+    if !enabled() {
         return;
     }
     let data = data.to_path_buf();
     let name = name.to_owned();
     std::thread::spawn(move || {
-        let _ = send(&data, &name, details);
+        let _ = send(&data, vec![event("app-lifecycle", &name, details)]);
     });
 }
 
 pub fn record_blocking(data: &Path, name: &str, details: serde_json::Value) {
-    if !secret().is_empty() && std::env::var_os("MNR_DISABLE_TELEMETRY").is_none() {
-        let _ = send(data, name, details);
+    if enabled() {
+        let _ = send(data, vec![event("app-lifecycle", name, details)]);
     }
 }
 
-fn send(data: &Path, name: &str, details: serde_json::Value) -> Result<(), String> {
+/// The tail of every runtime log plus the user's own note, sent as `error` events so they land
+/// in the same operator dashboard as crashes. One request: the ingest limits batches, not fields.
+pub fn report(data: &Path, runtime: &Path, note: &str) -> Result<String, String> {
+    if !enabled() {
+        return Err("Отправка отчётов доступна только в установленной версии".into());
+    }
+    let mut events = vec![error_event("user-report", note)];
+    for name in ["tag-host.log", "sessions.log", "tag-headphones.log"] {
+        let path = runtime.join("results").join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => events.push(error_event(name, &text)),
+            _ => continue,
+        }
+    }
+    let count = events.len();
+    send(data, events)?;
+    Ok(format!("Отчёт отправлен ({count})"))
+}
+
+/// `stack_top` holds the newest lines: a log grows at the end, and the worker stores 2 KB.
+fn error_event(name: &str, text: &str) -> serde_json::Value {
+    let tail: String = text.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
+    event(
+        "error",
+        name,
+        json!({
+            "exception_type": name,
+            "message": text.lines().next_back().unwrap_or("").chars().take(1000).collect::<String>(),
+            "stack_top": tail,
+            "source": "micnoize",
+        }),
+    )
+}
+
+fn event(tag: &str, name: &str, details: serde_json::Value) -> serde_json::Value {
+    json!({"tag": tag, "name": name, "data": details})
+}
+
+fn send(data: &Path, events: Vec<serde_json::Value>) -> Result<(), String> {
     let install_path = data.join("install-id.txt");
     let install_id = std::fs::read_to_string(&install_path)
         .ok()
@@ -50,12 +94,19 @@ fn send(data: &Path, name: &str, details: serde_json::Value) -> Result<(), Strin
     let (session, started_at) = SESSION.get_or_init(|| (Uuid::new_v4(), timestamp));
     let iso = format!("{}Z", chrono_free_utc(timestamp));
     let started_iso = format!("{}Z", chrono_free_utc(*started_at));
+    let events: Vec<serde_json::Value> = events
+        .into_iter()
+        .map(|mut e| {
+            e["ts"] = json!(iso);
+            e
+        })
+        .collect();
     let body = serde_json::to_vec(&json!({
         "app_id": "mic_noize",
         "session_id": session.to_string(),
         "session_started_at": started_iso,
         "app_version": VERSION,
-        "events": [{"ts": iso, "tag": "app-lifecycle", "name": name, "data": details}]
+        "events": events
     }))
     .map_err(|e| e.to_string())?;
     let body_hash = hex::encode(Sha256::digest(&body));
