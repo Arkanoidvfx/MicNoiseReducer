@@ -26,6 +26,7 @@ The product and internal app name is **Mic Noize**. Installed program files live
 | TAG driver install on a new PC | `driver_installed` / `install_driver` in `ui/src/components.rs` | `Msg::InstallDriver` / `DriverInstalled` and `driver_ready` in `main.rs`; `install-tag.ps1` is the developer path |
 | Logs tab / `app.log` report | `ui/src/logs.rs`, `load_logs` / `log_message` in `main.rs` | engine logs in `results/`; `nvafx.log` from `Afx` |
 | Telemetry / user-sent logs | `ui/src/telemetry.rs` | Worker `micnoize-telemetry` lives in `D:\Projects\Moment_Player\telemetry\worker` (`wrangler.micnoize.toml`), same source as Moment Player |
+| Release / "выпусти обнову" | [release checklist](references/workflow.md#release-checklist) — follow it as written, no research needed | |
 | Build / dependencies / linkage | `CMakeLists.txt`, `ui/build.rs`, `build.ps1` | [workflow](references/workflow.md) |
 
 Search symbols in `src` and `ui/src` before reading entire large files. Trace producers, queues and consumers before changing audio semantics. The deleted Win32 interface is not part of the current UI.

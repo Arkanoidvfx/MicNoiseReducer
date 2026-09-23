@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@v4
         with: { clean: false }
       - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
       - name: Resolve version
         id: version
         shell: pwsh
@@ -27,15 +28,38 @@ jobs:
           if (-not $value) { $value = "${{ github.ref_name }}".TrimStart('v') }
           if ($value -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid semver' }
           "value=$value" >> $env:GITHUB_OUTPUT
-      - name: Restore runtime build inputs
+      # The build compiles only against the NVIDIA and TAG headers (their DLLs load at run time):
+      # a 22 KB asset instead of the 1.15 GB core runtime. Rebuild it from the same vendor
+      # folders when runtime-core changes.
+      - name: Restore runtime headers
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           New-Item -ItemType Directory -Force .tmp\runtime | Out-Null
-          gh release download runtime-core-v2 --pattern core-runtime-2.part000 --dir .tmp\runtime
-          tar.exe -xf .tmp\runtime\core-runtime-2.part000 -C .
-          .\build.ps1 -NativeOnly
+          gh release download runtime-core-v2 --pattern runtime-headers-2.tar.zst --dir .tmp\runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime headers download failed.' }
+          tar.exe -xf .tmp\runtime\runtime-headers-2.tar.zst -C .
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime headers extraction failed.' }
+      - name: Build native
+        shell: pwsh
+        run: .\build.ps1 -NativeOnly
+      # Registry/git sources and compiled dependencies. Exact key only: a new rustc or Cargo.lock
+      # builds cold rather than piling stale artifacts into the cache. GitHub drops an entry
+      # unused for 7 days, and caches saved by tag-push runs are not reused: release by dispatch.
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/cargo/registry/index
+            .cache/cargo/registry/cache
+            .cache/cargo/git/db
+            build/rust
+          key: rust-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('ui/Cargo.lock') }}
+      # Never trust a cached Mic Noize binary: the release exe is always compiled from this commit.
+      - name: Drop cached Mic Noize artifacts
+        shell: pwsh
+        run: Remove-Item build\rust\release\.fingerprint\micnoize-* -Recurse -Force -ErrorAction SilentlyContinue
       - name: Build and verify
         shell: pwsh
         env:

@@ -94,7 +94,22 @@ git -C "$project\.tmp\public" push release HEAD:main
 git worktree remove "$project\.tmp\public"
 ```
 
-A release is then `workflow_dispatch` of `release.yml` (or pushing a `vX.Y.Z` tag) on the public repo; `release/version.txt` and `ui/Cargo.toml` must already carry that version. Runtime components (`runtime-core-*`, `runtime-rvc-*`) are separate GitHub Releases without a Velopack feed; the updater scans the 10 newest releases and skips them, so keep app releases within that window.
+### Release checklist
+
+"Выпусти обнову" means all of this, without asking again:
+
+1. Local checks for what changed (at least `cargo test --release --locked`; native checks for C++ changes). CI runs the full `verify.ps1`.
+2. Bump the patch version in `release/version.txt`, `ui/Cargo.toml` and the `micnoize` entry of `ui/Cargo.lock` (all three, or `--locked` fails).
+3. Rewrite `release/notes.md` (Russian, user-facing: what changed for the user, what is not verified). It becomes the GitHub Release text.
+4. `CHANGELOG.md`: dated `патч X.Y.Z` entry listing what the release contains.
+5. Commit everything on `main` as `Release X.Y.Z: <summary>` with **no Claude attribution trailer**; `git push origin main`.
+6. Cherry-pick onto `release/main` with the worktree commands above; confirm `git diff <public sha> <main sha>` is empty; push; remove the worktree.
+7. `gh workflow run release.yml -R Arkanoidvfx/MicNoize -f version=X.Y.Z`, then `gh run watch <id> -R Arkanoidvfx/MicNoize --exit-status` in the background. Always dispatch (tag-push runs do not reuse the Rust cache). With a warm cache (same rustc and `Cargo.lock`, last run within 7 days) expect well under 10 min; cold ~15 min.
+8. After success: `gh release view vX.Y.Z -R Arkanoidvfx/MicNoize` for installer size/SHA-256, then a `Record the X.Y.Z release` commit adding a `релиз vX.Y.Z опубликован` CHANGELOG entry (run id, commit, sizes, what is untested), pushed to `origin` and cherry-picked to `release` the same way.
+
+CI compiles against `runtime-headers-2.tar.zst` (34 NVIDIA/TAG `.h` files, 22 KB, asset of `runtime-core-v2`), not the 1.15 GB core runtime: the engine loads those DLLs at run time and no check needs them. When the core runtime changes, rebuild that archive from the same `vendor` folders (`tar -caf` of the `.h` files under `vendor/nvidia-afx-3.0.0/include`, `.../features/nvafxdenoiser/include`, `vendor/tag-2.0.0.1903-demo`) and point the workflow at it. The Rust build is cached by rustc + `Cargo.lock`; Mic Noize itself always recompiles.
+
+A release is `workflow_dispatch` of `release.yml` (or pushing a `vX.Y.Z` tag) on the public repo; `release/version.txt` and `ui/Cargo.toml` must already carry that version. Runtime components (`runtime-core-*`, `runtime-rvc-*`) are separate GitHub Releases without a Velopack feed; the updater scans the 10 newest releases and skips them, so keep app releases within that window.
 
 Telemetry backend: Mic Noize posts to its own Cloudflare Worker `micnoize-telemetry`, deployed from the Moment Player repository (`D:\Projects\Moment_Player\telemetry\worker`) with `npx wrangler deploy -c wrangler.micnoize.toml`; the same source also deploys `moment-telemetry`, so a change in `src/` needs both deploys. Its secrets are `MICNOIZE_HMAC_SECRET` (identical to the GitHub secret `MNR_TELEMETRY_SECRET` the release workflow builds with) plus `ADMIN_PASSWORD`, `ADMIN_TOKEN`, `ADMIN_SESSION_SECRET`; a Worker without them answers ingest with 503. Operator panel: `https://micnoize-telemetry.arkanoidvfx.workers.dev/admin`, filter `Mic Noize`. Never deploy or set secrets as part of an ordinary code task.
 
