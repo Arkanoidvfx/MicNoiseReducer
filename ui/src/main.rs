@@ -601,6 +601,8 @@ struct App {
     update_ready: bool,
     update_status: String,
     apply_after_quit: bool,
+    /// "Update" was pressed: apply as soon as the re-check before it finishes.
+    apply_pending: bool,
     busy: bool,
     quitting: bool,
     /// `Msg::Bind` target whose button is capturing a key in place.
@@ -918,6 +920,7 @@ impl App {
                     "Проверяем обновления…".into()
                 },
                 apply_after_quit: false,
+                apply_pending: false,
                 busy: false,
                 quitting: false,
                 binding: None,
@@ -1774,6 +1777,10 @@ impl App {
             }
             Msg::UpdateChecked(status) => {
                 self.update_checking = false;
+                // Apply after the fresh check: the newest download (Ready), or the one already on
+                // disk when the check itself failed (offline). Current means the release is gone.
+                let apply = std::mem::take(&mut self.apply_pending)
+                    && matches!(status, updater::Status::Ready(_) | updater::Status::Unavailable(_));
                 match status {
                     updater::Status::Current => {
                         self.update_ready = false;
@@ -1793,11 +1800,22 @@ impl App {
                             };
                     }
                 }
-            }
-            Msg::ApplyUpdate => {
-                if self.update_ready && !self.quitting {
+                if apply && !self.quitting {
                     self.apply_after_quit = true;
                     return self.update(Msg::Quit);
+                }
+            }
+            Msg::ApplyUpdate => {
+                // The download may be days old in a tray app: fetch the newest release first,
+                // so one click lands on the latest version instead of the next one.
+                if self.update_ready && !self.quitting && !self.update_checking {
+                    self.update_checking = true;
+                    self.apply_pending = true;
+                    self.update_status = "Проверяем последнюю версию…".into();
+                    return Task::perform(
+                        async { updater::check_and_download() },
+                        Msg::UpdateChecked,
+                    );
                 }
             }
             Msg::Monitor => {
@@ -3470,8 +3488,27 @@ mod controller_tests {
         }
         app.details = false;
         app.focus = focus::UPDATE_BANNER;
+        // A withdrawn release (Current after the re-check) is not applied.
         let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
-        assert!(app.apply_after_quit, "Enter on the banner must apply the update");
+        assert!(app.apply_pending && app.update_checking && !app.apply_after_quit);
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert!(app.update_checking, "a second press while checking is ignored");
+        let _ = app.update(Msg::UpdateChecked(updater::Status::Current));
+        assert!(!app.apply_pending && !app.apply_after_quit && !app.update_ready);
+        // Enter re-checks first, then applies what that check downloaded: the newest release.
+        app.update_ready = true;
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert!(!app.apply_after_quit, "the stale download must not be applied before the re-check");
+        let _ = app.update(Msg::UpdateChecked(updater::Status::Ready("0.2.4".into())));
+        assert!(app.apply_after_quit, "Enter on the banner must apply the newest update");
+    }
+    #[test]
+    fn offline_recheck_still_applies_the_downloaded_update() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.update_ready = true;
+        let _ = app.update(Msg::ApplyUpdate);
+        let _ = app.update(Msg::UpdateChecked(updater::Status::Unavailable("offline".into())));
+        assert!(app.apply_after_quit);
     }
     #[test]
     fn boost_monitor_is_independent_and_defaults_off() {
