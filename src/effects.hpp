@@ -228,6 +228,32 @@ public:
         }
     }
 };
+// Continuous reverse as close to live as reverse can be: every 100 ms the last 200 ms are
+// played backwards under a periodic Hann window; at 50 % overlap the windows sum to 1, so
+// joints neither click nor pump. Latency is one grain (200 ms) only while it is on.
+// Buffers are allocated once, before the audio loop; process() never allocates.
+class GrainReverse {
+public:
+    static constexpr unsigned Grain=9600,Hop=Grain/2;
+    GrainReverse():history_(Grain),output_(Grain),window_(Grain) {
+        for(unsigned k=0;k<Grain;++k) window_[k]=0.5f-0.5f*std::cos(6.28318530718f*k/Grain);
+    }
+    void reset(){std::fill(history_.begin(),history_.end(),0.f);std::fill(output_.begin(),output_.end(),0.f);write_=read_=count_=0;}
+    void process(float* data,unsigned frames) {
+        for(unsigned i=0;i<frames;++i) {
+            history_[write_]=data[i];write_=(write_+1)%Grain;
+            data[i]=output_[read_];output_[read_]=0;read_=(read_+1)%Grain;
+            if(++count_==Hop) {
+                count_=0;
+                // Newest sample first: the grain comes out reversed, starting at the read head.
+                for(unsigned k=0;k<Grain;++k) output_[(read_+k)%Grain]+=history_[(write_+Grain-1-k)%Grain]*window_[k];
+            }
+        }
+    }
+private:
+    std::vector<float> history_,output_,window_;
+    unsigned write_=0,read_=0,count_=0;
+};
 class PitchEffect {
     RubberBand::RubberBandLiveShifter shifter_{48000,1,0};
     const size_t size_=shifter_.getBlockSize();

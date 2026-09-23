@@ -7,6 +7,23 @@
 #include <limits>
 static void require(bool ok,const char* message){if(!ok) throw std::runtime_error(message);}
 int main() {try {
+    {
+        // Grain reverse: 50 % Hann overlap must add to unity (steady input stays steady),
+        // stay bounded, reverse order inside a grain, and reset to silence.
+        mic::GrainReverse reverse;std::vector<float> x(48000,0.5f);
+        reverse.process(x.data(),480*20);reverse.process(x.data()+480*20,48000-480*20);
+        for(unsigned i=mic::GrainReverse::Grain*2;i<48000;++i) require(std::abs(x[i]-0.5f)<1e-4f,"Grain reverse is not unity gain");
+        reverse.reset();std::vector<float> ramp(mic::GrainReverse::Grain*3);
+        for(unsigned i=0;i<ramp.size();++i) ramp[i]=float(i%mic::GrainReverse::Hop)/mic::GrainReverse::Hop;
+        reverse.process(ramp.data(),unsigned(ramp.size()));
+        for(float v:ramp) require(std::isfinite(v) && std::abs(v)<=1.0001f,"Grain reverse left the input range");
+        // A rising sawtooth comes back falling: most steps inside the steady part go down.
+        unsigned falling=0,rising=0;
+        for(unsigned i=mic::GrainReverse::Grain*2+1;i<ramp.size();++i) (ramp[i]<ramp[i-1]?falling:rising)++;
+        require(falling>rising*4,"Grain reverse did not reverse");
+        reverse.reset();std::vector<float> quiet(960,0.f);reverse.process(quiet.data(),960);
+        for(float v:quiet) require(v==0.f,"Grain reverse kept audio after reset");
+    }
     std::array<float,480> original{},data{};
     {
         mic::LastEffect replay;std::array<uint8_t,480> modified{};bool discord=false;

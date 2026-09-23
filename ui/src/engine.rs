@@ -56,6 +56,7 @@ unsafe extern "C" {
     ) -> i32;
     fn mnr_headphone_controls(p: usize, intensity: f32, volume: f32, pitch: i32, muted: i32);
     fn mnr_headphone_state(p: usize, text: *mut c_char, cap: u32) -> i32;
+    fn mnr_headphone_reverse(p: usize, enabled: i32);
     fn mnr_rvc_settings(p: usize, slot: u32, pitch: i32, index: u32, chunk_ms: u32, gain: u32);
     fn mnr_monitor(p: usize, enabled: i32, error: *mut c_char, cap: u32) -> i32;
     fn mnr_monitor_state(p: usize, text: *mut c_char, cap: u32) -> i32;
@@ -474,8 +475,12 @@ impl Engine {
     pub fn headphones(&self, enabled: bool, output: String, denoise: bool) {
         let _ = self.tx.send(Command::Headphones(enabled, output, denoise));
     }
-    pub fn headphone_controls(&self, intensity: f32, volume: f32, pitch: i32, muted: bool) {
-        unsafe { mnr_headphone_controls(self.p, intensity, volume, pitch, muted as i32) };
+    /// Headphones have no Mute of their own any more; `reverse` is the grain reverse.
+    pub fn headphone_controls(&self, intensity: f32, volume: f32, pitch: i32, reverse: bool) {
+        unsafe {
+            mnr_headphone_controls(self.p, intensity, volume, pitch, 0);
+            mnr_headphone_reverse(self.p, reverse as i32);
+        }
     }
     pub fn headphone_state(&self) -> (i32, String) {
         let mut text = [0u8; 4096];
@@ -579,7 +584,8 @@ impl Engine {
             unsafe { mnr_discord_state(self.p, text.as_mut_ptr().cast(), 2048, &mut active) };
         (state, active != 0, decoded(&text))
     }
-    /// 1 NVIDIA denoiser, 2 running without one (with the reason), 0 otherwise.
+    /// 1 NVIDIA, 2 none (with the reason), 3 DeepFilterNet on the CPU, 4 the input (named) is
+    /// already denoised by RTX Voice/Broadcast; 0 otherwise.
     pub fn denoiser_state(&self) -> (i32, String) {
         let mut text = [0u8; 1024];
         let state = unsafe { mnr_denoiser_state(self.p, text.as_mut_ptr().cast(), 1024) };

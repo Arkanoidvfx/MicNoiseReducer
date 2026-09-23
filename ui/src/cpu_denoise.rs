@@ -39,10 +39,16 @@ fn attenuation_db(strength: f32) -> f32 {
     if strength >= 1.0 { 100.0 } else { (strength.max(0.0) * 40.0).max(0.5) }
 }
 
+/// libDF's defaults gate every frame on its SNR guess: below -10 dB the frame is zeroed, above
+/// 20/30 dB decoder stages are skipped (their recurrent state then goes stale). On a noisy USB
+/// microphone syllables straddle those lines and the voice chops in and out, so every frame runs
+/// the full model and the model's own smooth gains do the suppression.
+fn runtime_params() -> RuntimeParams {
+    RuntimeParams::default_with_ch(1).with_thresholds(-100.0, 100.0, 100.0)
+}
+
 extern "C" fn create() -> *mut c_void {
-    let model = catch_unwind(|| {
-        DfTract::new(DfParams::default(), &RuntimeParams::default_with_ch(1))
-    });
+    let model = catch_unwind(|| DfTract::new(DfParams::default(), &runtime_params()));
     match model {
         Ok(Ok(model)) if model.hop_size == HOP && model.sr == 48_000 => {
             Box::into_raw(Box::new(State { model, strength: f32::NAN, silent: 0, padded: [0.0; HOP] })).cast()
@@ -118,6 +124,14 @@ mod tests {
         assert_eq!(attenuation_db(0.5), 20.0);
         assert_eq!(attenuation_db(0.0), 0.5);
         assert_eq!(attenuation_db(-1.0), 0.5);
+    }
+    #[test]
+    fn every_frame_runs_the_full_model() {
+        let model = DfTract::new(DfParams::default(), &runtime_params()).unwrap();
+        // libDF clamps its SNR estimate to -15..35 dB.
+        for lsnr in -15..=35 {
+            assert_eq!(model.apply_stages(lsnr as f32), (true, false, true), "{lsnr} dB");
+        }
     }
     #[test]
     fn deepfilternet_runs_480_sample_frames() {

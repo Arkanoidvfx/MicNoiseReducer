@@ -18,6 +18,7 @@
 #include <iostream>
 #include <memory>
 #include <future>
+#include <xmmintrin.h>
 #include "tag_link.hpp"
 #include "tag.hpp"
 #include "effects.hpp"
@@ -868,7 +869,7 @@ void Engine::stop() {
                <<" graphs="<<config_.cudaGraphs<<" blocks="<<stats.processed<<" underruns="<<stats.underruns<<" drops="<<stats.drops
                <<" run_max_ms="<<stats.maxRunMs<<" reset_max_ms="<<stats.maxResetMs<<" tag_gaps="<<stats.tagDriverGaps
                <<" late_ticks="<<stats.tagLateTicks<<" reconnects="<<stats.tagReconnects
-               <<" denoiser="<<(stats.denoiser==1?"nvidia":stats.denoiser==2?"bypass":stats.denoiser==3?"cpu":"none")<<" runs_over_5ms="<<stats.runsOver5Ms<<" runs_over_10ms="<<stats.runsOver10Ms<<" run_max_at_s="<<stats.maxRunBlock/100;
+               <<" denoiser="<<(stats.denoiser==1?"nvidia":stats.denoiser==2?"bypass":stats.denoiser==3?"cpu":stats.denoiser==4?"input":"none")<<" runs_over_5ms="<<stats.runsOver5Ms<<" runs_over_10ms="<<stats.runsOver10Ms<<" run_max_at_s="<<stats.maxRunBlock/100;
             if(const auto failed=failedAt_.load()) {
                 // The line is written on the next stop(), often much later: keep when it really broke.
                 const FILETIME file{static_cast<DWORD>(failed),static_cast<DWORD>(failed>>32)};SYSTEMTIME at{};
@@ -891,7 +892,17 @@ void Engine::dspLoop(Config c) {
         std::unique_ptr<Afx> fx;
         const CpuDenoiserApi* cpuApi=nullptr;
         struct Cpu {const CpuDenoiserApi*& api;void* state=nullptr;~Cpu(){if(state)api->destroy(state);}} cpu{cpuApi};
+        // RTX Voice (it also runs on GTX 10xx) or NVIDIA Broadcast as the input already denoised
+        // the voice on the GPU: a second denoiser would only add latency and artifacts.
+        std::wstring cleanedBy;
         try {
+            for(const auto& d:devices(true)) if(d.id==c.input) {
+                auto lower=d.name;std::transform(lower.begin(),lower.end(),lower.begin(),[](wchar_t ch){return static_cast<wchar_t>(towlower(ch));});
+                if(lower.find(L"rtx voice")!=std::wstring::npos || lower.find(L"nvidia broadcast")!=std::wstring::npos) cleanedBy=d.name;
+            }
+        } catch(...) {}
+        if(!cleanedBy.empty()) {{std::lock_guard lock(statusMutex_);denoiserMessage_=cleanedBy;}stats.denoiser=4;}
+        else try {
             // MNR_DENOISER=cpu tests the CPU path on an RTX machine (and frees the GPU for games).
             if(const auto* forced=_wgetenv(L"MNR_DENOISER"); forced && _wcsicmp(forced,L"cpu")==0)
                 throw std::runtime_error("выбран процессор (MNR_DENOISER=cpu)");
@@ -901,7 +912,9 @@ void Engine::dspLoop(Config c) {
             // No usable NVIDIA: DeepFilterNet on the CPU when the host supplied it, else no denoiser.
             {std::lock_guard lock(statusMutex_);denoiserMessage_=wide(e.what());}
             cpuApi=cpuDenoiser.load();
-            if(cpuApi) cpu.state=cpuApi->create();
+            // Flush denormals on this thread: DeepFilterNet's recurrent state decays into them on
+            // quiet input, and older CPUs take a large penalty per denormal operation.
+            if(cpuApi) {_mm_setcsr(_mm_getcsr()|0x8040);cpu.state=cpuApi->create();}
             stats.denoiser=cpu.state?3:2;
         }
         PitchEffect pitchEffect; PhraseEffect phraseEffect; auto rvc=std::make_unique<RvcClient>(stats,rvcConfig); Mmcss priority;
@@ -1321,6 +1334,7 @@ void Headphones::dspLoop(bool denoise) {
         std::unique_ptr<Afx> leftFx,rightFx;
         if(denoise){leftFx=std::make_unique<Afx>(c);if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0)return;rightFx=std::make_unique<Afx>(c);}
         PitchEffect leftPitch,rightPitch;
+        GrainReverse leftReverse,rightReverse;bool reversing=false;
         std::array<StereoSample,block> samples{};
         std::array<float,block> left{},right{},outLeft{},outRight{};
         unsigned generation=epoch_;float strength=intensity;
@@ -1330,7 +1344,7 @@ void Headphones::dspLoop(bool denoise) {
             while(WaitForSingleObject(stop_,0)!=WAIT_OBJECT_0 && captured_.pop(samples.data(),block)) {
                 const unsigned current=epoch_;
                 if(samples.front().epoch!=current || samples.back().epoch!=current)continue;
-                if(generation!=current){if(leftFx){leftFx->reset();rightFx->reset();}leftPitch.reset();rightPitch.reset();generation=current;}
+                if(generation!=current){if(leftFx){leftFx->reset();rightFx->reset();}leftPitch.reset();rightPitch.reset();leftReverse.reset();rightReverse.reset();generation=current;}
                 for(unsigned i=0;i<block;++i){left[i]=samples[i].left;right[i]=samples[i].right;}
                 if(leftFx) {
                     const float next=intensity;
@@ -1340,6 +1354,9 @@ void Headphones::dspLoop(bool denoise) {
                 const int tone=pitch;
                 leftPitch.process(outLeft.data(),block,tone,tone!=0);
                 rightPitch.process(outRight.data(),block,tone,tone!=0);
+                // Off adds no latency; each switch starts from empty grains (no old tail).
+                if(const bool want=reverse;want!=reversing){leftReverse.reset();rightReverse.reset();reversing=want;}
+                if(reversing){leftReverse.process(outLeft.data(),block);rightReverse.process(outRight.data(),block);}
                 for(unsigned i=0;i<block;++i){
                     if(!std::isfinite(outLeft[i])||!std::isfinite(outRight[i]))throw std::runtime_error("Non-finite headphone audio");
                     samples[i]={std::clamp(outLeft[i],-1.f,1.f),std::clamp(outRight[i],-1.f,1.f),current};

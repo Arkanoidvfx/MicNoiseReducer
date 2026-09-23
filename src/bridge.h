@@ -18,6 +18,8 @@ int32_t mnr_start(Mnr*,const char* input,uint32_t input_len,const char* output,u
 void mnr_stop(Mnr*);
 int32_t mnr_headphones(Mnr*,int32_t enabled,const char* output,uint32_t length,int32_t denoise,char* error,uint32_t capacity);
 void mnr_headphone_controls(Mnr*,float intensity,float volume,int32_t pitch,int32_t muted);
+// Continuous grain reverse on the headphone line (0/1; other values ignored). +200 ms while on.
+void mnr_headphone_reverse(Mnr*,int32_t enabled);
 int32_t mnr_headphone_state(Mnr*,char* text,uint32_t capacity);
 // mode: 0 off, 1 full voice, otherwise 1 + mask (1 other effects, 2 boost, 4 soundpad): 2..8.
 int32_t mnr_monitor(Mnr*,int32_t mode,char* error,uint32_t capacity);
@@ -31,7 +33,8 @@ int32_t mnr_discord_state(Mnr*,char* text,uint32_t capacity,int32_t* active);
 // Host-supplied CPU denoiser (see mic::CpuDenoiserApi): create, process(state,in,out,strength), destroy.
 typedef struct {void* (*create)(void);int32_t (*process)(void*,const float*,float*,float);void (*destroy)(void*);} MnrCpuDenoiser;
 void mnr_set_cpu_denoiser(const MnrCpuDenoiser* api);
-// 0 stopped/starting, 1 NVIDIA, 2 no denoiser, 3 CPU DeepFilterNet; `text` says why NVIDIA is off.
+// 0 stopped/starting, 1 NVIDIA, 2 no denoiser, 3 CPU DeepFilterNet, 4 input is RTX Voice/Broadcast
+// (no own denoiser); `text` says why NVIDIA is off, or names that input for 4.
 int32_t mnr_denoiser_state(Mnr*,char* text,uint32_t capacity);
 void mnr_phrase_cancel(Mnr*);
 void mnr_snapshot(Mnr*,MnrSnapshot*,char* error,uint32_t capacity,int32_t meters);

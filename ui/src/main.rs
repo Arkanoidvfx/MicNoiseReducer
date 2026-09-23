@@ -213,6 +213,7 @@ mod focus {
         pub const DONE: usize = 6;
         pub const QUIT: usize = 7;
         pub const AUTOSTART: usize = 8;
+        pub const APP_AUTOSTART: usize = 79;
         pub const UPDATE: usize = 57;
         pub const APPLY_UPDATE: usize = 58;
         pub const DRIVER: usize = 72;
@@ -269,7 +270,7 @@ mod focus {
         pub const INTENSITY: usize = 53;
         pub const VOLUME: usize = 54;
         pub const PITCH: usize = 55;
-        pub const MUTE: usize = 56;
+        pub const REVERSE: usize = 56;
     }
 }
 static RESTART: AtomicBool = AtomicBool::new(false);
@@ -386,6 +387,29 @@ fn set_tag_host_autostart(enabled: bool) -> Result<(), String> {
     }
 }
 
+const APP_RUN_NAME: &str = "MicNoize";
+/// Windows login starts this exe straight into the tray; the saved route then starts itself.
+/// Rewritten on every launch so the value follows the exe (updates, dev vs installed copy).
+fn set_app_autostart(enabled: bool) -> Result<(), String> {
+    let mut command = Command::new("reg");
+    command.creation_flags(0x08000000);
+    if enabled {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        command.args(["add", TAG_HOST_RUN_KEY, "/v", APP_RUN_NAME, "/t", "REG_SZ", "/d"])
+            .arg(format!(r#""{}" --start-tray"#, exe.display()))
+            .arg("/f");
+    } else {
+        command.args(["delete", TAG_HOST_RUN_KEY, "/v", APP_RUN_NAME, "/f"]);
+    }
+    let output = command.output().map_err(|e| e.to_string())?;
+    // Deleting a value that was never there is not an error worth showing.
+    if output.status.success() || !enabled {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Msg {
     HeadphoneToggle,
@@ -394,7 +418,7 @@ enum Msg {
     HeadphoneIntensity(f32),
     HeadphoneVolume(f32),
     HeadphonePitch(f32),
-    HeadphoneMute,
+    HeadphoneReverse(bool),
     Tick,
     Opened(window::Id),
     WindowFocus(window::Id, bool),
@@ -412,6 +436,7 @@ enum Msg {
     Page(u8),
     Refresh,
     Autostart(bool),
+    AppAutostart(bool),
     Input(Device),
     Output(Device),
     Version(i32),
@@ -564,7 +589,7 @@ struct App {
     headphone_intensity: f32,
     headphone_volume: f32,
     headphone_pitch: i32,
-    headphone_muted: bool,
+    headphone_reverse: bool,
     headphone_state: i32,
     headphone_busy: bool,
     headphone_message: String,
@@ -588,7 +613,8 @@ struct App {
     driver_ready: bool,
     report_sending: bool,
     logs_page: bool,
-    /// Engine denoiser: 1 NVIDIA, 2 none, 3 DeepFilterNet on the CPU; the text says why not NVIDIA.
+    /// Engine denoiser: 1 NVIDIA, 2 none, 3 DeepFilterNet on the CPU, 4 input already denoised
+    /// (the text names it); otherwise the text says why not NVIDIA.
     denoiser: (i32, String),
     logs_text: String,
     logs_copied: bool,
@@ -641,6 +667,7 @@ struct App {
     dirty: Option<Instant>,
     hint_shown: bool,
     autostart: bool,
+    app_autostart: bool,
     tray_ok: bool,
     peak: f32,
     ticks: u64,
@@ -732,6 +759,7 @@ impl App {
             settings.number("headphones", "intensity", 80, 0, 200) as f32 / 100.0;
         let headphone_volume = settings.number("headphones", "volume", 70, 0, 100) as f32 / 100.0;
         let headphone_pitch = settings.number("headphones", "pitch", 0, -12, 12);
+        let headphone_reverse = settings.number("headphones", "reverse", 0, 0, 1) != 0;
         let effects_monitor = settings.number("effects", "monitor_effects", 0, 0, 1) != 0;
         let boost_monitor = settings.number("effects", "monitor_boost", 0, 0, 1) != 0;
         let controls = Controls {
@@ -807,6 +835,11 @@ impl App {
         let period = settings.number("audio", "period_ms", 5, 2, 20) as u32;
         let graphs = settings.number("audio", "cuda_graphs", -1, -1, 1);
         let hint_shown = settings.get("ui", "tray_hint") == Some("1");
+        // On by default: a fresh install starts with Windows until the user unticks it.
+        let app_autostart = settings.number("ui", "app_autostart", 1, 0, 1) != 0;
+        if !cfg!(test) {
+            let _ = set_app_autostart(app_autostart);
+        }
         let args: Vec<_> = std::env::args().collect();
         let capture_path = args
             .iter()
@@ -911,7 +944,7 @@ impl App {
                 headphone_intensity,
                 headphone_volume,
                 headphone_pitch,
-                headphone_muted: false,
+                headphone_reverse,
                 headphone_state: 0,
                 headphone_busy: false,
                 headphone_message: String::new(),
@@ -981,6 +1014,7 @@ impl App {
                 dirty: None,
                 hint_shown,
                 autostart: !cfg!(test) && tag_host_autostart(),
+                app_autostart,
                 tray_ok: true,
                 peak: 0.0,
                 ticks: 0,
@@ -1054,6 +1088,8 @@ impl App {
         );
         self.settings
             .set("headphones", "pitch", self.headphone_pitch);
+        self.settings
+            .set("headphones", "reverse", self.headphone_reverse as i32);
         if self.benchmark {
             self.dirty = None;
             return;
@@ -1110,6 +1146,7 @@ impl App {
             self.settings.set("effects", k, v);
         }
         self.settings.set("ui", "tray_hint", self.hint_shown as i32);
+        self.settings.set("ui", "app_autostart", self.app_autostart as i32);
         if let Some(folder) = &self.sound_folder {
             self.settings
                 .set("soundpad", "folder", folder.to_string_lossy());
@@ -1142,7 +1179,7 @@ impl App {
             self.headphone_intensity,
             self.headphone_volume,
             self.headphone_pitch,
-            self.headphone_muted,
+            self.headphone_reverse,
         );
         self.dirty = Some(Instant::now());
     }
@@ -1462,6 +1499,7 @@ impl App {
                 1 => "NVIDIA".to_owned(),
                 2 => format!("выключен ({})", self.denoiser.1),
                 3 => format!("DeepFilterNet на CPU ({})", self.denoiser.1),
+                4 => format!("на входе ({})", self.denoiser.1),
                 _ => "-".to_owned(),
             },
             self.output.as_ref().map_or("не выбран", |d| d.name.as_str()),
@@ -1687,9 +1725,13 @@ impl App {
                     self.discord_message,
                 ) = self.engine.discord_state();
                 let denoiser = self.engine.denoiser_state();
-                if matches!(denoiser.0, 2 | 3) && self.denoiser.0 != denoiser.0 && !cfg!(test) {
-                    let mode = if denoiser.0 == 3 { "DeepFilterNet на CPU" } else { "без шумодава" };
-                    logs::note(&self.runtime_root, &format!("NVIDIA не используется, {mode}: {}", denoiser.1));
+                if matches!(denoiser.0, 2..=4) && self.denoiser.0 != denoiser.0 && !cfg!(test) {
+                    let text = match denoiser.0 {
+                        3 => format!("NVIDIA не используется, DeepFilterNet на CPU: {}", denoiser.1),
+                        4 => format!("Вход уже очищен ({}), свой шумодав выключен", denoiser.1),
+                        _ => format!("NVIDIA не используется, без шумодава: {}", denoiser.1),
+                    };
+                    logs::note(&self.runtime_root, &text);
                 }
                 self.denoiser = denoiser;
                 let playing = self.engine.sound_state();
@@ -1725,10 +1767,13 @@ impl App {
                     {
                         self.busy = true;
                         self.snapshot.state = 1;
+                        self.message.clear();
                         self.engine.start(config);
                     }
                 }
-                if snapshot.state == 5 && !error.is_empty() {
+                // During an in-flight restart the engine still reports the old failure: showing
+                // it again would leave a stale red error over a session that then starts fine.
+                if snapshot.state == 5 && !self.busy && !error.is_empty() {
                     self.message = match self.recovery.due {
                         Some(at) => format!(
                             "{error} Перезапуск через {} с.",
@@ -1982,7 +2027,7 @@ impl App {
                             self.headphone_intensity,
                             self.headphone_volume,
                             self.headphone_pitch,
-                            self.headphone_muted,
+                            self.headphone_reverse,
                         );
                         self.headphone_busy = true;
                         self.headphone_message.clear();
@@ -2012,11 +2057,25 @@ impl App {
                 self.focus = focus::headphones::OUTPUT;
             }
             Msg::HeadphoneNoise(value) => {
-                if !self.headphone_busy && !matches!(self.headphone_state, 1 | 2) {
+                if !self.headphone_busy {
                     self.headphone_denoise = value;
                     self.dirty = Some(Instant::now());
+                    // The NVIDIA model is chosen when a session opens, so a running session
+                    // is reopened in the new mode (engine commands run in order).
+                    if matches!(self.headphone_state, 1 | 2) {
+                        let output = self.headphone_output.as_ref().map(|d| d.id.clone()).unwrap_or_default();
+                        self.headphone_busy = true;
+                        self.headphone_message.clear();
+                        self.engine.headphones(false, output.clone(), value);
+                        self.engine.headphones(true, output, value);
+                    }
                 }
                 self.focus = focus::headphones::NOISE;
+            }
+            Msg::HeadphoneReverse(enabled) => {
+                self.headphone_reverse = enabled;
+                self.headphone_changed();
+                self.focus = focus::headphones::REVERSE;
             }
             Msg::HeadphoneIntensity(v) => {
                 self.headphone_intensity = (v / 100.0).clamp(0.0, 2.0);
@@ -2033,17 +2092,22 @@ impl App {
                 self.headphone_changed();
                 self.focus = focus::headphones::PITCH;
             }
-            Msg::HeadphoneMute => {
-                self.headphone_muted = !self.headphone_muted;
-                self.headphone_changed();
-                self.focus = focus::headphones::MUTE;
-            }
             Msg::Refresh => {
                 if !self.running() && !self.busy {
                     self.auto_started = false;
                     self.engine.refresh();
                 }
                 self.focus = focus::settings::REFRESH;
+            }
+            Msg::AppAutostart(enabled) => {
+                self.focus = focus::settings::APP_AUTOSTART;
+                match if cfg!(test) { Ok(()) } else { set_app_autostart(enabled) } {
+                    Ok(()) => {
+                        self.app_autostart = enabled;
+                        self.save();
+                    }
+                    Err(e) => self.message = format!("Автозапуск не изменён: {e}"),
+                }
             }
             Msg::Autostart(enabled) => {
                 self.focus = focus::settings::AUTOSTART;
@@ -2971,7 +3035,7 @@ impl App {
                 items
             } else if self.headphone_page {
                 use focus::headphones::*;
-                let mut items = vec![OUTPUT, TOGGLE, MUTE, NOISE, INTENSITY, VOLUME, PITCH];
+                let mut items = vec![OUTPUT, TOGGLE, NOISE, INTENSITY, VOLUME, PITCH, REVERSE];
                 items.extend(tabs);
                 items
             } else if self.soundpad_page {
@@ -2991,10 +3055,10 @@ impl App {
             } else if self.details {
                 use focus::settings::*;
                 let mut items = if self.running() || self.busy {
-                    vec![AUTOSTART, UPDATE, QUIT, DONE]
+                    vec![APP_AUTOSTART, AUTOSTART, UPDATE, QUIT, DONE]
                 } else {
                     vec![
-                        INPUT, OUTPUT, VERSION, BUFFER, AUTOSTART, REFRESH, UPDATE, QUIT, DONE,
+                        INPUT, OUTPUT, VERSION, BUFFER, APP_AUTOSTART, AUTOSTART, REFRESH, UPDATE, QUIT, DONE,
                     ]
                 };
                 if !self.driver_ready {
@@ -3202,7 +3266,7 @@ impl App {
                 PITCH if delta != 0 => {
                     Msg::HeadphonePitch(self.headphone_pitch as f32 + delta as f32)
                 }
-                MUTE if activate => Msg::HeadphoneMute,
+                REVERSE if activate => Msg::HeadphoneReverse(!self.headphone_reverse),
                 _ => Msg::Noop,
             }
         } else if self.details {
@@ -3255,6 +3319,7 @@ impl App {
                 DONE if activate => Msg::Settings,
                 QUIT if activate => Msg::Quit,
                 AUTOSTART if activate => Msg::Autostart(!self.autostart),
+                APP_AUTOSTART if activate => Msg::AppAutostart(!self.app_autostart),
                 _ => Msg::Noop,
             }
         } else {
@@ -3318,7 +3383,8 @@ impl App {
                 focus::rvc::DELETE if activate => Msg::RvcDelete,
                 focus::rvc::ADVANCED if activate => Msg::RvcAdvanced,
                 SLOW if delta != 0 => {
-                    Msg::Slow((self.controls.slow * 100.0 + delta as f32 * 5.0).clamp(50.0, 95.0))
+                    // The slider is mirrored (slower = right), so Right slows down.
+                    Msg::Slow((self.controls.slow * 100.0 - delta as f32 * 5.0).clamp(50.0, 95.0))
                 }
                 SLOW_BIND if activate => Msg::Bind(2),
                 FAST if delta != 0 => {
@@ -3778,15 +3844,14 @@ mod controller_tests {
         let _ = app.update(Msg::HeadphoneIntensity(250.0));
         assert_eq!(app.headphone_intensity, 2.0);
         assert_eq!(app.controls.intensity, microphone);
-        let _ = app.update(Msg::HeadphoneMute);
-        assert!(app.headphone_muted && !app.controls.muted);
         app.window = Some(App::open(1.0).0);
         app.focus = 55;
         let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
         assert_eq!(app.headphone_pitch, 3);
+        // NVIDIA switches while running: the session reopens in the new mode.
         app.headphone_state = 2;
         let _ = app.update(Msg::HeadphoneNoise(false));
-        assert!(app.headphone_denoise);
+        assert!(!app.headphone_denoise && app.headphone_busy);
     }
     #[test]
     fn recordings_keep_six_play_and_save() {
@@ -4269,6 +4334,12 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         assert_eq!(app.controls.intensity, 2.0);
         let _ = app.key(Key::Named(Named::ArrowLeft), Modifiers::empty(), false);
         assert!((app.controls.intensity - 1.99).abs() < 0.0001);
+        // The slow slider is mirrored on screen (slower = right), so Right slows down.
+        let _ = app.update(Msg::Slow(70.0));
+        let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
+        assert!((app.controls.slow - 0.65).abs() < 0.0001);
+        let _ = app.key(Key::Named(Named::ArrowLeft), Modifiers::empty(), false);
+        assert!((app.controls.slow - 0.70).abs() < 0.0001);
         app.details = false;
         app.controls.overload = false;
         app.focus = 37;

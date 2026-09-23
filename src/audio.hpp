@@ -108,7 +108,7 @@ struct TagClock {
 };
 struct Stats {
     std::atomic<int> desktopState{0}; // Off, Starting, Ready, Error
-    std::atomic<int> denoiser{0}; // Stopped, NVIDIA, bypass, CPU (DeepFilterNet)
+    std::atomic<int> denoiser{0}; // Stopped, NVIDIA, bypass, CPU (DeepFilterNet), input already denoised
     std::atomic<bool> desktopSource{false};
     std::atomic<int> phraseState{0};
     std::atomic<float> phraseSeconds{0};
@@ -321,7 +321,7 @@ class Headphones {
 public:
     std::atomic<int> state{0},pitch{0}; // Off, Loading, Ready, Error
     std::atomic<float> intensity{0.8f},volume{0.7f};
-    std::atomic<bool> muted{false};
+    std::atomic<bool> muted{false},reverse{false};
     std::atomic<unsigned> processed{0},drops{0};
     Headphones();
     ~Headphones();

@@ -60,6 +60,19 @@ public:
             std::vector<VirtualLineDesc> lines(std::max(1u,info.NumLines)); unsigned count=0;
             ok(driver_->GetLineList(lines.data(),static_cast<unsigned>(lines.size()*sizeof(VirtualLineDesc)),count),"TAG line list");
             if(count>lines.size()) throw std::runtime_error("Invalid TAG line count");
+            // The demo driver holds a fixed number of lines (three here) and ships default
+            // "TAG Microphone" / "TAG Speakers" lines nothing of ours uses; with them present
+            // the headphone line is refused (0x80070044). Remove them; the list is re-read.
+            bool removed=false;
+            for(unsigned i=0;i<count;++i)
+                if(!wcsncmp(lines[i].KsName,L"TAG ",4)) {
+                    if(const auto hr=driver_->DeleteLine(lines[i].Id);FAILED(hr)) logLineFailure("delete default",lines[i].Id,hr);
+                    else removed=true;
+                }
+            if(removed) {
+                ok(driver_->GetLineList(lines.data(),static_cast<unsigned>(lines.size()*sizeof(VirtualLineDesc)),count),"TAG line list");
+                if(count>lines.size()) throw std::runtime_error("Invalid TAG line count");
+            }
             unsigned id=0,fallback=0,next=1;
             for(unsigned i=0;i<count;++i) {
                 next=std::max(next,lines[i].Id+1);
@@ -75,7 +88,17 @@ public:
                 const auto hr=driver_->CreateLine(line);
                 if(SUCCEEDED(hr)){id=next;newLine=true;}
                 else if(capture && fallback){id=fallback;logLineFailure("create",next,hr);}
-                else ok(hr,"TAG create line");
+                else {
+                    // Name the lines the driver already has: a refusal is otherwise just a code.
+                    char s[160]; sprintf_s(s,"TAG create line %u: HRESULT 0x%08lX; driver has %u line(s):",next,static_cast<unsigned long>(hr),count);
+                    std::string m=s;
+                    for(unsigned i=0;i<count;++i){
+                        char n[sizeof lines[i].KsName]; size_t conv=0; wcstombs_s(&conv,n,lines[i].KsName,_TRUNCATE);
+                        sprintf_s(s," [id %u %s type %d \"%s\"]",lines[i].Id,lines[i].Capture?"capture":"render",static_cast<int>(lines[i].Type),n);
+                        m+=s;
+                    }
+                    throw std::runtime_error(m);
+                }
             }
             if(capture && newLine) {
                 constexpr wchar_t legacy[]=L"MicNoiseReducer"; // Legacy name, migration only.

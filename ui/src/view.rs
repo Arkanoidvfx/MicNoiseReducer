@@ -94,6 +94,10 @@ fn bold<'a>(s: impl Into<String>, size: u32, color: Color) -> widget::Text<'a> {
         ..Font::with_name("Segoe UI")
     })
 }
+/// Parameter heading used across pages: bold name left, value right.
+fn heading<'a>(name: &'a str, value: String) -> Element<'a, Msg> {
+    row![bold(name, 14, INK), Space::new().width(Length::Fill), label(value, 13, INK)].into()
+}
 fn line<'a>() -> Element<'a, Msg> {
     container(Space::new().height(1))
         .width(Length::Fill)
@@ -121,10 +125,17 @@ fn action<'a>(
         .on_press(message)
         .style(move |_, status| {
             let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            // A button that can't be pressed must not look like the page's main action:
+            // accent fades, plain buttons lose their fill and read as outlines.
+            let disabled = matches!(status, button::Status::Disabled);
             button::Style {
                 background: Some(
-                    (if accent {
+                    (if accent && disabled {
+                        Color { a: 0.35, ..ORANGE }
+                    } else if accent {
                         ORANGE
+                    } else if disabled {
+                        BG
                     } else if hover {
                         Color::from_rgb8(49, 50, 54)
                     } else {
@@ -238,6 +249,96 @@ fn slider_style_with_opacity(
 }
 fn slider_style(_: &Theme, status: slider::Status) -> slider::Style {
     slider_style_with_opacity(status, 1.0, 1.0)
+}
+/// Grey mark behind a rail: the 100 % point, or zero of a signed value.
+const TICK: Color = Color::from_rgb8(100, 100, 106);
+/// Where a slider's orange starts and which point of its range gets a tick.
+#[derive(Clone, Copy)]
+enum Rail {
+    /// Orange from the left edge, as Iced draws it; tick at this value.
+    Tick(f32),
+    /// Signed value: orange between zero and the handle, zero ticked, so 0 shows no fill.
+    Signed,
+}
+/// A slider with a tick under its rail. Ctrl+click resets it to `default`.
+/// Marks use the handle's resting radius (6) as inset, the same geometry Iced uses to
+/// place the handle, so a tick sits exactly under the handle at that value.
+fn marked_slider<'a>(
+    range: std::ops::RangeInclusive<f32>,
+    value: f32,
+    on_change: impl Fn(f32) -> Msg + 'a,
+    step: f32,
+    default: f32,
+    rail: Rail,
+    opacity: f32,
+) -> Element<'a, Msg> {
+    let (min, max) = (*range.start(), *range.end());
+    let at = |v: f32| (((v - min) / (max - min)).clamp(0.0, 1.0) * 1000.0).round() as u16;
+    let fade = move |c: Color| Color { a: c.a * opacity, ..c };
+    let bar = |width: Length, height: f32, color: Color| {
+        container(Space::new().width(Length::Fill).height(height))
+            .width(width)
+            .style(move |_| container::Style {
+                background: Some(color.into()),
+                border: Border { radius: 2.0.into(), ..Default::default() },
+                ..Default::default()
+            })
+    };
+    // One element spanning [from, to] of the handle track, in thousandths.
+    let span = |from: u16, to: u16, content: widget::Container<'a, Msg>| -> Element<'a, Msg> {
+        let mut line = row![].align_y(iced::Center);
+        if from > 0 {
+            line = line.push(Space::new().width(Length::FillPortion(from)));
+        }
+        line = line.push(content);
+        if to < 1000 {
+            line = line.push(Space::new().width(Length::FillPortion(1000 - to)));
+        }
+        container(line).padding([0, 6]).height(Length::Fill).center_y(Length::Fill).into()
+    };
+    let tick = match rail {
+        Rail::Tick(v) => at(v),
+        Rail::Signed => at(0.0),
+    };
+    let signed = matches!(rail, Rail::Signed);
+    let mut stack = widget::Stack::new()
+        .width(Length::Fill)
+        .push(
+            slider(range, value, on_change)
+                .step(step)
+                .default(default)
+                .style(move |_, status| {
+                    let mut style = slider_style_with_opacity(status, opacity, opacity);
+                    if signed {
+                        style.rail.backgrounds = (Color::TRANSPARENT.into(), Color::TRANSPARENT.into());
+                    }
+                    style
+                }),
+        );
+    if signed {
+        let (from, to) = (tick.min(at(value)), tick.max(at(value)));
+        if to > from {
+            stack = stack.push_under(span(from, to, bar(Length::FillPortion(to - from), 4.0, fade(ORANGE))));
+        }
+        stack = stack.push_under(
+            container(bar(Length::Fill, 4.0, fade(LINE))).height(Length::Fill).center_y(Length::Fill),
+        );
+    }
+    stack.push_under(span(tick, tick, bar(Length::Fixed(2.0), 12.0, fade(TICK)))).into()
+}
+/// A checked box is a setting, not something happening now: it fills DIM, and orange
+/// stays for live state (a firing effect, a playing clip). Filled vs hollow still reads.
+fn check_style(theme: &Theme, status: widget::checkbox::Status) -> widget::checkbox::Style {
+    use widget::checkbox::Status::*;
+    let mut style = widget::checkbox::primary(theme, status);
+    let (Active { is_checked } | Hovered { is_checked } | Disabled { is_checked }) = status;
+    if is_checked {
+        let fill = if matches!(status, Hovered { .. }) { INK } else { DIM };
+        style.background = fill.into();
+        style.border.color = fill;
+        style.icon_color = BG;
+    }
+    style
 }
 impl App {
     pub fn view(&self, _: window::Id) -> Element<'_, Msg> {
@@ -439,7 +540,8 @@ impl App {
             meter,
         ]
         .spacing(5);
-        let monitoring = column![
+        let can_monitor = !self.busy && !self.quitting && matches!(self.snapshot.state, 2 | 3);
+        let mut monitoring = column![
             row![
                 action(
                     label(
@@ -449,49 +551,43 @@ impl App {
                             _ => "Слышать весь голос",
                         },
                         13,
-                        if full_monitor == 2 { BG } else { INK }
+                        if full_monitor == 2 { BG } else if can_monitor { INK } else { DIM }
                     ),
                     Msg::Monitor,
                     self.focus == focus::effects::MONITOR,
                     full_monitor == 2
                 )
-                .on_press_maybe(
-                    (!self.busy && !self.quitting && matches!(self.snapshot.state, 2 | 3))
-                        .then_some(Msg::Monitor)
-                ),
+                .on_press_maybe(can_monitor.then_some(Msg::Monitor)),
                 self.bind_button(10, self.keys[10], self.focus == focus::effects::MONITOR_BIND, false, 150.0),
             ]
             .spacing(8)
             .align_y(iced::Center),
-            label(
-                if self.monitor_all && matches!(self.monitor, 1 | 2) {
-                    "Сейчас слышен весь голос; режим эффектов сохранён."
-                } else if self.effect_monitoring() && self.monitor == 1 {
-                    "Подключение наушников…"
-                } else if self.effect_monitoring() && self.monitor == 3 {
-                    "Ошибка прослушивания — см. сообщение сверху."
-                } else {
-                    ""
-                },
-                11,
-                DIM
-            ),
-            frame(widget::checkbox(self.effects_monitor)
-                .label("Слышать результат эффектов").text_size(13).size(16)
-                .on_toggle(Msg::EffectsMonitor), self.focus == focus::effects::EFFECTS_MONITOR),
-            frame(widget::checkbox(self.boost_monitor)
-                .label("Слышать результат эффекта усиления").text_size(13).size(16)
-                .on_toggle(Msg::BoostMonitor), self.focus == focus::effects::BOOST_MONITOR),
         ]
         .spacing(5)
         .width(Length::Fill);
+        // Only while there is something to say: an empty line would push the checkboxes
+        // away from the button they belong with.
+        let monitor_note = if self.monitor_all && matches!(self.monitor, 1 | 2) {
+            "Сейчас слышен весь голос; режим эффектов сохранён."
+        } else if self.effect_monitoring() && self.monitor == 1 {
+            "Подключение наушников…"
+        } else if self.effect_monitoring() && self.monitor == 3 {
+            "Ошибка прослушивания — см. сообщение сверху."
+        } else {
+            ""
+        };
+        if !monitor_note.is_empty() {
+            monitoring = monitoring.push(label(monitor_note, 11, DIM));
+        }
+        let monitoring = monitoring
+            .push(frame(widget::checkbox(self.effects_monitor)
+                .label("Слышать эффекты").text_size(13).size(16).style(check_style)
+                .on_toggle(Msg::EffectsMonitor), self.focus == focus::effects::EFFECTS_MONITOR))
+            .push(frame(widget::checkbox(self.boost_monitor)
+                .label("Слышать усиление").text_size(13).size(16).style(check_style)
+                .on_toggle(Msg::BoostMonitor), self.focus == focus::effects::BOOST_MONITOR));
+        // Discord volume first: the replay key then sits right above the recordings it plays.
         let output_controls = column![
-            row![
-                label("Повтор последнего", 13, INK),
-                self.bind_button(11, self.keys[11], self.focus == focus::effects::REPLAY_BIND, false, 150.0)
-            ]
-            .spacing(8)
-            .align_y(iced::Center),
             row![
                 label("Громкость Discord", 13, DIM),
                 Space::new().width(Length::Fill),
@@ -505,26 +601,52 @@ impl App {
                 )
             ],
             frame(
-                slider(
+                marked_slider(
                     0.0..=DISCORD_VOLUME_MAX_PERCENT,
                     discord_volume_percent(self.controls.discord_volume),
-                    Msg::DiscordVolume
-                )
-                .step(1.0_f32)
-                .style(slider_style),
+                    Msg::DiscordVolume,
+                    1.0,
+                    100.0,
+                    Rail::Tick(100.0),
+                    1.0,
+                ),
                 self.focus == focus::effects::DISCORD_VOLUME
             ),
+            row![
+                label("Повтор последнего", 13, INK),
+                self.bind_button(11, self.keys[11], self.focus == focus::effects::REPLAY_BIND, false, 150.0)
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
         ]
         .spacing(5)
         .width(Length::Fill)
         .push(self.clips_view());
-        column![
+        // Defaults for Ctrl+click match the settings defaults in main.rs.
+        let noise = |value: f32, message: fn(f32) -> Msg, default: f32| {
+            marked_slider(0.0..=200.0, value * 100.0, message, 1.0, default, Rail::Tick(100.0), 1.0)
+        };
+        // Without NVIDIA the sliders do nothing; say so next to them, not in the error line.
+        // The range note only appears once a slider is past the 100 % tick: a warning that
+        // is always there stops being read.
+        let note = if self.denoiser.0 == 2 && self.running() {
+            Some(label(format!("Шумодав выключен: {}. Голос, эффекты и виртуальный микрофон работают.", self.denoiser.1),12,ORANGE))
+        } else if self.denoiser.0 == 3 && self.running() {
+            Some(label(format!("Шумодав DeepFilterNet на процессоре (+30 мс). NVIDIA: {}", self.denoiser.1),12,DIM))
+        } else if self.denoiser.0 == 4 && self.running() {
+            Some(label(format!("Шум уже убран на входе ({}): свой шумодав выключен, силу задаёт он.", self.denoiser.1),12,DIM))
+        } else if self.controls.intensity > 1.0 || self.controls.alternate_intensity > 1.0 {
+            Some(label("Выше 100%: запрос вне диапазона NVIDIA. SDK может отклонить его или не усилить эффект.",12,ORANGE))
+        } else {
+            None
+        };
+        let mut body = column![
             route,
             level_view,
             row![
                 column![
                     container(label(format!("Шумоподавление · {:.0}%", self.controls.intensity * 100.0), 14, INK)).height(30).center_y(30),
-                    frame(slider(0.0..=200.0, self.controls.intensity * 100.0, Msg::Intensity).step(1.0_f32).style(slider_style), self.focus == focus::effects::INTENSITY),
+                    frame(noise(self.controls.intensity, Msg::Intensity, 100.0), self.focus == focus::effects::INTENSITY),
                 ].spacing(5).width(Length::Fill),
                 column![
                     row![
@@ -532,23 +654,18 @@ impl App {
                         Space::new().width(Length::Fill),
                         self.bind_button(12, self.keys[12], self.focus == focus::effects::NOISE_BIND, false, 150.0),
                     ].spacing(8).height(30).align_y(iced::Center),
-                    frame(slider(0.0..=200.0, self.controls.alternate_intensity * 100.0, Msg::AlternateIntensity).step(1.0_f32).style(slider_style), self.focus == focus::effects::ALT_INTENSITY),
+                    frame(noise(self.controls.alternate_intensity, Msg::AlternateIntensity, 15.0), self.focus == focus::effects::ALT_INTENSITY),
                 ].spacing(5).width(Length::Fill),
             ].spacing(20),
-            // Without NVIDIA the sliders do nothing; say so next to them, not in the error line.
-            if self.denoiser.0 == 2 && self.running() {
-                label(format!("Шумодав выключен: {}. Голос, эффекты и виртуальный микрофон работают.", self.denoiser.1),12,ORANGE)
-            } else if self.denoiser.0 == 3 && self.running() {
-                label(format!("Шумодав DeepFilterNet на процессоре (+30 мс). NVIDIA: {}", self.denoiser.1),12,DIM)
-            } else {
-                label("101–200% — запрос вне диапазона NVIDIA. SDK может отклонить его или не усилить эффект.",12,DIM)
-            },
-            self.effects_table(),
-            line(),
-            row![monitoring, output_controls].spacing(20),
         ]
-        .spacing(12)
-        .into()
+        .spacing(12);
+        if let Some(note) = note {
+            body = body.push(note);
+        }
+        body.push(self.effects_table())
+            .push(line())
+            .push(row![monitoring, output_controls].spacing(20))
+            .into()
     }
     /// One recording: play/stop on the left, its save menu on the right.
     fn clip_cell(&self, i: usize, playing: u32) -> Element<'_, Msg> {
@@ -621,7 +738,7 @@ impl App {
         row![play, save].spacing(2).width(Length::Fill).into()
     }
     /// The last recordings of the hold effects, three per line so all six fit under the
-    /// Discord volume without scrolling. The header line carries the block's title, or the
+    /// replay key without scrolling. The header line carries the block's title, or the
     /// result of the last save, or the two save targets while a menu is open.
     fn clips_view(&self) -> Element<'_, Msg> {
         use focus::effects::*;
@@ -733,24 +850,27 @@ impl App {
                 0 => frame(
                     slider(100.0..=2000.0, self.controls.boost * 100.0, Msg::Boost)
                         .step(10.0_f32)
+                        .default(300.0_f32)
                         .style(slider_style),
                     self.focus == focus,
                 ),
                 1 => frame(
-                    slider(-12.0..=12.0, self.controls.pitch as f32, Msg::Pitch)
-                        .step(1.0_f32)
-                        .style(slider_style),
+                    marked_slider(-12.0..=12.0, self.controls.pitch as f32, Msg::Pitch, 1.0, -5.0, Rail::Signed, 1.0),
                     self.focus == focus,
                 ),
+                // Mirrored so that, as on every other slider, more orange means a stronger
+                // effect: ×0.50 (slowest) sits on the right.
                 2 => frame(
-                    slider(50.0..=95.0, self.controls.slow * 100.0, Msg::Slow)
+                    slider(-95.0..=-50.0, -self.controls.slow * 100.0, |v| Msg::Slow(-v))
                         .step(5.0_f32)
+                        .default(-70.0_f32)
                         .style(slider_style),
                     self.focus == focus,
                 ),
                 3 => frame(
                     slider(105.0..=200.0, self.controls.fast * 100.0, Msg::Fast)
                         .step(5.0_f32)
+                        .default(150.0_f32)
                         .style(slider_style),
                     self.focus == focus,
                 ),
@@ -769,6 +889,7 @@ impl App {
                         .label("Перегрузка")
                         .size(16)
                         .text_size(12)
+                        .style(check_style)
                         .on_toggle(Msg::Overload),
                     self.focus == OVERLOAD,
                 ));
@@ -851,6 +972,8 @@ impl App {
         let runtime_action: Element<'_, Msg> = if self.rvc_runtime_installed {
             Space::new().into()
         } else {
+            // Without the runtime this is the only thing on the page that does anything, so it
+            // is the page's one orange button.
             action(
                 label(
                     if self.rvc_runtime_installing {
@@ -859,15 +982,11 @@ impl App {
                         "Установить RVC runtime"
                     },
                     13,
-                    if self.rvc_runtime_installing {
-                        DIM
-                    } else {
-                        INK
-                    },
+                    BG,
                 ),
                 Msg::RvcInstall,
                 self.focus == focus::rvc::INSTALL,
-                false,
+                true,
             )
             .on_press_maybe((!self.rvc_runtime_installing).then_some(Msg::RvcInstall))
             .into()
@@ -927,7 +1046,7 @@ impl App {
                             "Импорт модели"
                         },
                         13,
-                        if self.rvc_importing { DIM } else { INK }
+                        if self.rvc_importing || !self.rvc_runtime_installed { DIM } else { INK }
                     ),
                     Msg::RvcImport,
                     self.focus == focus::rvc::IMPORT,
@@ -977,29 +1096,12 @@ impl App {
             ]
             .spacing(10)
             .align_y(iced::Center),
-            row![
-                label(
-                    format!(
-                        "Тон модели  {:+} полутонов",
-                        self.controls.rvc_options.pitch
-                    ),
-                    13,
-                    INK
-                )
-                .width(250),
-                frame(
-                    slider(
-                        -24.0..=24.0,
-                        self.controls.rvc_options.pitch as f32,
-                        Msg::RvcPitch
-                    )
-                    .step(1.0_f32)
-                    .style(slider_style),
-                    self.focus == focus::rvc::PITCH
-                ),
-            ]
-            .spacing(12)
-            .align_y(iced::Center),
+            line(),
+            heading("Тон модели", format!("{:+} полутонов", self.controls.rvc_options.pitch)),
+            frame(
+                marked_slider(-24.0..=24.0, self.controls.rvc_options.pitch as f32, Msg::RvcPitch, 1.0, 0.0, Rail::Signed, 1.0),
+                self.focus == focus::rvc::PITCH
+            ),
             action(
                 label(
                     if self.rvc_advanced {
@@ -1015,25 +1117,24 @@ impl App {
                 false
             ),
         ]
-        .spacing(10);
+        .spacing(12);
         if !self.rvc_import_note.is_empty() {
             content = content.push(label(&self.rvc_import_note, 12, DIM));
         }
         if self.rvc_advanced {
             content = content.push(column![
-                    row![
-                        label(format!("Влияние индекса  {}%", self.controls.rvc_options.index), 13, INK).width(250),
-                        if self.rvc_has_index() {
-                            frame(slider(0.0..=100.0, self.controls.rvc_options.index as f32, Msg::RvcIndex).step(1.0_f32).style(slider_style), self.focus == focus::rvc::INDEX)
-                        } else { label("Недоступно без .index", 12, DIM).into() },
-                    ].spacing(12).align_y(iced::Center),
+                    line(),
+                    heading("Влияние индекса", format!("{}%", self.controls.rvc_options.index)),
+                    if self.rvc_has_index() {
+                        frame(slider(0.0..=100.0, self.controls.rvc_options.index as f32, Msg::RvcIndex).step(1.0_f32).default(0.0_f32).style(slider_style), self.focus == focus::rvc::INDEX)
+                    } else { label("Недоступно без .index", 12, DIM).into() },
                     label(if self.rvc_has_index() {
                         "Индекс усиливает сходство с обучающими примерами модели"
                     } else {"У этой модели нет .index — регулятор индекса не влияет на звук"}, 11, DIM),
-                    row![
-                        label(format!("Вход модели  {}%", self.controls.rvc_options.gain), 13, INK).width(250),
-                        frame(slider(50.0..=300.0, self.controls.rvc_options.gain as f32, Msg::RvcGain).step(5.0_f32).style(slider_style), self.focus == focus::rvc::GAIN),
-                    ].spacing(12).align_y(iced::Center),
+                    line(),
+                    heading("Вход модели", format!("{}%", self.controls.rvc_options.gain)),
+                    frame(marked_slider(50.0..=300.0, self.controls.rvc_options.gain as f32, Msg::RvcGain, 5.0, 100.0, Rail::Tick(100.0), 1.0), self.focus == focus::rvc::GAIN),
+                    line(),
                     row![
                         label("Блок аудио, мс", 13, INK),
                         frame(pick_list(rvc::CHUNKS, Some(self.controls.rvc_options.chunk), Msg::RvcChunk), self.focus == focus::rvc::CHUNK),
@@ -1043,9 +1144,11 @@ impl App {
                     label("Задержка = блок + 200 мс, всегда постоянная. При лаге модели — тишина, не обычный голос. 100–150 мс: меньше задержка, выше нагрузка.", 11, DIM),
 
                     label("Только микрофон. Выключение завершает сервер и выгружает модель; повторный запуск требует загрузки.", 11, DIM)
-            ].spacing(8));
+            ].spacing(12));
         }
-        panel(content).width(Length::Fill).into()
+        // Same page anatomy as Наушники: no card, bold name left / value right, full-width
+        // slider below, rules between groups.
+        content.into()
     }
     fn headphone_view(&self) -> Element<'_, Msg> {
         let locked = matches!(self.headphone_state, 1 | 2) || self.headphone_busy;
@@ -1079,27 +1182,70 @@ impl App {
         ]
         .spacing(12)
         .align_y(iced::Center);
-        let mut body = column![
-            route,
+        let mut body = column![route].spacing(12);
+        // One column: the start/stop action first, then each switch sits on its own slider.
+        // The NVIDIA box is the heading of the strength slider it enables (switchable while
+        // running); without it the route is "Без обработки" and the slider fades.
+        let mut params = column![
+            action(
+                container(label(if locked { "Остановить" } else { "Включить наушники" }, 13, BG)).center_x(Length::Fill),
+                Msg::HeadphoneToggle,
+                self.focus == focus::headphones::TOGGLE,
+                true,
+            )
+            .width(Length::Fill),
+            line(),
             row![
-                action(label(if locked { "Остановить" } else { "Включить" }, 13, BG), Msg::HeadphoneToggle, self.focus == focus::headphones::TOGGLE, true),
-                action(label(if self.headphone_muted { "Вернуть звук" } else { "Без звука" }, 13, INK), Msg::HeadphoneMute, self.focus == focus::headphones::MUTE, false),
+                frame(
+                    widget::checkbox(self.headphone_denoise)
+                        .label("Шумодав NVIDIA")
+                        .size(16)
+                        .text_size(14)
+                        .font(Font { weight: iced::font::Weight::Semibold, ..Font::with_name("Segoe UI") })
+                        .style(check_style)
+                        .on_toggle_maybe((!self.headphone_busy).then_some(Msg::HeadphoneNoise)),
+                    self.focus == focus::headphones::NOISE,
+                ),
                 Space::new().width(Length::Fill),
-                frame(widget::checkbox(self.headphone_denoise).label("Шумодав NVIDIA").size(16).text_size(13).on_toggle(Msg::HeadphoneNoise), self.focus == focus::headphones::NOISE),
-            ].spacing(10).align_y(iced::Center),
-            label(format!("Сила шумоподавления · {:.0}%{}", self.headphone_intensity * 100.0, if self.headphone_intensity > 1.0 { " · эксперимент" } else { "" }), 14, INK),
-            frame(slider(0.0..=200.0, self.headphone_intensity * 100.0, Msg::HeadphoneIntensity).step(1.0_f32).style(slider_style), self.focus == focus::headphones::INTENSITY),
-            label("101–200% — запрос вне диапазона NVIDIA. SDK может отклонить его или не усилить эффект.", 12, DIM),
-            line(),
-            row![bold("Громкость", 14, INK), Space::new().width(Length::Fill), label(format!("{:.0}%", self.headphone_volume * 100.0), 13, INK)],
-            frame(slider(0.0..=100.0, self.headphone_volume * 100.0, Msg::HeadphoneVolume).step(1.0_f32).style(slider_style), self.focus == focus::headphones::VOLUME),
-            line(),
-            row![bold("Высота", 14, INK), Space::new().width(Length::Fill), label(format!("{:+} полутонов", self.headphone_pitch), 13, INK)],
-            frame(slider(-12.0..=12.0, self.headphone_pitch as f32, Msg::HeadphonePitch).step(1.0_f32).style(slider_style), self.focus == focus::headphones::PITCH),
-            line(),
-            label("Выход приложения в микшере Windows → Mic Noize Headphones. После остановки верните физические наушники.", 11, DIM),
-            label("Режим NVIDIA меняется после остановки. Музыка и атмосфера тоже могут подавляться.", 11, DIM),
+                label(format!("{:.0}%", self.headphone_intensity * 100.0), 13, if self.headphone_denoise { INK } else { DIM }),
+            ]
+            .align_y(iced::Center),
+            frame(marked_slider(0.0..=200.0, self.headphone_intensity * 100.0, Msg::HeadphoneIntensity, 1.0, 80.0, Rail::Tick(100.0), if self.headphone_denoise { 1.0 } else { 0.35 }), self.focus == focus::headphones::INTENSITY),
         ].spacing(12);
+        if self.headphone_intensity > 1.0 {
+            params = params.push(label("Выше 100%: запрос вне диапазона NVIDIA. SDK может отклонить его или не усилить эффект.", 12, ORANGE));
+        }
+        let params = params.extend([
+            line(),
+            row![bold("Громкость", 14, INK), Space::new().width(Length::Fill), label(format!("{:.0}%", self.headphone_volume * 100.0), 13, INK)].into(),
+            frame(slider(0.0..=100.0, self.headphone_volume * 100.0, Msg::HeadphoneVolume).step(1.0_f32).default(70.0_f32).style(slider_style), self.focus == focus::headphones::VOLUME),
+            line(),
+            row![bold("Высота", 14, INK), Space::new().width(Length::Fill), label(format!("{:+} полутонов", self.headphone_pitch), 13, INK)].into(),
+            frame(marked_slider(-12.0..=12.0, self.headphone_pitch as f32, Msg::HeadphonePitch, 1.0, 0.0, Rail::Signed, 1.0), self.focus == focus::headphones::PITCH),
+            line(),
+            row![
+                frame(
+                    widget::checkbox(self.headphone_reverse)
+                        .label("Реверс")
+                        .size(16)
+                        .text_size(14)
+                        .font(Font { weight: iced::font::Weight::Semibold, ..Font::with_name("Segoe UI") })
+                        .style(check_style)
+                        .on_toggle(Msg::HeadphoneReverse),
+                    self.focus == focus::headphones::REVERSE,
+                ),
+                Space::new().width(Length::Fill),
+                label("куски по 0,2 с задом наперёд · +200 мс", 12, DIM),
+            ]
+            .align_y(iced::Center)
+            .into(),
+            line(),
+            label("Выход приложения в микшере Windows → Mic Noize Headphones. После остановки верните физические наушники.", 11, DIM).into(),
+            label("Шумодав NVIDIA подавляет и музыку, и атмосферу; переключение на ходу перезапускает звук на долю секунды.", 11, DIM).into(),
+        ]);
+        // Three lone full-width sliders read as a wall of rails on an 820 px window; a
+        // centred 600 px column keeps name, value and slider end within one glance.
+        body = body.push(container(container(params).max_width(600)).center_x(Length::Fill));
         if !self.headphone_message.is_empty() {
             body = body.push(label(&self.headphone_message, 13, RED));
         }
@@ -1154,9 +1300,7 @@ impl App {
                     label(format!("{:.0}%", self.sound_volume * 100.0), 13, INK),
                 ],
                 frame(
-                    slider(0.0..=200.0, self.sound_volume * 100.0, Msg::SoundpadVolume)
-                        .step(1.0_f32)
-                        .style(slider_style),
+                    marked_slider(0.0..=200.0, self.sound_volume * 100.0, Msg::SoundpadVolume, 1.0, 100.0, Rail::Tick(100.0), 1.0),
                     self.focus == VOLUME,
                 ),
                 frame(
@@ -1164,6 +1308,7 @@ impl App {
                         .label("Выравнивать громкость")
                         .text_size(13)
                         .size(16)
+                        .style(check_style)
                         .on_toggle(Msg::SoundpadNormalize),
                     self.focus == NORMALIZE,
                 ),
@@ -1177,6 +1322,7 @@ impl App {
                         .label("Слышать звуки в наушниках")
                         .text_size(13)
                         .size(16)
+                        .style(check_style)
                         .on_toggle(Msg::SoundpadHear),
                     self.focus == HEAR,
                 ),
@@ -1450,6 +1596,7 @@ impl App {
                 frame(
                     slider(0.0..=200.0, sound.volume as f32, move |v| Msg::SoundVolume(i, v))
                         .step(5.0_f32)
+                        .default(100.0_f32)
                         .width(76)
                         .style(move |_, status| {
                             let active = volume_active
@@ -1646,27 +1793,29 @@ impl App {
             line(),label(format!("NVIDIA {:.2} мс  ·  очередь {:.1} мс  ·  пропуски {} / {}",self.snapshot.process_ms,self.snapshot.queue_ms,self.snapshot.underruns,self.snapshot.drops),12,DIM),
             label(format!("Pitch: задержка {:.1} мс  ·  максимум обработки {:.2} мс",self.snapshot.pitch_delay_ms,self.snapshot.pitch_max_ms),12,DIM),
             label("Буфер — запас от обрывов, не полная задержка. Pitch добавляет задержку только при удержании.",12,DIM),
+            frame(widget::checkbox(self.app_autostart)
+                .label("Запускать Mic Noize вместе с Windows (в трее)")
+                .text_size(13)
+                .size(16)
+                .on_toggle(Msg::AppAutostart)
+                .style(check_style), self.focus == focus::settings::APP_AUTOSTART),
             frame(widget::checkbox(self.autostart)
                 .label("Держать виртуальный микрофон доступным после входа в Windows")
                 .text_size(13)
                 .size(16)
                 .on_toggle(Msg::Autostart)
-                .style(|theme, status| {
-                    let mut style = widget::checkbox::primary(theme, status);
-                    style.text_color = Some(INK);
-                    if self.autostart { style.background = ORANGE.into(); style.icon_color = BG; }
-                    style
-                }), self.focus == focus::settings::AUTOSTART),
+                .style(check_style), self.focus == focus::settings::AUTOSTART),
             driver_row,
             widget::rule::horizontal(1),
             label(format!("Mic Noize {}", env!("CARGO_PKG_VERSION")), 13, INK),
             label(&self.update_status, 12, if self.update_ready { GREEN } else { DIM }),
+            // "Обновить сейчас" exists only with an update to apply (the Tab order already
+            // skips it otherwise); a disabled orange button read as the page's main action.
             row![
-                action(label(if self.update_checking { "Проверка…" } else { "Проверить обновления" },13,INK),Msg::UpdateCheck,self.focus==focus::settings::UPDATE,false)
+                action(label(if self.update_checking { "Проверка…" } else { "Проверить обновления" },13,if self.update_checking { DIM } else { INK }),Msg::UpdateCheck,self.focus==focus::settings::UPDATE,false)
                     .on_press_maybe((!self.update_checking).then_some(Msg::UpdateCheck)),
-                action(label("Обновить сейчас",13,BG),Msg::ApplyUpdate,self.focus==focus::settings::APPLY_UPDATE,true)
-                    .on_press_maybe(self.update_ready.then_some(Msg::ApplyUpdate)),
-            ].spacing(8),
+            ].push(self.update_ready.then(|| action(label("Обновить сейчас",13,BG),Msg::ApplyUpdate,self.focus==focus::settings::APPLY_UPDATE,true)))
+            .spacing(8),
             row![action(label("Обновить устройства",13,INK),Msg::Refresh,self.focus==focus::settings::REFRESH,false),Space::new().width(Length::Fill),action(label("Выход",13,INK),Msg::Quit,self.focus==focus::settings::QUIT,false),action(label("Готово",13,BG),Msg::Settings,self.focus==focus::settings::DONE,true)].spacing(8)
         ].spacing(12).into()
     }
@@ -1729,7 +1878,7 @@ impl App {
 }
 
 const ROW_HEIGHT: f32 = 30.0;
-/// Recordings block: three cells per line, two lines, so all six fit under the Discord volume.
+/// Recordings block: three cells per line, two lines, so all six fit under the replay key.
 const CLIP_CELL: f32 = 22.0;
 const CLIPS_PER_LINE: usize = 3;
 const ROW_SPACING: f32 = 2.0;

@@ -65,6 +65,9 @@ extern "C" void mnr_headphone_controls(Mnr* p,float intensity,float volume,int32
     if(!std::isfinite(intensity)||intensity<0||intensity>2||!std::isfinite(volume)||volume<0||volume>1||pitch< -12||pitch>12)return;
     p->headphones.intensity=intensity;p->headphones.volume=volume;p->headphones.pitch=pitch;p->headphones.muted=muted!=0;
 }
+extern "C" void mnr_headphone_reverse(Mnr* p,int32_t enabled) {
+    if(enabled==0 || enabled==1)p->headphones.reverse=enabled!=0;
+}
 extern "C" int32_t mnr_headphone_state(Mnr* p,char* text,uint32_t cap) {
     try{copy(mic::utf8(p->headphones.message()),text,cap);return p->headphones.state;}catch(...){return 3;}
 }
