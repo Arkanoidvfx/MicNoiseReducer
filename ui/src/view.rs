@@ -273,7 +273,9 @@ impl App {
         ]
         .spacing(4)
         .align_y(iced::Center);
-        let content = if self.soundpad_page {
+        let content = if self.logs_page {
+            self.logs_view()
+        } else if self.soundpad_page {
             self.soundpad_view()
         } else if self.headphone_page {
             self.headphone_view()
@@ -299,12 +301,17 @@ impl App {
                     tab(
                         "Микрофон",
                         0,
-                        !self.details && !self.rvc_page && !self.headphone_page && !self.soundpad_page
+                        !self.details
+                            && !self.rvc_page
+                            && !self.headphone_page
+                            && !self.soundpad_page
+                            && !self.logs_page
                     ),
                     tab("Наушники", 3, self.headphone_page),
                     tab("Voice Changer", 1, self.rvc_page && !self.details),
                     tab("Саундпад", 4, self.soundpad_page),
                     Space::new().width(Length::Fill),
+                    tab("Логи", 5, self.logs_page),
                     tab("Настройки", 2, self.details),
                 ]
                 .spacing(6)
@@ -528,7 +535,14 @@ impl App {
                     frame(slider(0.0..=200.0, self.controls.alternate_intensity * 100.0, Msg::AlternateIntensity).step(1.0_f32).style(slider_style), self.focus == focus::effects::ALT_INTENSITY),
                 ].spacing(5).width(Length::Fill),
             ].spacing(20),
-            label("101–200% — запрос вне диапазона NVIDIA. SDK может отклонить его или не усилить эффект.",12,DIM),
+            // Without NVIDIA the sliders do nothing; say so next to them, not in the error line.
+            if self.denoiser.0 == 2 && self.running() {
+                label(format!("Шумодав выключен: {}. Голос, эффекты и виртуальный микрофон работают.", self.denoiser.1),12,ORANGE)
+            } else if self.denoiser.0 == 3 && self.running() {
+                label(format!("Шумодав DeepFilterNet на процессоре (+30 мс). NVIDIA: {}", self.denoiser.1),12,DIM)
+            } else {
+                label("101–200% — запрос вне диапазона NVIDIA. SDK может отклонить его или не усилить эффект.",12,DIM)
+            },
             self.effects_table(),
             line(),
             row![monitoring, output_controls].spacing(20),
@@ -1091,6 +1105,27 @@ impl App {
         }
         body.into()
     }
+    /// One report to copy and send: the buttons first, the text exactly as it will be copied.
+    fn logs_view(&self) -> Element<'_, Msg> {
+        use focus::logs::*;
+        let report: Element<'_, Msg> = if self.logs_text.is_empty() {
+            label("Собираем отчёт…", 12, DIM).into()
+        } else {
+            // Consolas: the generic monospace fallback has no Cyrillic and clips underscores.
+            text(&self.logs_text).size(12).color(INK).font(Font::with_name("Consolas")).line_height(1.35).into()
+        };
+        column![
+            row![
+                action(label(if self.logs_copied { "Скопировано" } else { "Копировать всё" }, 13, BG), Msg::LogsCopy, self.focus == COPY, true),
+                action(label("Открыть папку", 13, INK), Msg::LogsFolder, self.focus == FOLDER, false),
+                Space::new().width(Length::Fill),
+                action(label(if self.report_sending { "Отправляем…" } else { "Отправить разработчику" }, 13, INK), Msg::SendReport, self.focus == SEND, false)
+                    .on_press_maybe((!self.report_sending).then_some(Msg::SendReport)),
+            ].spacing(8).align_y(iced::Center),
+            label("Версия, видеокарта, состояние и последние строки каждого лога. Имя пользователя Windows заменено.", 12, DIM),
+            panel(report).width(Length::Fill),
+        ].spacing(12).into()
+    }
     fn soundpad_view(&self) -> Element<'_, Msg> {
         use focus::soundpad::*;
         let folder_name = self
@@ -1631,9 +1666,6 @@ impl App {
                     .on_press_maybe((!self.update_checking).then_some(Msg::UpdateCheck)),
                 action(label("Обновить сейчас",13,BG),Msg::ApplyUpdate,self.focus==focus::settings::APPLY_UPDATE,true)
                     .on_press_maybe(self.update_ready.then_some(Msg::ApplyUpdate)),
-                Space::new().width(Length::Fill),
-                action(label(if self.report_sending { "Отправляем…" } else { "Отправить логи разработчику" },13,INK),Msg::SendReport,self.focus==focus::settings::REPORT,false)
-                    .on_press_maybe((!self.report_sending).then_some(Msg::SendReport)),
             ].spacing(8),
             row![action(label("Обновить устройства",13,INK),Msg::Refresh,self.focus==focus::settings::REFRESH,false),Space::new().width(Length::Fill),action(label("Выход",13,INK),Msg::Quit,self.focus==focus::settings::QUIT,false),action(label("Готово",13,BG),Msg::Settings,self.focus==focus::settings::DONE,true)].spacing(8)
         ].spacing(12).into()

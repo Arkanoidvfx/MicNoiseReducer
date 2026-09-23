@@ -3,3 +3,9 @@
 c627cf52aaee7a1eee207ab157017c0f016e95003389c61dbbb9a1ae0305b481  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models/ampere/denoiser_48k.trtpkg
 7d868d60e0f0859a274dc8101afc3f01c73fe3f32445bdfa71956a6e37cb80a5  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models/ampere/denoiser_v2_48k.trtpkg
 3074b5b3cd2abcde86b118a4a20055a0c1bad15564042734fb7a08c58e9c6364  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/license/NVIDIA-Models-Community-License-2025-04-15.pdf
+63fa6321ce4b422ce15e36934312a355cb229905d49e17f2b9e15a7491dba5de  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models/turing/denoiser_48k.trtpkg
+2676cecab71f180d9c4d1c92e28242949f085b3ba339b7e97fb15e41975aee4e  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models/turing/denoiser_v2_48k.trtpkg
+b77f814e5df856be84ab94cd27be424647c276aaf3c56da1957130ccc3313caa  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models/ada/denoiser_48k.trtpkg
+1839b601ae74bbafcd98e4cf42ceab42cec5abd100f2199f3c938e20b0561f3b  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models/ada/denoiser_v2_48k.trtpkg
+b4cc9766b02221c1c9baeb692f64ef5e4709ca0fa87536927851cd643f353d5d  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models/blackwell/denoiser_48k.trtpkg
+1938da7e76f841995acb5aa78bbd08d5f531c00ce71c44e4454c043b92f9fd51  vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models/blackwell/denoiser_v2_48k.trtpkg

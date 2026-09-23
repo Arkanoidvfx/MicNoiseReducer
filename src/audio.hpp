@@ -31,6 +31,17 @@ std::vector<Device> devices(bool capture);
 std::filesystem::path projectRoot();
 std::string utf8(const std::wstring& s);
 std::wstring wide(const std::string& s);
+// CPU denoiser supplied by the host program (DeepFilterNet in the Rust UI), used when NVIDIA
+// cannot run. 480-sample 48 kHz mono frames; `process` returns 0 on failure. The native checks
+// link without it and fall back to no denoiser.
+struct CpuDenoiserApi {
+    void* (*create)();
+    int32_t (*process)(void* state,const float* in,float* out,float strength);
+    void (*destroy)(void* state);
+};
+void setCpuDenoiser(const CpuDenoiserApi* api);
+// NVIDIA model folder for CUDA device 0 (turing/ampere/ada/blackwell); `name` gets the GPU name.
+std::string gpuArch(std::string& name);
 
 // Single producer / single consumer. Only the consumer may discard old samples.
 template<size_t Capacity,class T=float> class Ring {
@@ -97,6 +108,7 @@ struct TagClock {
 };
 struct Stats {
     std::atomic<int> desktopState{0}; // Off, Starting, Ready, Error
+    std::atomic<int> denoiser{0}; // Stopped, NVIDIA, bypass, CPU (DeepFilterNet)
     std::atomic<bool> desktopSource{false};
     std::atomic<int> phraseState{0};
     std::atomic<float> phraseSeconds{0};
@@ -228,7 +240,7 @@ class Engine {
     std::atomic<bool> resetEffect_{false}, running_{false};
     mutable std::mutex statusMutex_;
     std::wstring status_ = L"Stopped";
-    std::wstring desktopMessage_;
+    std::wstring desktopMessage_,denoiserMessage_;
     void ioLoop(Config config);
     void tagLoop(Config config);
     void dspLoop(Config config);
@@ -243,6 +255,7 @@ public:
     std::atomic<unsigned> effectEpoch{0};
     std::atomic<bool> desktopEnabled{false};
     std::wstring desktopMessage() const;
+    std::wstring denoiserMessage() const;
     std::atomic<int> state{0}; // Stopped, Loading, WaitingClient, Running, Stopping, Error
     std::atomic<float> volume{1}, boost{3};
     std::atomic<bool> overload{false};

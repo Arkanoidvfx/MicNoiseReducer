@@ -75,9 +75,11 @@ unsafe extern "C" {
     );
     fn mnr_phrase_state(p: usize, seconds: *mut f32) -> i32;
     fn mnr_discord_state(p: usize, text: *mut c_char, capacity: u32, active: *mut i32) -> i32;
+    fn mnr_denoiser_state(p: usize, text: *mut c_char, capacity: u32) -> i32;
     fn mnr_phrase_cancel(p: usize);
     fn mnr_snapshot(p: usize, s: *mut Snapshot, error: *mut c_char, cap: u32, meters: i32);
     fn mnr_devices(capture: i32, result: *mut c_char, capacity: u32) -> i32;
+    fn mnr_gpu(text: *mut c_char, capacity: u32) -> i32;
     fn mnr_bindings(p: usize, keys: *const u32, count: u32);
     fn mnr_alternate_intensity(p: usize, intensity: f32);
     fn mnr_capture_key(p: usize, enabled: i32);
@@ -138,6 +140,16 @@ pub struct Device {
 impl std::fmt::Display for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.name)
+    }
+}
+/// NVIDIA model architecture folder and GPU name of CUDA device 0, as the engine will load it.
+pub fn gpu() -> Result<(String, String), String> {
+    let mut b = [0u8; 512];
+    let ok = unsafe { mnr_gpu(b.as_mut_ptr().cast(), b.len() as u32) } != 0;
+    let text = decoded(&b);
+    match text.split_once('\t') {
+        Some((arch, name)) if ok => Ok((arch.into(), name.into())),
+        _ => Err(text),
     }
 }
 pub fn devices(capture: bool) -> Result<Vec<Device>, String> {
@@ -566,6 +578,12 @@ impl Engine {
         let state =
             unsafe { mnr_discord_state(self.p, text.as_mut_ptr().cast(), 2048, &mut active) };
         (state, active != 0, decoded(&text))
+    }
+    /// 1 NVIDIA denoiser, 2 running without one (with the reason), 0 otherwise.
+    pub fn denoiser_state(&self) -> (i32, String) {
+        let mut text = [0u8; 1024];
+        let state = unsafe { mnr_denoiser_state(self.p, text.as_mut_ptr().cast(), 1024) };
+        (state, decoded(&text))
     }
     pub fn phrase(&self) -> (i32, f32) {
         let mut seconds = 0.0;

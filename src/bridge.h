@@ -28,9 +28,16 @@ void mnr_controls(Mnr*,float volume,float boost,int32_t pitch,float intensity,in
 void mnr_rvc_settings(Mnr*,uint32_t slot,int32_t pitch,uint32_t index,uint32_t chunk_ms,uint32_t gain);
 int32_t mnr_phrase_state(Mnr*,float* seconds);
 int32_t mnr_discord_state(Mnr*,char* text,uint32_t capacity,int32_t* active);
+// Host-supplied CPU denoiser (see mic::CpuDenoiserApi): create, process(state,in,out,strength), destroy.
+typedef struct {void* (*create)(void);int32_t (*process)(void*,const float*,float*,float);void (*destroy)(void*);} MnrCpuDenoiser;
+void mnr_set_cpu_denoiser(const MnrCpuDenoiser* api);
+// 0 stopped/starting, 1 NVIDIA, 2 no denoiser, 3 CPU DeepFilterNet; `text` says why NVIDIA is off.
+int32_t mnr_denoiser_state(Mnr*,char* text,uint32_t capacity);
 void mnr_phrase_cancel(Mnr*);
 void mnr_snapshot(Mnr*,MnrSnapshot*,char* error,uint32_t capacity,int32_t meters);
 int32_t mnr_devices(int32_t capture,char* result,uint32_t capacity);
+// NVIDIA model architecture of CUDA device 0 and its name as "arch<TAB>name"; 0 with the reason.
+int32_t mnr_gpu(char* text,uint32_t capacity);
 void mnr_bindings(Mnr*,const uint32_t* keys,uint32_t count);
 void mnr_alternate_intensity(Mnr*,float intensity);
 void mnr_capture_key(Mnr*,int32_t enabled);

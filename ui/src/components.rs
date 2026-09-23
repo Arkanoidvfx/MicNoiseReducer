@@ -15,6 +15,13 @@ const CORE_MANIFEST_URL: &str =
     "https://github.com/Arkanoidvfx/MicNoize/releases/download/runtime-core-v2/components.json";
 const RVC_MANIFEST_URL: &str =
     "https://github.com/Arkanoidvfx/MicNoize/releases/download/runtime-rvc-v2.1.4/components.json";
+/// Per-architecture NVIDIA denoiser models (`models-<arch>.json`); the core ships Ampere only.
+const MODELS_RELEASE: &str =
+    "https://github.com/Arkanoidvfx/MicNoize/releases/download/runtime-models-v3.0.0";
+const MODELS_DIR: &str = "vendor/nvidia-afx-3.0.0/features/nvafxdenoiser/models";
+/// Bump together with `MODELS_RELEASE` to make every install download newer models. A folder
+/// without `version.txt` came with core v2, which carries 3.0.0 models.
+const MODELS_VERSION: &str = "3.0.0";
 const PUBLIC_KEY: &str = "plpoEiomh7k+cZtpxNJX9Zq2RNv0ugQruiH4lZGazHg=";
 /// Device node, instance and hardware id of the signed TAG driver that ships inside the core
 /// component; identical to `install-tag.ps1`, which stays the developer path with SDK checks.
@@ -58,6 +65,15 @@ pub fn core_installed(root: &Path) -> bool {
             .join("vendor/tag-2.0.0.1903-demo/apidll/x64/tagapi.dll")
             .is_file()
         && root.join("bin/mic_tag_host.exe").is_file()
+}
+
+/// Both model versions the engine can load for `arch` (the engine's own folder names), current.
+pub fn models_installed(root: &Path, arch: &str) -> bool {
+    let dir = root.join(MODELS_DIR).join(arch);
+    let version = std::fs::read_to_string(dir.join("version.txt"));
+    dir.join("denoiser_48k.trtpkg").is_file()
+        && dir.join("denoiser_v2_48k.trtpkg").is_file()
+        && version.as_deref().map_or("3.0.0", str::trim) == MODELS_VERSION
 }
 
 pub fn driver_installed() -> bool {
@@ -135,17 +151,38 @@ pub fn install_rvc(components: &Path) -> Result<String, String> {
     )
 }
 
-pub fn install_core(components: &Path) -> Result<String, String> {
-    install(
-        CORE_MANIFEST_URL,
-        components,
-        "vendor/nvidia-afx-3.0.0/bin/NVAudioEffects.dll",
-        &[
-            "vendor/nvidia-afx-3.0.0",
-            "vendor/tag-2.0.0.1903-demo",
-            "bin/mic_tag_host.exe",
-        ],
-    )
+/// The core runtime when it is missing, then the models for this GPU when the core lacks them.
+/// Models go in their own folder: a running `mic_tag_host.exe` never has to be replaced.
+pub fn install_core(components: &Path, arch: Option<&str>) -> Result<String, String> {
+    let mut version = String::new();
+    if !core_installed(components) {
+        version = install(
+            CORE_MANIFEST_URL,
+            components,
+            "vendor/nvidia-afx-3.0.0/bin/NVAudioEffects.dll",
+            &[
+                "vendor/nvidia-afx-3.0.0",
+                "vendor/tag-2.0.0.1903-demo",
+                "bin/mic_tag_host.exe",
+            ],
+        )?;
+    }
+    if let Some(arch) = arch.filter(|a| ["turing", "ampere", "ada", "blackwell"].contains(a))
+        && !models_installed(components, arch)
+    {
+        let entry = format!("{MODELS_DIR}/{arch}");
+        let models = install(
+            &format!("{MODELS_RELEASE}/models-{arch}.json"),
+            components,
+            &format!("{entry}/denoiser_48k.trtpkg"),
+            &[&entry],
+        )
+        .map_err(|e| format!("модели NVIDIA для {arch}: {e}"))?;
+        if version.is_empty() {
+            version = format!("(модели NVIDIA {arch} {models})");
+        }
+    }
+    Ok(version)
 }
 
 fn install(
@@ -166,7 +203,7 @@ fn install(
     verify(&envelope)?;
     let manifest: Manifest = serde_json::from_str(&envelope.payload).map_err(|e| e.to_string())?;
     if manifest.parts.is_empty() {
-        return Err("Манифест RVC не содержит частей архива".into());
+        return Err("Манифест не содержит частей архива".into());
     }
     TOTAL.store(
         manifest.parts.iter().map(|p| p.size).sum(),
@@ -195,7 +232,7 @@ fn install(
         .status()
         .map_err(|e| e.to_string())?;
     if !status.success() {
-        return Err("Не удалось распаковать RVC runtime".into());
+        return Err("Не удалось распаковать компонент".into());
     }
     if !stage.join(expected).is_file() {
         return Err("Архив компонента не содержит ожидаемый файл".into());
@@ -336,6 +373,22 @@ mod tests {
         std::fs::write(&path, b"corrupt").unwrap();
         assert!(!cached_part_is_valid(&part, &path));
         std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn models_need_both_files_and_the_current_version() {
+        let root = std::env::temp_dir().join(format!("mnr-models-{}", std::process::id()));
+        let dir = root.join(MODELS_DIR).join("ada");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("denoiser_48k.trtpkg"), b"x").unwrap();
+        assert!(!models_installed(&root, "ada"));
+        std::fs::write(dir.join("denoiser_v2_48k.trtpkg"), b"x").unwrap();
+        assert!(models_installed(&root, "ada"));
+        std::fs::write(dir.join("version.txt"), "2.1.0\n").unwrap();
+        assert!(!models_installed(&root, "ada"));
+        std::fs::write(dir.join("version.txt"), format!("{MODELS_VERSION}\r\n")).unwrap();
+        assert!(models_installed(&root, "ada"));
+        assert!(!models_installed(&root, "turing"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
     fn driver_install_script_quotes_paths_with_spaces() {

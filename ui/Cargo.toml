@@ -1,17 +1,21 @@
 [package]
 name = "micnoize"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 rust-version = "1.97"
 build = "build.rs"
 
 [dependencies]
 base64 = "0.22"
+# DeepFilterNet 3 (MIT/Apache-2.0) for the CPU denoiser; not on crates.io past 0.2.5, so the
+# v0.5.6 release commit is pinned. `default-model` embeds the 8 MB DFN3 model.
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "978576aa8400552a4ce9730838c635aa30db5e61", default-features = false, features = ["tract", "default-model"] }
 ed25519-dalek = "2"
 iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "advanced"] }
 png = "0.18"
 hex = "0.4"
 hmac = "0.12"
+ndarray = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

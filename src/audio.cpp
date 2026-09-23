@@ -24,9 +24,12 @@
 
 namespace mic {
 using Microsoft::WRL::ComPtr;
+// Windows invalidates an endpoint when it is unplugged, disabled or switches format.
+struct DeviceLost : std::runtime_error {using std::runtime_error::runtime_error;};
 static void check(HRESULT hr, const char* where) {
     if(FAILED(hr)) {
         char text[160]; sprintf_s(text, "%s: HRESULT 0x%08lX", where, static_cast<unsigned long>(hr));
+        if(hr==AUDCLNT_E_DEVICE_INVALIDATED) throw DeviceLost(text);
         throw std::runtime_error(text);
     }
 }
@@ -334,6 +337,34 @@ void checkTagLevelWatch() {
     } catch(...) {level->SetMute(FALSE,nullptr);throw;}
 }
 
+std::string gpuArch(std::string& name) {
+    // The driver's CUDA API is present with every NVIDIA driver; no CUDA runtime is needed.
+    HMODULE cuda=LoadLibraryExW(L"nvcuda.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if(!cuda) throw std::runtime_error("Драйвер NVIDIA не найден: нужна видеокарта NVIDIA RTX");
+    struct Free {HMODULE h;~Free(){FreeLibrary(h);}} guard{cuda};
+    using Init=int(__stdcall*)(unsigned);using Get=int(__stdcall*)(int*,int);
+    using Attribute=int(__stdcall*)(int*,int,int);using Name=int(__stdcall*)(char*,int,int);
+    const auto init=reinterpret_cast<Init>(GetProcAddress(cuda,"cuInit"));
+    const auto get=reinterpret_cast<Get>(GetProcAddress(cuda,"cuDeviceGet"));
+    const auto attribute=reinterpret_cast<Attribute>(GetProcAddress(cuda,"cuDeviceGetAttribute"));
+    const auto getName=reinterpret_cast<Name>(GetProcAddress(cuda,"cuDeviceGetName"));
+    int device=0,major=0,minor=0;char text[256]{};
+    // 75/76: CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR/MINOR.
+    if(!init || !get || !attribute || !getName || init(0) || get(&device,0) ||
+       attribute(&major,75,device) || attribute(&minor,76,device) || getName(text,255,device))
+        throw std::runtime_error("CUDA недоступна: обновите драйвер NVIDIA");
+    name=text;
+    const int sm=major*10+minor;
+    if(sm>=100) return "blackwell";
+    if(sm==89) return "ada";
+    if(sm>=80 && sm<89) return "ampere";
+    if(sm==75) return "turing";
+    throw std::runtime_error(name+" (sm "+std::to_string(sm)+") не поддерживается NVIDIA Audio Effects: нужна RTX");
+}
+
+static std::atomic<const CpuDenoiserApi*> cpuDenoiser{nullptr};
+void setCpuDenoiser(const CpuDenoiserApi* api) {cpuDenoiser=api;}
+
 class Afx {
     HMODULE dll_=nullptr;
     std::vector<DLL_DIRECTORY_COOKIE> dirs_;
@@ -361,16 +392,29 @@ public:
             if(!SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32|LOAD_LIBRARY_SEARCH_USER_DIRS))
                 throw std::runtime_error("Cannot configure Windows DLL search path");
             const auto root=std::filesystem::absolute(c.sdk);
-            const auto model=root/L"features/nvafxdenoiser/models/ampere"/(c.version==1?L"denoiser_48k.trtpkg":L"denoiser_v2_48k.trtpkg");
-            if(!std::filesystem::is_regular_file(model)) throw std::runtime_error("NVIDIA model missing: "+model.string());
+            // TensorRT models are built per GPU architecture; another one fails in NvAFX_Load.
+            std::string gpu;const auto arch=gpuArch(gpu);
+            const auto model=root/L"features/nvafxdenoiser/models"/arch/(c.version==1?L"denoiser_48k.trtpkg":L"denoiser_v2_48k.trtpkg");
+            if(!std::filesystem::is_regular_file(model))
+                throw std::runtime_error("Нет модели NVIDIA для "+gpu+" ("+arch+"): перезапустите Mic Noize, чтобы докачать её");
             // All proprietary runtime files stay in the official, unmodified SDK tree.
             for(auto sub:{L"bin",L"bin/external/cuda/bin",L"bin/external/nvtrt/bin",L"bin/external/openssl/bin",L"features/nvafxdenoiser/bin"}) {
                 auto cookie=AddDllDirectory((root/sub).c_str());
                 if(!cookie) throw std::runtime_error("Cannot register SDK DLL directory");
                 dirs_.push_back(cookie);
             }
+            // Stop unloads the SDK, so the logger is set up on every fresh load, not once.
+            const bool fresh=!GetModuleHandleW(L"NVAudioEffects.dll");
             dll_=LoadLibraryExW((root/L"bin/NVAudioEffects.dll").c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
             if(!dll_) throw std::runtime_error("Cannot load NVIDIA SDK DLL; Windows error "+std::to_string(GetLastError()));
+            // SDK errors (why NvAFX_Load failed) go to results/nvafx.log; the SDK takes a narrow path.
+            using InitLogger=NvAFX_Status(*)(LoggingSeverity,LoggingTarget,const char*,logging_cb_t,void*);
+            if(const auto init=reinterpret_cast<InitLogger>(GetProcAddress(dll_,"NvAFX_InitializeLogger")); fresh && init) {
+                const auto folder=projectRoot()/L"results";std::error_code ignored;std::filesystem::create_directories(folder,ignored);
+                const auto path=utf8((folder/L"nvafx.log").wstring());
+                if(std::none_of(path.begin(),path.end(),[](unsigned char ch){return ch>127;}))
+                    init(LOG_LEVEL_ERROR,LOG_TARGET_FILE,path.c_str(),nullptr,nullptr);
+            }
             destroy_=proc<decltype(destroy_)>("NvAFX_DestroyEffect");
             run_=proc<decltype(run_)>("NvAFX_Run"); reset_=proc<decltype(reset_)>("NvAFX_Reset");
             setFloat_=proc<decltype(setFloat_)>("NvAFX_SetFloat");
@@ -390,7 +434,7 @@ public:
                 throw std::runtime_error("Place the NVIDIA SDK in a path with ASCII characters");
             ok(setString(handle_,NVAFX_PARAM_MODEL_PATH,modelText.c_str()),"Model path");
             strength(c.intensity);
-            ok(proc<decltype(&NvAFX_Load)>("NvAFX_Load")(handle_),"Load model");
+            ok(proc<decltype(&NvAFX_Load)>("NvAFX_Load")(handle_),("Load model "+arch+", "+gpu).c_str());
             for(auto param:{NVAFX_PARAM_NUM_SAMPLES_PER_INPUT_FRAME,NVAFX_PARAM_NUM_SAMPLES_PER_OUTPUT_FRAME}) {
                 unsigned n=0; ok(getU32(handle_,param,&n),param);
                 if(n!=block) throw std::runtime_error("This application requires 480-sample NVIDIA frames");
@@ -530,6 +574,7 @@ public:
     }
 };
 std::wstring Engine::desktopMessage() const {std::lock_guard lock(statusMutex_);return desktopMessage_;}
+std::wstring Engine::denoiserMessage() const {std::lock_guard lock(statusMutex_);return denoiserMessage_;}
 void Engine::desktopLoop() {
     while(WaitForSingleObject(stop_,0)!=WAIT_OBJECT_0){
         if(!desktopEnabled){stats.desktopState=0;if(WaitForSingleObject(stop_,250)==WAIT_OBJECT_0)break;continue;}
@@ -623,6 +668,9 @@ void Monitor::start(const std::wstring& route,uint8_t effectsMask) {
         const bool effectsOnly=effectsMask!=0;
         try {
             Com com;
+            // Replugged headphones or a new Windows default output invalidate the stream:
+            // reopen on the current default instead of ending the preview.
+            for(unsigned lost=0;;) try {
             std::wstring inputId;
             if(route==L"TAG") {
                 for(const auto& d:devices(true)) if(d.name.find(L"Thin Audio Gateway")!=std::wstring::npos) inputId=d.id;
@@ -658,7 +706,7 @@ void Monitor::start(const std::wstring& route,uint8_t effectsMask) {
             check(render->ReleaseBuffer(output.capacity,AUDCLNT_BUFFERFLAGS_SILENT),"Monitor prime release");
             Mmcss priority;if(input.client)input.start();output.start();
             {std::lock_guard lock(mutex_);message_=outputName;}
-            state=2;bool primed=false;Drift drift;
+            state=2;lost=0;bool primed=false;Drift drift;
             auto adjusted=std::chrono::steady_clock::now(),captured=adjusted;
             HANDLE events[]={stop_,captureEvent.h,renderEvent.h};
             while(engine_.running()) {
@@ -705,6 +753,12 @@ void Monitor::start(const std::wstring& route,uint8_t effectsMask) {
                 if(primed && now-adjusted>=std::chrono::milliseconds(100)){
                     check(clock->SetSampleRate(static_cast<float>(rate*(1+drift.update(static_cast<double>(queued())-block)))),"Monitor drift");adjusted=now;
                 }
+            }
+            break;
+            } catch(const DeviceLost&) {
+                if(++lost>20) throw;
+                state=1;
+                if(WaitForSingleObject(stop_,500)==WAIT_OBJECT_0 || !engine_.running()) break;
             }
             engine_.previewMask_=0;state=0;
         }catch(const std::exception& e){engine_.previewMask_=0;std::lock_guard lock(mutex_);message_=wide(e.what());state=3;}
@@ -765,7 +819,7 @@ void Engine::start(const Config& c) {
     stats.tagBufferFrames=0; stats.tagDriverGaps=0; stats.tagFrames=0;
     stats.tagLateTicks=0; stats.tagMaxWakeMs=0; stats.tagReconnects=0;
     stats.pitchActive=false; stats.boostActive=false; stats.pitchDelayMs=0; stats.pitchMaxMs=0;stats.phraseState=0;stats.phraseSeconds=0;
-    stats.rvcState=rvcEnabled?1:0;stats.rvcLatencyMs=0;
+    stats.rvcState=rvcEnabled?1:0;stats.rvcLatencyMs=0;stats.denoiser=0;
     intensity=c.intensity; releaseEffects(); running_=true; state=1; status(L"Loading NVIDIA model...");
     try {
         if(c.tag) {
@@ -814,7 +868,7 @@ void Engine::stop() {
                <<" graphs="<<config_.cudaGraphs<<" blocks="<<stats.processed<<" underruns="<<stats.underruns<<" drops="<<stats.drops
                <<" run_max_ms="<<stats.maxRunMs<<" reset_max_ms="<<stats.maxResetMs<<" tag_gaps="<<stats.tagDriverGaps
                <<" late_ticks="<<stats.tagLateTicks<<" reconnects="<<stats.tagReconnects
-               <<" runs_over_5ms="<<stats.runsOver5Ms<<" runs_over_10ms="<<stats.runsOver10Ms<<" run_max_at_s="<<stats.maxRunBlock/100;
+               <<" denoiser="<<(stats.denoiser==1?"nvidia":stats.denoiser==2?"bypass":stats.denoiser==3?"cpu":"none")<<" runs_over_5ms="<<stats.runsOver5Ms<<" runs_over_10ms="<<stats.runsOver10Ms<<" run_max_at_s="<<stats.maxRunBlock/100;
             if(const auto failed=failedAt_.load()) {
                 // The line is written on the next stop(), often much later: keep when it really broke.
                 const FILETIME file{static_cast<DWORD>(failed),static_cast<DWORD>(failed>>32)};SYSTEMTIME at{};
@@ -827,12 +881,30 @@ void Engine::stop() {
     stats.outputActive=false;
     stats.inputPeak=0; stats.outputPeak=0; stats.inputQueue=0; stats.outputQueue=0;
     stats.pitchActive=false; stats.boostActive=false; stats.phraseState=0;stats.phraseSeconds=0;state=0;
-    stats.rvcState=0;stats.rvcLatencyMs=0;
+    stats.rvcState=0;stats.rvcLatencyMs=0;stats.denoiser=0;
     stats.desktopSource=false;stats.desktopState=0;
 }
 void Engine::dspLoop(Config c) {
     try {
-        Afx fx(c); PitchEffect pitchEffect; PhraseEffect phraseEffect; auto rvc=std::make_unique<RvcClient>(stats,rvcConfig); Mmcss priority;
+        // Without a usable NVIDIA GPU or model the voice still goes out, only without denoising:
+        // effects, the virtual microphone and the soundpad do not depend on NVIDIA.
+        std::unique_ptr<Afx> fx;
+        const CpuDenoiserApi* cpuApi=nullptr;
+        struct Cpu {const CpuDenoiserApi*& api;void* state=nullptr;~Cpu(){if(state)api->destroy(state);}} cpu{cpuApi};
+        try {
+            // MNR_DENOISER=cpu tests the CPU path on an RTX machine (and frees the GPU for games).
+            if(const auto* forced=_wgetenv(L"MNR_DENOISER"); forced && _wcsicmp(forced,L"cpu")==0)
+                throw std::runtime_error("выбран процессор (MNR_DENOISER=cpu)");
+            fx=std::make_unique<Afx>(c);stats.denoiser=1;
+        }
+        catch(const std::exception& e) {
+            // No usable NVIDIA: DeepFilterNet on the CPU when the host supplied it, else no denoiser.
+            {std::lock_guard lock(statusMutex_);denoiserMessage_=wide(e.what());}
+            cpuApi=cpuDenoiser.load();
+            if(cpuApi) cpu.state=cpuApi->create();
+            stats.denoiser=cpu.state?3:2;
+        }
+        PitchEffect pitchEffect; PhraseEffect phraseEffect; auto rvc=std::make_unique<RvcClient>(stats,rvcConfig); Mmcss priority;
         std::array<float,block> in{},out{},microphone{};
         LastEffect lastEffect;OutputEffects boostEffect;SoundPlayer sounds;
         bool clipPending=false;
@@ -845,8 +917,10 @@ void Engine::dspLoop(Config c) {
         float applied=c.intensity;
         // Build lazy CUDA/graph state before opening the microphone or output stream.
         for(unsigned j=0;j<block;++j) in[j]=0.02f*std::sin(j*0.07f)+0.01f*std::sin(j*0.21f);
-        for(unsigned i=0;i<20;++i) { if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0) return; fx.process(in.data(),out.data()); }
-        fx.reset();
+        if(fx) {
+            for(unsigned i=0;i<20;++i) { if(WaitForSingleObject(stop_,0)==WAIT_OBJECT_0) return; fx->process(in.data(),out.data()); }
+            fx->reset();
+        }
         soundRequest=0;soundPlaying=0;soundPosition=0;soundLength=0; // a press before start never plays later
         SetEvent(ready_);
         HANDLE events[]={stop_,data_};
@@ -857,18 +931,20 @@ void Engine::dspLoop(Config c) {
                 if(captured_.size()>inputBudget) { captured_.trim(block*2); resetEffect_=true; ++stats.drops; }
                 if(!captured_.pop(in.data(),block)) break;
                 auto begin=std::chrono::steady_clock::now();
-                if(resetEffect_.exchange(false)) {
-                    fx.reset();
+                if(resetEffect_.exchange(false) && fx) {
+                    fx->reset();
                     stats.maxResetMs=std::max(stats.maxResetMs.load(),std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-begin).count());
                 }
                 const float wanted=heldIntensity(intensity.load(),alternateIntensity.load(),noiseHeldSample.load(),
                     effectEpoch.load(),GetTickCount64(),running_ && stats.outputActive && !muted);
-                if(wanted!=applied) {
-                    auto start=std::chrono::steady_clock::now(); fx.strength(wanted); applied=wanted;
+                if(wanted!=applied && fx) {
+                    auto start=std::chrono::steady_clock::now(); fx->strength(wanted); applied=wanted;
                     stats.reconfigureMs=std::max(stats.reconfigureMs.load(),std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-start).count());
                 }
                 const auto runBegin=std::chrono::steady_clock::now();
-                fx.process(in.data(),out.data());
+                if(fx) fx->process(in.data(),out.data());
+                else if(cpu.state) {if(!cpuApi->process(cpu.state,in.data(),out.data(),wanted)) throw std::runtime_error("DeepFilterNet failed");}
+                else out=in;
                 const float runMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-runBegin).count();
                 if(runMs>stats.maxRunMs.load(std::memory_order_relaxed)){stats.maxRunMs=runMs;stats.maxRunBlock=stats.processed.load(std::memory_order_relaxed);}
                 if(runMs>5) stats.runsOver5Ms.fetch_add(1,std::memory_order_relaxed);

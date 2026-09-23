@@ -46,7 +46,7 @@ pub fn report(data: &Path, runtime: &Path, note: &str) -> Result<String, String>
         return Err("Отправка отчётов доступна только в установленной версии".into());
     }
     let mut events = vec![error_event("user-report", note)];
-    for name in ["tag-host.log", "sessions.log", "tag-headphones.log"] {
+    for name in ["app.log", "nvafx.log", "tag-host.log", "sessions.log", "tag-headphones.log"] {
         let path = runtime.join("results").join(name);
         match std::fs::read_to_string(&path) {
             Ok(text) if !text.trim().is_empty() => events.push(error_event(name, &text)),
@@ -128,7 +128,7 @@ fn send(data: &Path, events: Vec<serde_json::Value>) -> Result<(), String> {
 }
 
 // UTC formatting without another time dependency; telemetry accepts ISO-8601.
-fn chrono_free_utc(seconds: u64) -> String {
+pub(crate) fn chrono_free_utc(seconds: u64) -> String {
     const SECONDS_PER_DAY: u64 = 86_400;
     let days = seconds / SECONDS_PER_DAY;
     let rem = seconds % SECONDS_PER_DAY;

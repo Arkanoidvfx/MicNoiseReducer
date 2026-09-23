@@ -84,6 +84,16 @@ extern "C" int32_t mnr_discord_state(Mnr* p,char* text,uint32_t cap,int32_t* act
     *active=p->engine.stats.desktopSource;
     try {copy(mic::utf8(p->engine.desktopMessage()),text,cap);return p->engine.stats.desktopState;}catch(...){return 3;}
 }
+extern "C" void mnr_set_cpu_denoiser(const MnrCpuDenoiser* api) {
+    // Registered once at startup, before any session reads it.
+    static mic::CpuDenoiserApi registered{};
+    if(api && api->create && api->process && api->destroy) {registered={api->create,api->process,api->destroy};mic::setCpuDenoiser(&registered);}
+    else mic::setCpuDenoiser(nullptr);
+}
+extern "C" int32_t mnr_denoiser_state(Mnr* p,char* text,uint32_t cap) {
+    try {copy(mic::utf8(p->engine.denoiserMessage()),text,cap);} catch(...) {copy("",text,cap);}
+    return p->engine.stats.denoiser;
+}
 extern "C" void mnr_phrase_cancel(Mnr* p) {++p->engine.phraseCancel;}
 extern "C" void mnr_rvc_settings(Mnr* p,uint32_t slot,int32_t pitch,uint32_t index,uint32_t chunkMs,uint32_t gain) {
     if(slot>65535 || pitch < -24 || pitch>24 || index>100 || gain<50 || gain>300 ||
@@ -108,6 +118,10 @@ extern "C" void mnr_snapshot(Mnr* p,MnrSnapshot* s,char* error,uint32_t cap,int3
         e.stats.underruns.load(),e.stats.drops.load(),e.effectEpoch.load(),p->captured.exchange(0),
         e.stats.rvcState.load(),e.stats.rvcLatencyMs.load()};
     try {copy(mic::utf8(e.status()),error,cap);} catch(...) {copy("Status unavailable",error,cap);}
+}
+extern "C" int32_t mnr_gpu(char* text,uint32_t capacity) {
+    try {std::string name;const auto arch=mic::gpuArch(name);copy(arch+"\t"+name,text,capacity);return 1;}
+    catch(const std::exception& e) {copy(e.what(),text,capacity);return 0;} catch(...) {copy("GPU query failed",text,capacity);return 0;}
 }
 extern "C" int32_t mnr_devices(int32_t capture,char* result,uint32_t capacity) {
     try {

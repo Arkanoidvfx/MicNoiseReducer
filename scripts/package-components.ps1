@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('core','rvc')][string]$Kind,
+    [Parameter(Mandatory)][ValidateSet('core','rvc','models-turing','models-ampere','models-ada','models-blackwell')][string]$Kind,
     [Parameter(Mandatory)][string]$Version,
     [string]$SourceRoot = 'D:\Projects\Audio\MicNoize',
     [string]$SigningKeyPath = ''
@@ -21,6 +21,17 @@ if ($Kind -eq 'core') {
     Copy-Item (Join-Path $SourceRoot 'vendor\nvidia-afx-3.0.0') (Join-Path $stage 'vendor') -Recurse
     Copy-Item (Join-Path $SourceRoot 'vendor\tag-2.0.0.1903-demo') (Join-Path $stage 'vendor') -Recurse
     Copy-Item (Join-Path $SourceRoot 'bin\mic_tag_host.exe') (Join-Path $stage 'bin')
+} elseif ($Kind -like 'models-*') {
+    # One GPU architecture per package: the app downloads only the models its GPU can load.
+    $models = 'vendor\nvidia-afx-3.0.0\features\nvafxdenoiser\models\' + $Kind.Substring(7)
+    foreach ($name in 'denoiser_48k.trtpkg','denoiser_v2_48k.trtpkg') {
+        if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot "$models\$name"))) { throw "Missing $models\$name" }
+    }
+    $destination = Join-Path $stage $models
+    New-Item -ItemType Directory -Force (Split-Path -Parent $destination) | Out-Null
+    Copy-Item (Join-Path $SourceRoot $models) $destination -Recurse
+    # The app re-downloads when this differs from `MODELS_VERSION` in components.rs.
+    [IO.File]::WriteAllText((Join-Path $destination 'version.txt'), $Version, [Text.UTF8Encoding]::new($false))
 } else {
     $source = Join-Path $SourceRoot 'vendor\vcclient-2.1.4-alpha'
     $destination = Join-Path $stage 'vendor\vcclient-2.1.4-alpha'
@@ -29,6 +40,8 @@ if ($Kind -eq 'core') {
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed with $LASTEXITCODE" }
 }
 
+$release = if ($Kind -like 'models-*') { "runtime-models-v$Version" } else { "runtime-$Kind-v$Version" }
+$manifest = if ($Kind -like 'models-*') { "$Kind.json" } else { 'components.json' }
 $archive = Join-Path $work "$Kind-runtime.tar.zst"
 & tar.exe -caf $archive -C $stage .
 if ($LASTEXITCODE -ne 0) { throw 'Component archive failed.' }
@@ -54,7 +67,7 @@ try {
         } finally { $part.Dispose() }
         $file = Get-Item $path
         $parts += [ordered]@{
-            url = "https://github.com/Arkanoidvfx/MicNoize/releases/download/runtime-$Kind-v$Version/$name"
+            url = "https://github.com/Arkanoidvfx/MicNoize/releases/download/$release/$name"
             size = $file.Length
             sha256 = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
         }
@@ -77,5 +90,5 @@ $envelope = [ordered]@{
     payload = $payload
     signature = [Convert]::ToBase64String([IO.File]::ReadAllBytes($signature))
 } | ConvertTo-Json -Depth 4
-[IO.File]::WriteAllText((Join-Path $out 'components.json'), $envelope, [Text.UTF8Encoding]::new($false))
+[IO.File]::WriteAllText((Join-Path $out $manifest), $envelope, [Text.UTF8Encoding]::new($false))
 Write-Host "Component assets:" $out

@@ -1,6 +1,8 @@
 #![windows_subsystem = "windows"]
 mod components;
+mod cpu_denoise;
 mod engine;
+mod logs;
 mod paths;
 mod rvc;
 mod settings;
@@ -170,8 +172,19 @@ mod focus {
     pub const TAB_SOUNDPAD: usize = 60;
     /// Update banner above every page; it only exists while an update is downloaded.
     pub const UPDATE_BANNER: usize = 74;
+    /// Page 5 (logs), outside `TAB_BASE + page` like the soundpad.
+    pub const TAB_LOGS: usize = 76;
     pub fn tab(page: u8) -> usize {
-        if page == 4 { TAB_SOUNDPAD } else { TAB_BASE + page as usize }
+        match page {
+            4 => TAB_SOUNDPAD,
+            5 => TAB_LOGS,
+            _ => TAB_BASE + page as usize,
+        }
+    }
+    pub mod logs {
+        pub const COPY: usize = 77;
+        pub const FOLDER: usize = 78;
+        pub const SEND: usize = 73;
     }
     pub mod soundpad {
         pub const FOLDER: usize = 61;
@@ -203,7 +216,6 @@ mod focus {
         pub const UPDATE: usize = 57;
         pub const APPLY_UPDATE: usize = 58;
         pub const DRIVER: usize = 72;
-        pub const REPORT: usize = 73;
     }
     pub mod effects {
         pub const INPUT: usize = 35;
@@ -432,6 +444,10 @@ enum Msg {
     DriverInstalled(Result<(), String>),
     SendReport,
     ReportSent(Result<String, String>),
+    /// A fresh logs report; `true` also puts it on the clipboard.
+    Logs(String, bool),
+    LogsCopy,
+    LogsFolder,
     UpdateCheck,
     UpdateChecked(updater::Status),
     ApplyUpdate,
@@ -571,6 +587,15 @@ struct App {
     driver_installing: bool,
     driver_ready: bool,
     report_sending: bool,
+    logs_page: bool,
+    /// Engine denoiser: 1 NVIDIA, 2 none, 3 DeepFilterNet on the CPU; the text says why not NVIDIA.
+    denoiser: (i32, String),
+    logs_text: String,
+    logs_copied: bool,
+    /// Last `message` written to app.log, digits removed so countdowns do not repeat it.
+    logged_message: String,
+    /// NVIDIA model architecture and GPU name, or why there is none.
+    gpu: Result<(String, String), String>,
     rvc_runtime_installed: bool,
     rvc_runtime_installing: bool,
     keys: [u32; 13],
@@ -801,7 +826,25 @@ impl App {
             let (id, task) = Self::open(qa_scale);
             (Some(id), task)
         };
-        let core_installing = !cfg!(test) && !components::core_installed(&runtime_root);
+        let gpu = if cfg!(test) { Err(String::new()) } else { engine::gpu() };
+        let arch = gpu.as_ref().ok().map(|(arch, _)| arch.clone());
+        // Missing models for this GPU are downloaded like the core: the engine waits for both.
+        let core_installing = !cfg!(test)
+            && (!components::core_installed(&runtime_root)
+                || arch.as_ref().is_some_and(|a| !components::models_installed(&runtime_root, a)));
+        if !cfg!(test) {
+            logs::note(
+                &runtime_root,
+                &format!(
+                    "Запуск Mic Noize {}; GPU: {}",
+                    env!("CARGO_PKG_VERSION"),
+                    match &gpu {
+                        Ok((arch, name)) => format!("{name} ({arch})"),
+                        Err(error) => error.clone(),
+                    }
+                ),
+            );
+        }
         // The TAG driver is machine-wide and absent on a fresh install; the core component
         // carries its files, so this can only run once they are on disk.
         let driver_ready = cfg!(test) || components::driver_installed();
@@ -880,6 +923,12 @@ impl App {
                 driver_installing,
                 driver_ready,
                 report_sending: false,
+                logs_page: args.iter().any(|s| s == "--ui-logs"),
+                denoiser: (0, String::new()),
+                logs_text: String::new(),
+                logs_copied: false,
+                logged_message: String::new(),
+                gpu,
                 rvc_runtime_installed,
                 rvc_runtime_installing: false,
                 keys,
@@ -899,7 +948,7 @@ impl App {
                 boost_monitor,
                 monitor_message: String::new(),
                 message: if core_installing {
-                    "Устанавливаем основной NVIDIA/TAG runtime…".into()
+                    "Загружаем компоненты NVIDIA/TAG…".into()
                 } else if driver_installing {
                     DRIVER_INSTALL_MESSAGE.into()
                 } else {
@@ -944,12 +993,14 @@ impl App {
         };
         app.sanitize_sound_keys();
         let preload = app.sync_sound_bindings();
+        let logs = if app.logs_page { app.load_logs(false) } else { Task::none() };
         Ok(Some((
             app,
             Task::batch([
                 open,
                 timer(true),
                 preload,
+                logs,
                 if cfg!(test) {
                     Task::none()
                 } else {
@@ -957,7 +1008,7 @@ impl App {
                 },
                 if core_installing {
                     Task::perform(
-                        async move { components::install_core(&component_root) },
+                        async move { components::install_core(&component_root, arch.as_deref()) },
                         Msg::CoreInstalled,
                     )
                 } else {
@@ -1380,6 +1431,54 @@ impl App {
         self.section_name.clear();
         self.section = selection;
     }
+    /// Every new text in the status line goes to app.log once; a countdown is the same text.
+    fn log_message(&mut self) {
+        let key: String = self.message.chars().filter(|c| !c.is_ascii_digit()).collect();
+        if key != self.logged_message {
+            if !self.message.is_empty() && !cfg!(test) {
+                logs::note(&self.runtime_root, &self.message);
+            }
+            self.logged_message = key;
+        }
+    }
+    fn load_logs(&mut self, copy: bool) -> Task<Msg> {
+        self.log_message();
+        let state = match self.snapshot.state {
+            0 => "остановлен",
+            1 => "запуск",
+            2 | 3 => "работает",
+            4 => "остановка",
+            _ => "ошибка",
+        };
+        let header = format!(
+            "Mic Noize {}\nGPU: {}\nДвижок: {state}; шумодав {}; выход {}; модель v{}; буфер {} мс\n\
+             Виртуальный микрофон: {}; runtime {}\nПрослушивание: {} {}\nСтатус: {}",
+            env!("CARGO_PKG_VERSION"),
+            match &self.gpu {
+                Ok((arch, name)) => format!("{name} ({arch})"),
+                Err(error) => error.clone(),
+            },
+            match self.denoiser.0 {
+                1 => "NVIDIA".to_owned(),
+                2 => format!("выключен ({})", self.denoiser.1),
+                3 => format!("DeepFilterNet на CPU ({})", self.denoiser.1),
+                _ => "-".to_owned(),
+            },
+            self.output.as_ref().map_or("не выбран", |d| d.name.as_str()),
+            self.version,
+            self.buffer,
+            if self.driver_ready { "драйвер установлен" } else { "драйвер НЕ установлен" },
+            if self.core_installing { "загружается" } else { "готов" },
+            self.monitor,
+            self.monitor_message,
+            if self.message.is_empty() { "-" } else { &self.message },
+        );
+        let runtime = self.runtime_root.clone();
+        Task::perform(
+            async move { logs::report(&runtime, &header) },
+            move |text| Msg::Logs(text, copy),
+        )
+    }
     fn auto_start(&mut self) {
         if self.auto_started
             || self.benchmark
@@ -1416,6 +1515,7 @@ impl App {
         match msg {
             Msg::Tick => {
                 self.ticks += 1;
+                self.log_message();
                 if self.rvc_runtime_installing
                     && let Some(progress) = components::progress()
                 {
@@ -1424,7 +1524,7 @@ impl App {
                 if self.core_installing
                     && let Some(progress) = components::progress()
                 {
-                    self.message = format!("Установка NVIDIA/TAG runtime: {progress}%");
+                    self.message = format!("Загрузка компонентов NVIDIA/TAG: {progress}%");
                 }
                 if self.benchmark {
                     if self.ticks == 8 {
@@ -1586,6 +1686,12 @@ impl App {
                     self.discord_source,
                     self.discord_message,
                 ) = self.engine.discord_state();
+                let denoiser = self.engine.denoiser_state();
+                if matches!(denoiser.0, 2 | 3) && self.denoiser.0 != denoiser.0 && !cfg!(test) {
+                    let mode = if denoiser.0 == 3 { "DeepFilterNet на CPU" } else { "без шумодава" };
+                    logs::note(&self.runtime_root, &format!("NVIDIA не используется, {mode}: {}", denoiser.1));
+                }
+                self.denoiser = denoiser;
                 let playing = self.engine.sound_state();
                 // Hotkey starts happen natively: the engine state is the one source of "played".
                 if playing.0 != 0 && playing.0 != self.sound_playing.0
@@ -1852,13 +1958,19 @@ impl App {
                 }
                 self.soundpad_page = page == 4;
                 self.headphone_page = page == 3;
+                self.logs_page = page == 5;
+                self.logs_copied = false;
                 self.details = page == 2;
                 self.rvc_page = page == 1;
                 self.focus = focus::NONE;
-                return iced::widget::operation::snap_to(
+                let snap = iced::widget::operation::snap_to(
                     "body",
                     iced::widget::scrollable::RelativeOffset::START,
                 );
+                if self.logs_page {
+                    return Task::batch([snap, self.load_logs(false)]);
+                }
+                return snap;
             }
             Msg::HeadphoneToggle => {
                 if !self.headphone_busy {
@@ -2071,24 +2183,28 @@ impl App {
             }
             Msg::CoreInstalled(result) => {
                 self.core_installing = false;
-                match result {
-                    Ok(version) => {
-                        self.runtime_root = self.component_root.clone();
-                        unsafe { std::env::set_var("MNR_RUNTIME_ROOT", &self.runtime_root) };
-                        self.rvc_runtime_installed = components::rvc_installed(&self.runtime_root);
-                        self.message = format!("Основной runtime {version} установлен");
-                        self.engine.refresh();
-                        if !components::driver_installed() {
-                            self.driver_installing = true;
-                            self.message = DRIVER_INSTALL_MESSAGE.into();
-                            let root = self.runtime_root.clone();
-                            return Task::perform(
-                                async move { components::install_driver(&root) },
-                                Msg::DriverInstalled,
-                            );
-                        }
+                self.message = match &result {
+                    Ok(version) => format!("Основной runtime {version} установлен"),
+                    Err(error) => format!("Основной runtime: {error}"),
+                };
+                // A failed model download must not keep a fresh PC without its virtual
+                // microphone: the driver only needs the core files.
+                if components::core_installed(&self.component_root) {
+                    self.runtime_root = self.component_root.clone();
+                    unsafe { std::env::set_var("MNR_RUNTIME_ROOT", &self.runtime_root) };
+                    self.rvc_runtime_installed = components::rvc_installed(&self.runtime_root);
+                    self.engine.refresh();
+                    if !components::driver_installed() {
+                        // The driver prompt replaces the status line; keep the result in app.log.
+                        self.log_message();
+                        self.driver_installing = true;
+                        self.message = DRIVER_INSTALL_MESSAGE.into();
+                        let root = self.runtime_root.clone();
+                        return Task::perform(
+                            async move { components::install_driver(&root) },
+                            Msg::DriverInstalled,
+                        );
                     }
-                    Err(error) => self.message = format!("Основной runtime: {error}"),
                 }
             }
             Msg::InstallDriver => {
@@ -2103,8 +2219,27 @@ impl App {
                     );
                 }
             }
+            Msg::LogsCopy => {
+                self.focus = focus::logs::COPY;
+                return self.load_logs(true);
+            }
+            Msg::Logs(text, copy) => {
+                self.logs_text = text;
+                if copy {
+                    self.logs_copied = true;
+                    return iced::clipboard::write(self.logs_text.clone());
+                }
+            }
+            Msg::LogsFolder => {
+                self.focus = focus::logs::FOLDER;
+                let folder = self.runtime_root.join("results");
+                let _ = std::fs::create_dir_all(&folder);
+                if let Err(error) = std::process::Command::new("explorer.exe").arg(&folder).spawn() {
+                    self.message = format!("Не удалось открыть папку логов: {error}");
+                }
+            }
             Msg::SendReport => {
-                self.focus = focus::settings::REPORT;
+                self.focus = focus::logs::SEND;
                 if !self.report_sending {
                     // The note carries what the log files cannot: what the UI last showed.
                     let note = format!(
@@ -2819,15 +2954,22 @@ impl App {
             return Task::none();
         }
         if key == Key::Named(Named::Tab) {
-            // Visual order of the page tabs: microphone, headphones, voice changer, soundpad, settings.
+            // Visual order of the page tabs: microphone, headphones, voice changer, soundpad,
+            // logs, settings.
             let tabs = [
                 focus::TAB_BASE,
                 focus::TAB_BASE + 3,
                 focus::TAB_BASE + 1,
                 focus::TAB_SOUNDPAD,
+                focus::TAB_LOGS,
                 focus::TAB_BASE + 2,
             ];
-            let order = if self.headphone_page {
+            let order = if self.logs_page {
+                use focus::logs::*;
+                let mut items = vec![COPY, FOLDER, SEND];
+                items.extend(tabs);
+                items
+            } else if self.headphone_page {
                 use focus::headphones::*;
                 let mut items = vec![OUTPUT, TOGGLE, MUTE, NOISE, INTENSITY, VOLUME, PITCH];
                 items.extend(tabs);
@@ -2861,7 +3003,6 @@ impl App {
                 if self.update_ready {
                     items.insert(items.len() - 2, APPLY_UPDATE);
                 }
-                items.insert(items.len() - 2, REPORT);
                 items.extend(tabs);
                 items
             } else if self.rvc_page {
@@ -2957,7 +3098,9 @@ impl App {
                 }),
             ]);
         }
-        if key == Key::Named(Named::Escape) && (self.details || self.rvc_page || self.soundpad_page) {
+        if key == Key::Named(Named::Escape)
+            && (self.details || self.rvc_page || self.soundpad_page || self.logs_page)
+        {
             return self.update(Msg::Page(0));
         }
         let activate = matches!(key, Key::Named(Named::Enter | Named::Space)) && !repeat;
@@ -2971,13 +3114,23 @@ impl App {
             if self.focus == focus::TAB_SOUNDPAD {
                 return self.update(Msg::Page(4));
             }
+            if self.focus == focus::TAB_LOGS {
+                return self.update(Msg::Page(5));
+            }
         }
         let delta = match key {
             Key::Named(Named::ArrowLeft | Named::ArrowDown) => -1,
             Key::Named(Named::ArrowRight | Named::ArrowUp) => 1,
             _ => 0,
         };
-        let message = if self.soundpad_page {
+        let message = if self.logs_page {
+            match self.focus {
+                focus::logs::COPY if activate => Msg::LogsCopy,
+                focus::logs::FOLDER if activate => Msg::LogsFolder,
+                focus::logs::SEND if activate => Msg::SendReport,
+                _ => Msg::Noop,
+            }
+        } else if self.soundpad_page {
             use focus::soundpad::*;
             match self.focus {
                 FOLDER if activate => Msg::SoundpadFolder,
@@ -3099,7 +3252,6 @@ impl App {
                 UPDATE if activate => Msg::UpdateCheck,
                 APPLY_UPDATE if activate => Msg::ApplyUpdate,
                 DRIVER if activate => Msg::InstallDriver,
-                REPORT if activate => Msg::SendReport,
                 DONE if activate => Msg::Settings,
                 QUIT if activate => Msg::Quit,
                 AUTOSTART if activate => Msg::Autostart(!self.autostart),
@@ -3258,6 +3410,7 @@ impl App {
 }
 fn main() {
     velopack::VelopackApp::build().run();
+    cpu_denoise::register();
     let root = paths::Paths::resolve().ok().map(|p| p.data);
     let mut result = (|| -> Result<(), String> {
         let Some((app, task)) = App::new()? else {
@@ -3580,6 +3733,30 @@ mod controller_tests {
         app.input = None;
         let _ = app.update(Msg::Input(app.inputs[0].clone()));
         assert!(app.input.is_none());
+    }
+    #[test]
+    fn logs_page_is_reachable_by_keyboard() {
+        use iced::keyboard::{Key, Modifiers, key::Named};
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.window = Some(App::open(1.0).0);
+        let _ = app.update(Msg::Page(5));
+        assert!(app.logs_page && !app.details && !app.soundpad_page && !app.headphone_page);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::logs::COPY);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::logs::FOLDER);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::logs::SEND);
+        let _ = app.update(Msg::Logs("report".into(), true));
+        assert!(app.logs_copied && app.logs_text == "report");
+        app.focus = focus::TAB_BASE + 2;
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert!(app.details && !app.logs_page && !app.logs_copied);
+        app.focus = focus::TAB_LOGS;
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert!(app.logs_page);
+        let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
+        assert!(!app.logs_page);
     }
     #[test]
     fn headphones_are_off_and_independent() {
