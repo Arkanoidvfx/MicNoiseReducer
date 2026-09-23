@@ -1124,6 +1124,15 @@ impl App {
                         .style(slider_style),
                     self.focus == VOLUME,
                 ),
+                frame(
+                    widget::checkbox(self.sound_normalize)
+                        .label("Выравнивать громкость")
+                        .text_size(13)
+                        .size(16)
+                        .on_toggle(Msg::SoundpadNormalize),
+                    self.focus == NORMALIZE,
+                ),
+                label("Тихие звуки поднимаются, громкие приглушаются. Файлы не меняются.", 11, DIM),
             ]
             .spacing(5)
             .width(Length::Fill),

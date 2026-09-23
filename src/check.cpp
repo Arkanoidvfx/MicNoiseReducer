@@ -185,7 +185,7 @@ int main(int argc,char** argv) {
         if(argc==2 && std::string(argv[1])=="--tag-level-check") { mic::checkTagLevel(); return 0; }
         if(argc==2 && std::string(argv[1])=="--tag-level-watch-check") { mic::checkTagLevelWatch(); return 0; }
         if(argc==2 && std::string(argv[1])=="--rvc-check") { mic::checkRvc(); return 0; }
-        if(argc==6 && std::string(argv[1])=="--bench-afx") {
+        if((argc==6 || argc==7) && std::string(argv[1])=="--bench-afx") {
             std::ifstream input(mic::wide(argv[2]),std::ios::binary);
             require(static_cast<bool>(input),"Cannot open PCM packet recording");
             std::vector<float> samples;
@@ -199,7 +199,7 @@ int main(int argc,char** argv) {
             }
             const int seconds=std::stoi(argv[3]); require(seconds>0 && seconds<=600,"Benchmark duration");
             mic::Config config; config.version=2; config.sdk=mic::projectRoot()/L"vendor/nvidia-afx-3.0.0"; config.cudaGraphs=std::stoi(argv[4]);
-            mic::benchmarkAfx(config,samples,seconds,mic::wide(argv[5]));
+            mic::benchmarkAfx(config,samples,seconds,mic::wide(argv[5]),argc==7 && std::string(argv[6])=="churn");
             std::cout<<"Benchmark saved\n"; return 0;
         }
         auto inputs=mic::devices(true), outputs=mic::devices(false);

@@ -407,7 +407,7 @@ public:
     void process(const float* in,float* out) { ok(run_(handle_,&in,&out,block,1),"Process audio"); }
 };
 
-void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigned seconds,const std::filesystem::path& csv) {
+void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigned seconds,const std::filesystem::path& csv,bool churn) {
     if(samples.size()<block || samples.size()>rate*600 || !seconds || seconds>600 || config.cudaGraphs < -1 || config.cudaGraphs>1)
         throw std::runtime_error("Invalid benchmark input");
     for(float v:samples) if(!std::isfinite(v) || std::abs(v)>1) throw std::runtime_error("Invalid PCM sample");
@@ -440,6 +440,10 @@ void benchmarkAfx(const Config& config,const std::vector<float>& samples,unsigne
         // Repeat identical 5-second silence/speech transitions in each A/B arm.
         if((frame/500)%2==0) in.fill(0);
         else std::copy_n(samples.data()+((frame%500)%(samples.size()/block))*block,block,in.data());
+        // Churn: what the alternate-intensity hold and capture discontinuities do in a session;
+        // the next block's run time shows whether the SDK rebuilds state after them.
+        if(churn && frame && frame%250==0) fx.reset();
+        else if(churn && frame && frame%100==0) fx.strength((frame/100)%2?0.5f:config.intensity);
         const auto beforeCpu=cpu(); const auto begin=Clock::now();
         fx.process(in.data(),out.data());
         const auto end=Clock::now(); const auto afterCpu=cpu();
@@ -721,6 +725,8 @@ Engine::~Engine() { stop(); CloseHandle(stop_); CloseHandle(data_); CloseHandle(
 void Engine::status(std::wstring s) { std::lock_guard lock(statusMutex_); status_=std::move(s); }
 std::wstring Engine::status() const { std::lock_guard lock(statusMutex_); return status_; }
 void Engine::fail(const std::exception& error) {
+    FILETIME now{};GetSystemTimeAsFileTime(&now);uint64_t none=0;
+    failedAt_.compare_exchange_strong(none,(static_cast<uint64_t>(now.dwHighDateTime)<<32)|now.dwLowDateTime);
     if(running_.exchange(false)) status(wide(error.what()));
     state=5; releaseEffects(); stats.pitchActive=false;stats.boostActive=false;stats.outputActive=false;stats.phraseState=0;stats.phraseSeconds=0;
     stats.rvcState=rvcEnabled?3:0;
@@ -752,7 +758,7 @@ void Engine::start(const Config& c) {
     ResetEvent(stop_); ResetEvent(data_); ResetEvent(ready_);
     stats.outputActive=false;
     stats.inputPeak=0; stats.outputPeak=0; stats.processMs=0; stats.maxProcessMs=0; stats.reconfigureMs=0;
-    stats.maxRunMs=0; stats.maxResetMs=0;
+    stats.maxRunMs=0; stats.maxResetMs=0; stats.runsOver5Ms=0; stats.runsOver10Ms=0; stats.maxRunBlock=0; failedAt_=0;
     stats.inputQueue=0; stats.outputQueue=0; stats.renderPadding=0;
     stats.underruns=0; stats.drops=0; stats.discontinuities=0; stats.processed=0;
     stats.inputPeriodMs=0; stats.outputPeriodMs=0; stats.driftPpm=0;
@@ -799,12 +805,22 @@ void Engine::stop() {
         try {
             const auto folder=projectRoot()/L"results"; std::filesystem::create_directories(folder);
             std::ofstream log(folder/L"sessions.log",std::ios::app);
+            auto format=[](const SYSTEMTIME& t){
+                char text[32]; sprintf_s(text,"%04u-%02u-%02uT%02u:%02u:%02uZ",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond);
+                return std::string(text);
+            };
             SYSTEMTIME time{}; GetSystemTime(&time);
-            char stamp[32]; sprintf_s(stamp,"%04u-%02u-%02uT%02u:%02u:%02uZ",time.wYear,time.wMonth,time.wDay,time.wHour,time.wMinute,time.wSecond);
-            log<<stamp<<" output="<<(config_.tag?"TAG":"WASAPI")<<" version="<<config_.version<<" reserve_ms="<<config_.bufferMs
+            log<<format(time)<<" output="<<(config_.tag?"TAG":"WASAPI")<<" version="<<config_.version<<" reserve_ms="<<config_.bufferMs
                <<" graphs="<<config_.cudaGraphs<<" blocks="<<stats.processed<<" underruns="<<stats.underruns<<" drops="<<stats.drops
                <<" run_max_ms="<<stats.maxRunMs<<" reset_max_ms="<<stats.maxResetMs<<" tag_gaps="<<stats.tagDriverGaps
-               <<" late_ticks="<<stats.tagLateTicks<<" reconnects="<<stats.tagReconnects<<" status="<<utf8(status())<<'\n';
+               <<" late_ticks="<<stats.tagLateTicks<<" reconnects="<<stats.tagReconnects
+               <<" runs_over_5ms="<<stats.runsOver5Ms<<" runs_over_10ms="<<stats.runsOver10Ms<<" run_max_at_s="<<stats.maxRunBlock/100;
+            if(const auto failed=failedAt_.load()) {
+                // The line is written on the next stop(), often much later: keep when it really broke.
+                const FILETIME file{static_cast<DWORD>(failed),static_cast<DWORD>(failed>>32)};SYSTEMTIME at{};
+                if(FileTimeToSystemTime(&file,&at)) log<<" failed_at="<<format(at);
+            }
+            log<<" status="<<utf8(status())<<'\n';
             if(!log) OutputDebugStringW(L"Mic Noize: could not write results/sessions.log\n");
         } catch(...) {OutputDebugStringW(L"Mic Noize: session log unavailable\n");}
     }
@@ -853,7 +869,10 @@ void Engine::dspLoop(Config c) {
                 }
                 const auto runBegin=std::chrono::steady_clock::now();
                 fx.process(in.data(),out.data());
-                stats.maxRunMs=std::max(stats.maxRunMs.load(),std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-runBegin).count());
+                const float runMs=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-runBegin).count();
+                if(runMs>stats.maxRunMs.load(std::memory_order_relaxed)){stats.maxRunMs=runMs;stats.maxRunBlock=stats.processed.load(std::memory_order_relaxed);}
+                if(runMs>5) stats.runsOver5Ms.fetch_add(1,std::memory_order_relaxed);
+                if(runMs>10) stats.runsOver10Ms.fetch_add(1,std::memory_order_relaxed);
                 float ms=std::chrono::duration<float,std::milli>(std::chrono::steady_clock::now()-begin).count();
                 stats.processMs=ms; stats.maxProcessMs=std::max(stats.maxProcessMs.load(),ms);
                 for(float v:out) if(!std::isfinite(v)) throw std::runtime_error("NVIDIA returned a non-finite audio sample");

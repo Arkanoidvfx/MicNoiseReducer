@@ -85,7 +85,7 @@ struct Config {
     std::filesystem::path tagSdk;
     int cudaGraphs = -1; // -1: SDK default, 0: disabled, 1: enabled.
 };
-void benchmarkAfx(const Config&, const std::vector<float>&, unsigned seconds, const std::filesystem::path& csv);
+void benchmarkAfx(const Config&, const std::vector<float>&, unsigned seconds, const std::filesystem::path& csv, bool churn = false);
 struct TagClock {
     double pending = 0;
     unsigned take(double elapsed, double correction, unsigned maximum) {
@@ -105,6 +105,8 @@ struct Stats {
     std::atomic<bool> outputActive{false};
     std::atomic<float> reconfigureMs{0};
     std::atomic<float> maxRunMs{0}, maxResetMs{0};
+    // NVIDIA run time distribution: a lone max and a steady overload look the same otherwise.
+    std::atomic<unsigned> runsOver5Ms{0}, runsOver10Ms{0}, maxRunBlock{0};
     std::atomic<float> inputPeak{0}, outputPeak{0}, processMs{0}, maxProcessMs{0};
     std::atomic<int> rvcState{0}; // Off, Starting, Ready, Bypass
     std::atomic<float> rvcLatencyMs{0};
@@ -209,6 +211,8 @@ class Engine {
     Config config_;
     std::thread io_, dsp_, desktopThread_, tagLevelThread_;
     std::atomic<float> tagLevelCompensation_{1};
+    // UTC FILETIME of the first failure; the session line is written later, on the next stop().
+    std::atomic<uint64_t> failedAt_{0};
     Ring<16384> captured_, desktop_;
     Ring<16384,RoutedSample> cleaned_;
     Ring<16384,RoutedSample> preview_;

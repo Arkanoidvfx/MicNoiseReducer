@@ -317,6 +317,101 @@ pub fn decode(path: &Path) -> Result<Vec<f32>, String> {
     Ok(samples)
 }
 
+/// Default loudness window, LUFS of the mono clip as played (a stereo source reads ~3 dB below
+/// its stereo BS.1770 figure; the window is tuned to this measure).
+pub const NORM_MIN: i32 = -18;
+pub const NORM_MAX: i32 = -12;
+/// Peak ceiling a boost may reach, and the largest boost: a near-silent clip is mostly noise.
+const CEILING_DB: f32 = -1.0;
+const MAX_BOOST_DB: f32 = 12.0;
+
+/// Integrated loudness (ITU-R BS.1770-4, one channel, 48 kHz) in LUFS; `None` for silence.
+pub fn loudness(samples: &[f32]) -> Option<f32> {
+    // K-weighting: high-shelf then high-pass, 48 kHz coefficients from the standard. f64: the
+    // high-pass pole sits at 0.99 where f32 state noise would bias the result.
+    const STAGES: [([f64; 3], [f64; 2]); 2] = [
+        (
+            [1.53512485958697, -2.69169618940638, 1.19839281085285],
+            [-1.69065929318241, 0.73248077421585],
+        ),
+        ([1.0, -2.0, 1.0], [-1.99004745483398, 0.99007225036621]),
+    ];
+    const STEP: usize = RATE as usize / 10; // 100 ms; a gating block is 4 steps
+    let mut state = [[0f64; 2]; 2];
+    let mut steps = Vec::with_capacity(samples.len() / STEP + 1);
+    let mut energy = 0f64;
+    for (i, &x) in samples.iter().enumerate() {
+        let mut v = x as f64;
+        for ((b, a), s) in STAGES.iter().zip(&mut state) {
+            // Transposed direct form II.
+            let y = b[0] * v + s[0];
+            s[0] = b[1] * v - a[0] * y + s[1];
+            s[1] = b[2] * v - a[1] * y;
+            v = y;
+        }
+        energy += v * v;
+        if (i + 1) % STEP == 0 {
+            steps.push(energy);
+            energy = 0.0;
+        }
+    }
+    let blocks: Vec<f64> = if steps.len() < 4 {
+        // Shorter than one 400 ms block: the whole clip is the block.
+        if samples.is_empty() {
+            return None;
+        }
+        vec![(steps.iter().sum::<f64>() + energy) / samples.len() as f64]
+    } else {
+        steps
+            .windows(4)
+            .map(|w| w.iter().sum::<f64>() / (4 * STEP) as f64)
+            .collect()
+    };
+    let lufs = |power: f64| -0.691 + 10.0 * power.log10();
+    let gated_mean = |threshold: f64| {
+        let kept: Vec<f64> = blocks.iter().copied().filter(|&p| lufs(p) > threshold).collect();
+        (!kept.is_empty()).then(|| kept.iter().sum::<f64>() / kept.len() as f64)
+    };
+    let relative = lufs(gated_mean(-70.0)?) - 10.0;
+    gated_mean(relative.max(-70.0)).map(|p| lufs(p) as f32)
+}
+
+/// Scale a clip into the `[min, max]` LUFS window; returns the applied gain in dB. Cuts are
+/// unlimited; a boost stops at [`MAX_BOOST_DB`] and at a [`CEILING_DB`] sample peak.
+/// ponytail: sample-peak ceiling, no limiter; a quiet clip with sharp peaks may stay below `min`.
+pub fn normalize(samples: &mut [f32], min: f32, max: f32) -> f32 {
+    let Some(level) = loudness(samples) else {
+        return 0.0;
+    };
+    let mut db = level.clamp(min, max) - level;
+    if db > 0.0 {
+        let peak = samples.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let headroom = if peak > 0.0 { CEILING_DB - 20.0 * peak.log10() } else { 0.0 };
+        db = db.min(MAX_BOOST_DB).min(headroom).max(0.0);
+    }
+    if db.abs() < 0.05 {
+        return 0.0;
+    }
+    let gain = 10f32.powf(db / 20.0);
+    for v in samples.iter_mut() {
+        *v *= gain;
+    }
+    db
+}
+
+/// `[soundpad] normalize`: on unless set to 0.
+pub fn normalize_enabled(settings: &Settings) -> bool {
+    settings.number("soundpad", "normalize", 1, 0, 1) != 0
+}
+/// The loudness window from `[soundpad] norm_min / norm_max`; an inverted pair falls back to the
+/// defaults.
+pub fn window(settings: &Settings) -> (f32, f32) {
+    let min = settings.number("soundpad", "norm_min", NORM_MIN, -40, -5);
+    let max = settings.number("soundpad", "norm_max", NORM_MAX, -40, -5);
+    let (min, max) = if min <= max { (min, max) } else { (NORM_MIN, NORM_MAX) };
+    (min as f32, max as f32)
+}
+
 /// Linear interpolation. ponytail: fine for memes; use a windowed sinc if bright clips alias.
 pub fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
     if from == to || input.is_empty() {
@@ -492,5 +587,51 @@ mod tests {
         assert_eq!(import(&library, std::slice::from_ref(&source)).unwrap(), (1, 0));
         assert_eq!(import(&library, &[source, dir.join("missing.mp3")]).unwrap(), (0, 2));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn normalize_window() {
+        let sine = |amplitude: f32, seconds: f32| -> Vec<f32> {
+            (0..(seconds * RATE as f32) as usize)
+                .map(|i| (i as f32 * 997.0 * std::f32::consts::TAU / RATE as f32).sin() * amplitude)
+                .collect()
+        };
+        let near = |value: f32, expected: f32, tolerance: f32| {
+            assert!((value - expected).abs() <= tolerance, "{value} is not {expected} ± {tolerance}");
+        };
+        // BS.1770 reference: a full-scale 997 Hz sine in one channel reads -3.01 LUFS.
+        near(loudness(&sine(1.0, 3.0)).unwrap(), -3.01, 0.1);
+        let mut loud = sine(1.0, 3.0);
+        near(normalize(&mut loud, -18.0, -12.0), -9.0, 0.1);
+        near(loudness(&loud).unwrap(), -12.0, 0.1);
+        let inside = sine(0.3, 3.0);
+        let mut untouched = inside.clone();
+        assert_eq!(normalize(&mut untouched, -18.0, -12.0), 0.0);
+        assert_eq!(untouched, inside);
+        let mut quiet = sine(0.01, 3.0);
+        assert_eq!(normalize(&mut quiet, -18.0, -12.0), MAX_BOOST_DB);
+        let mut peaky = sine(0.02, 3.0);
+        peaky[RATE as usize] = 0.8;
+        near(normalize(&mut peaky, -18.0, -12.0), CEILING_DB - 20.0 * 0.8f32.log10(), 0.01);
+        assert!(peaky.iter().all(|v| v.abs() <= 10f32.powf(CEILING_DB / 20.0) + 1e-4));
+        assert!(loudness(&peaky).unwrap() < -18.0);
+        let mut silence = vec![0.0; RATE as usize];
+        assert_eq!(loudness(&silence), None);
+        assert_eq!(normalize(&mut silence, -18.0, -12.0), 0.0);
+        assert!(silence.iter().all(|v| *v == 0.0));
+        assert_eq!(loudness(&[]), None);
+        assert_eq!(normalize(&mut [], -18.0, -12.0), 0.0);
+        near(loudness(&sine(0.5, 0.1)).unwrap(), -9.0, 0.5);
+        assert!(normalize_enabled(&Settings::for_test("")));
+        assert!(!normalize_enabled(&Settings::for_test("[soundpad]\nnormalize=0")));
+        assert!(normalize_enabled(&Settings::for_test("[soundpad]\nnormalize=7")));
+        assert_eq!(window(&Settings::for_test("")), (-18.0, -12.0));
+        assert_eq!(
+            window(&Settings::for_test("[soundpad]\nnorm_min=-10\nnorm_max=-20")),
+            (-18.0, -12.0)
+        );
+        assert_eq!(
+            window(&Settings::for_test("[soundpad]\nnorm_min=-99\nnorm_max=-8")),
+            (-18.0, -8.0)
+        );
     }
 }

@@ -17,7 +17,10 @@ use std::{
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -34,9 +37,8 @@ const DISCORD_VOLUME_AT_100: f32 = 0.08;
 const DISCORD_VOLUME_MAX_PERCENT: f32 = 200.0;
 /// `Msg::Bind` targets above the 13 effect keys: the soundpad stop key and one per clip.
 const SOUND_STOP_BIND: usize = 99;
-/// Displayed 100 % soundpad volume as physical gain. Clips are normalised media near 0 dBFS
-/// while processed speech peaks around -18 dBFS; -14 dB puts a clip at voice level.
-const SOUND_VOLUME_AT_100: f32 = 0.2;
+/// The old 20 % soundpad setting is the new 100 %: physical gain 0.04 (-28 dB).
+const SOUND_VOLUME_AT_100: f32 = 0.04;
 const SOUND_BIND_BASE: usize = 100;
 /// Engine clip ids of the recordings list; above every soundpad clip id.
 const CLIP_ID_BASE: u32 = 900_000;
@@ -113,6 +115,51 @@ fn load_discord_volume(settings: &Settings) -> f32 {
     discord_volume_gain(percent)
 }
 
+fn load_sound_volume(settings: &Settings) -> f32 {
+    let percent = |key| {
+        settings
+            .get("soundpad", key)
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| (0..=200).contains(value))
+    };
+    let legacy = percent("volume");
+    let display = percent("volume_display");
+    let value = match (legacy, display) {
+        (Some(old), Some(new)) if old == (new + 2) / 5 => new,
+        (Some(old), _) => (old * 5).min(200),
+        (None, Some(new)) => new,
+        (None, None) => 100,
+    };
+    value as f32 / 100.0
+}
+
+/// Decode a clip, scaled into the loudness `window` when levelling is on. Runs off the UI thread.
+fn decode_for(path: &Path, window: Option<(f32, f32)>) -> Result<Vec<f32>, String> {
+    let mut pcm = soundpad::decode(path)?;
+    if let Some((min, max)) = window {
+        soundpad::normalize(&mut pcm, min, max);
+    }
+    Ok(pcm)
+}
+
+/// Hand a decoded clip to the engine unless its list was rescanned meanwhile: the engine keeps
+/// clips by id, so a stale decode would replace the current one. The error never reaches the
+/// user, the handler drops results of an old generation.
+/// ponytail: microsecond gap between check and load; a generation in `mnr_sound_load` closes it.
+fn load_if_live(
+    loader: &engine::SoundLoader,
+    live: &AtomicU32,
+    generation: u32,
+    id: u32,
+    pcm: &[f32],
+    gain: f32,
+) -> Result<(), String> {
+    if live.load(Ordering::Acquire) != generation {
+        return Err("Список звуков обновился".into());
+    }
+    loader.load(id, pcm, gain)
+}
+
 /// Keyboard focus targets. Values overlap between pages (each page has its own Tab order) and
 /// are asserted literally by the controller tests, so they must never change.
 mod focus {
@@ -138,6 +185,7 @@ mod focus {
         pub const SECTION_ADD: usize = 69;
         pub const SECTION_NAME: usize = 70;
         pub const SECTION_DELETE: usize = 71;
+        pub const NORMALIZE: usize = 75;
         /// Row `i`: `ROW_BASE + 3 * i` play, `+ 1` volume, `+ 2` hotkey.
         pub const ROW_BASE: usize = 1000;
         /// Sidebar entry `i` of `App::section_items`.
@@ -218,6 +266,54 @@ fn restart_requested(events: u32) -> bool {
     events & (EXIT_EVENT | RESTART_EVENT) == RESTART_EVENT
 }
 
+/// Pauses before each automatic restart; after the last one the error stays on screen.
+const RECOVERY_DELAYS: [u64; 5] = [2, 5, 15, 30, 60];
+/// Restarts processing after any failure: TAG host gone, microphone lost across sleep, a start
+/// that hit a device not ready yet after login. There is no Start button, so without this a
+/// failure lasted until the user pressed Refresh. A settings error just spends the attempts;
+/// a minute of healthy running since the last failure forgives them.
+#[derive(Default)]
+struct Recovery {
+    attempts: usize,
+    since: Option<Instant>,
+    due: Option<Instant>,
+}
+impl Recovery {
+    /// Feed every engine state; returns the pause when a restart gets scheduled.
+    fn observe(&mut self, state: i32, now: Instant) -> Option<Duration> {
+        match state {
+            2 | 3 => {
+                // Running again (maybe started by hand): nothing left to recover.
+                self.due = None;
+                let since = *self.since.get_or_insert(now);
+                if now.duration_since(since) >= Duration::from_secs(60) {
+                    self.attempts = 0;
+                }
+                None
+            }
+            5 if self.due.is_none() => {
+                // A flapping session must not count its old healthy stretch as forgiveness.
+                self.since = None;
+                let delay = Duration::from_secs(*RECOVERY_DELAYS.get(self.attempts)?);
+                self.attempts += 1;
+                self.due = Some(now + delay);
+                Some(delay)
+            }
+            _ => None,
+        }
+    }
+    fn take_due(&mut self, now: Instant) -> bool {
+        let due = self.due.is_some_and(|at| now >= at);
+        if due {
+            self.due = None;
+        }
+        due
+    }
+    fn exhausted(&self) -> bool {
+        self.due.is_none() && self.attempts >= RECOVERY_DELAYS.len()
+    }
+}
+
 fn tag_host_autostart() -> bool {
     [TAG_HOST_RUN_NAME, LEGACY_TAG_HOST_RUN_NAME]
         .iter()
@@ -290,6 +386,8 @@ enum Msg {
     Tick,
     Opened(window::Id),
     WindowFocus(window::Id, bool),
+    /// Windows minimized the window (0×0 resize), e.g. a taskbar click on the active window.
+    Minimized(window::Id),
     Hide,
     Show,
     Minimize,
@@ -345,6 +443,8 @@ enum Msg {
     SoundpadRefresh,
     SoundpadVolume(f32),
     SoundpadHear(bool),
+    /// Level clip loudness on decode; reloads the library.
+    SoundpadNormalize(bool),
     SoundpadFilter(String),
     SoundpadSort(SoundSort),
     /// Absolute scroll offset and viewport height of the body: the clip list renders only
@@ -404,6 +504,8 @@ struct App {
     sounds: Vec<Sound>,
     sound_volume: f32,
     sound_monitor: bool,
+    /// Scale clips into the `[soundpad]` loudness window as they are decoded.
+    sound_normalize: bool,
     sound_filter: String,
     sound_sort: SoundSort,
     sound_scroll: (f32, f32),
@@ -419,6 +521,9 @@ struct App {
     sound_stop_key: u32,
     /// Bumped on every rescan so a decode finishing for an old list is ignored.
     sound_generation: u32,
+    /// Always equal to `sound_generation` (see `bump_sounds`): a decode task checks it right
+    /// before loading, so a clip decoded for an old list never replaces a newer one in the engine.
+    sound_live: Arc<AtomicU32>,
     sound_pending_play: Option<usize>,
     sound_playing: (u32, f32, f32),
     sound_note: String,
@@ -430,6 +535,8 @@ struct App {
     clip_generation: u32,
     /// Bumped on every recordings rescan so a decode for an old list is ignored.
     clip_loads: u32,
+    /// Always equal to `clip_loads` (see `bump_clips`), like `sound_live`.
+    clip_live: Arc<AtomicU32>,
     clip_menu: Option<usize>,
     clip_pending_play: Option<usize>,
     clip_note: String,
@@ -449,6 +556,8 @@ struct App {
     settings: Settings,
     window: Option<window::Id>,
     window_focused: bool,
+    /// Set by the title-bar "−": that minimize stays in the taskbar instead of hiding to tray.
+    own_minimize: bool,
     hidden_window: Option<window::Id>,
     inputs: Vec<Device>,
     outputs: Vec<Device>,
@@ -500,6 +609,7 @@ struct App {
     /// Captured key that another binding already uses; shown on the capturing button.
     bind_conflict: Option<u32>,
     auto_started: bool,
+    recovery: Recovery,
     focus: usize,
     dirty: Option<Instant>,
     hint_shown: bool,
@@ -642,8 +752,9 @@ impl App {
             .get("soundpad", "folder")
             .filter(|f| !f.is_empty())
             .map(PathBuf::from);
-        let sound_volume = settings.number("soundpad", "volume", 100, 0, 200) as f32 / 100.0;
+        let sound_volume = load_sound_volume(&settings);
         let sound_monitor = settings.number("soundpad", "monitor", 0, 0, 1) != 0;
+        let sound_normalize = soundpad::normalize_enabled(&settings);
         let sound_stop_key = settings.number("soundpad", "stop_key", 0, 0, 2046) as u32;
         let sound_sort = SoundSort::from_code(settings.number("soundpad", "sort", 0, 0, 3));
         let sections = soundpad::sections(&settings);
@@ -711,6 +822,7 @@ impl App {
                 sounds,
                 sound_volume,
                 sound_monitor,
+                sound_normalize,
                 sound_filter: String::new(),
                 sound_sort,
                 sound_scroll: (0.0, 800.0),
@@ -724,6 +836,7 @@ impl App {
                 drag_over: None,
                 sound_stop_key,
                 sound_generation: 0,
+                sound_live: Arc::new(AtomicU32::new(0)),
                 sound_pending_play: None,
                 sound_playing: (0, 0.0, 0.0),
                 sound_note,
@@ -732,6 +845,7 @@ impl App {
                 clips_folder,
                 clip_generation: 0,
                 clip_loads: 0,
+                clip_live: Arc::new(AtomicU32::new(0)),
                 clip_menu: None,
                 clip_pending_play: None,
                 clip_note: String::new(),
@@ -740,6 +854,7 @@ impl App {
                 settings,
                 window,
                 window_focused: false,
+                own_minimize: false,
                 hidden_window: None,
                 inputs: vec![],
                 outputs: vec![],
@@ -809,6 +924,7 @@ impl App {
                 candidate: 0,
                 bind_conflict: None,
                 auto_started: false,
+                recovery: Recovery::default(),
                 focus: focus::NONE,
                 dirty: None,
                 hint_shown,
@@ -944,10 +1060,13 @@ impl App {
             self.settings
                 .set("soundpad", "folder", folder.to_string_lossy());
         }
-        self.settings
-            .set("soundpad", "volume", (self.sound_volume * 100.0).round() as i32);
+        let sound_percent = (self.sound_volume * 100.0).round() as i32;
+        self.settings.set("soundpad", "volume_display", sound_percent);
+        self.settings.set("soundpad", "volume", (sound_percent + 2) / 5);
         self.settings
             .set("soundpad", "monitor", self.sound_monitor as i32);
+        self.settings
+            .set("soundpad", "normalize", self.sound_normalize as i32);
         self.settings
             .set("soundpad", "stop_key", self.sound_stop_key as i32);
         self.settings
@@ -1072,14 +1191,28 @@ impl App {
         CLIP_ID_BASE + index as u32
     }
     /// Re-read the recordings folder; older files beyond [`CLIPS_KEPT`] are deleted.
-    fn rescan_clips(&mut self) {
+    fn bump_sounds(&mut self) {
+        self.sound_generation += 1;
+        self.sound_live.store(self.sound_generation, Ordering::Release);
+    }
+    fn bump_clips(&mut self) {
         self.clip_loads += 1;
+        self.clip_live.store(self.clip_loads, Ordering::Release);
+    }
+    /// The loudness window new decodes use, if levelling is on.
+    fn sound_window(&self) -> Option<(f32, f32)> {
+        // The flag lives here, not in `settings`: those only catch up on the next save.
+        self.sound_normalize.then(|| soundpad::window(&self.settings))
+    }
+    fn rescan_clips(&mut self) {
+        self.bump_clips();
         self.clip_menu = None;
         self.clip_note.clear();
         self.clip_pending_play = None;
         self.clips = newest_clips(&self.clips_folder);
     }
     fn load_clip(&mut self, index: usize) -> Task<Msg> {
+        let (window, live) = (self.sound_window(), self.clip_live.clone());
         let Some(clip) = self.clips.get_mut(index) else {
             return Task::none();
         };
@@ -1095,8 +1228,8 @@ impl App {
         );
         Task::perform(
             async move {
-                let pcm = soundpad::decode(&path)?;
-                loader.load(id, &pcm, 1.0)?;
+                let pcm = decode_for(&path, window)?;
+                load_if_live(&loader, &live, generation, id, &pcm, 1.0)?;
                 Ok(pcm.len() as f32 / soundpad::RATE as f32)
             },
             move |result| Msg::ClipLoaded(index, generation, result),
@@ -1119,6 +1252,7 @@ impl App {
         };
     }
     fn load_sound(&mut self, index: usize) -> Task<Msg> {
+        let (window, live) = (self.sound_window(), self.sound_live.clone());
         let Some(sound) = self.sounds.get_mut(index) else {
             return Task::none();
         };
@@ -1134,8 +1268,8 @@ impl App {
         );
         Task::perform(
             async move {
-                let pcm = soundpad::decode(&path)?;
-                loader.load(id, &pcm, gain)?;
+                let pcm = decode_for(&path, window)?;
+                load_if_live(&loader, &live, generation, id, &pcm, gain)?;
                 Ok(pcm.len() as f32 / soundpad::RATE as f32)
             },
             move |result| Msg::SoundLoaded(index, generation, result),
@@ -1143,10 +1277,12 @@ impl App {
     }
     /// Re-read the folder, keeping keys and gains of clips that are still there.
     fn rescan_sounds(&mut self) -> Task<Msg> {
-        self.sound_generation += 1;
+        self.bump_sounds();
         self.sound_pending_play = None;
         self.engine.sound_clear();
-        // sound_clear drops the loaded recordings too; they decode again on the next play.
+        // sound_clear drops the loaded recordings too; they decode again on the next play, and
+        // a recording still decoding must not mark itself loaded.
+        self.bump_clips();
         self.clip_pending_play = None;
         for clip in &mut self.clips {
             clip.state = SoundState::Unloaded;
@@ -1267,7 +1403,8 @@ impl App {
     fn update(&mut self, msg: Msg) -> Task<Msg> {
         if matches!(&msg, Msg::Page(_) | Msg::Hide | Msg::Minimize
             | Msg::WindowFocus(_, false) | Msg::SoundpadFilter(_) | Msg::SoundpadSort(_)
-            | Msg::SectionSelect(_) | Msg::SoundpadRefresh | Msg::SoundpadPicked(_, _))
+            | Msg::SectionSelect(_) | Msg::SoundpadRefresh | Msg::SoundpadNormalize(_)
+            | Msg::SoundpadPicked(_, _))
         {
             self.scroll_anims.clear();
             self.scroll_pending.clear();
@@ -1461,8 +1598,38 @@ impl App {
                 }
                 self.monitor = monitor;
                 self.monitor_message = monitor_message;
+                // `busy` covers an in-flight start: the engine still reports the old failure
+                // until `Reply::Started` arrives, which must not count as another one.
+                // Only after the first start: until then auto_start owns starting.
+                if self.auto_started
+                    && !self.busy
+                    && !self.quitting
+                    && !self.benchmark
+                    && !self.core_installing
+                    && !self.driver_installing
+                {
+                    let now = Instant::now();
+                    self.recovery.observe(snapshot.state, now);
+                    if snapshot.state == 5
+                        && self.recovery.take_due(now)
+                        && let Some(config) = self.config()
+                    {
+                        self.busy = true;
+                        self.snapshot.state = 1;
+                        self.engine.start(config);
+                    }
+                }
                 if snapshot.state == 5 && !error.is_empty() {
-                    self.message = error;
+                    self.message = match self.recovery.due {
+                        Some(at) => format!(
+                            "{error} Перезапуск через {} с.",
+                            at.saturating_duration_since(Instant::now()).as_secs() + 1
+                        ),
+                        None if self.recovery.exhausted() => {
+                            format!("{error} Автоперезапуск не помог: нажмите «Обновить устройства» в настройках.")
+                        }
+                        None => error,
+                    };
                 }
                 if self.ui_active() {
                     self.peak = snapshot.output_peak.max(self.peak * 0.80);
@@ -1534,6 +1701,13 @@ impl App {
             Msg::WindowFocus(id, focused) => {
                 if self.window == Some(id) {
                     self.window_focused = focused;
+                    self.own_minimize &= !focused;
+                }
+            }
+            Msg::Minimized(id) => {
+                // Like OBS: clicking the taskbar icon of the active window hides it to tray.
+                if self.window == Some(id) && !std::mem::take(&mut self.own_minimize) {
+                    return self.update(Msg::Hide);
                 }
             }
             Msg::Hide => {
@@ -1571,6 +1745,7 @@ impl App {
             Msg::Minimize => {
                 self.window_focused = false;
                 if let Some(id) = self.window {
+                    self.own_minimize = true;
                     return window::minimize(id, true);
                 }
             }
@@ -2192,6 +2367,13 @@ impl App {
                     self.engine.monitor(self.monitor_mode());
                 }
             }
+            Msg::SoundpadNormalize(enabled) => {
+                self.sound_normalize = enabled;
+                self.focus = focus::soundpad::NORMALIZE;
+                self.dirty = Some(Instant::now());
+                // Loaded clips carry the old level: drop them all, bound clips decode again.
+                return self.rescan_sounds();
+            }
             Msg::SoundpadFilter(text) => {
                 self.sound_filter = text.chars().take(80).collect();
                 self.focus = focus::soundpad::FILTER;
@@ -2634,7 +2816,8 @@ impl App {
                 items
             } else if self.soundpad_page {
                 use focus::soundpad::*;
-                let mut items = vec![FOLDER, ADD, REFRESH, VOLUME, HEAR, STOP_BIND, FILTER, SORT];
+                let mut items =
+                    vec![FOLDER, ADD, REFRESH, VOLUME, NORMALIZE, HEAR, STOP_BIND, FILTER, SORT];
                 items.extend((0..self.section_items().len()).map(|i| SECTION_BASE + i));
                 items.push(SECTION_ADD);
                 if self.custom_section().is_some() {
@@ -2785,6 +2968,7 @@ impl App {
                 VOLUME if delta != 0 => {
                     Msg::SoundpadVolume(self.sound_volume * 100.0 + delta as f32)
                 }
+                NORMALIZE if activate => Msg::SoundpadNormalize(!self.sound_normalize),
                 HEAR if activate => Msg::SoundpadHear(!self.sound_monitor),
                 STOP_BIND if activate => Msg::Bind(SOUND_STOP_BIND),
                 SORT if delta != 0 || activate => {
@@ -3031,6 +3215,11 @@ impl App {
                     iced::Event::Window(window::Event::Unfocused) => {
                         return Some(Msg::WindowFocus(id, false));
                     }
+                    iced::Event::Window(window::Event::Resized(size))
+                        if size.width == 0.0 && size.height == 0.0 =>
+                    {
+                        return Some(Msg::Minimized(id));
+                    }
                     _ => {}
                 }
                 match event {
@@ -3152,6 +3341,16 @@ mod controller_tests {
         assert!((clamped.controls.discord_volume - 0.16).abs() < 0.0001);
     }
     #[test]
+    fn soundpad_volume_migrates_and_handles_an_old_version_edit() {
+        assert_eq!(load_sound_volume(&Settings::for_test("")), 1.0);
+        assert_eq!(load_sound_volume(&Settings::for_test("[soundpad]\nvolume=20")), 1.0);
+        assert_eq!(load_sound_volume(&Settings::for_test("[soundpad]\nvolume=40")), 2.0);
+        assert_eq!(load_sound_volume(&Settings::for_test("[soundpad]\nvolume=100")), 2.0);
+        assert_eq!(load_sound_volume(&Settings::for_test("[soundpad]\nvolume=20\nvolume_display=100")), 1.0);
+        assert_eq!(load_sound_volume(&Settings::for_test("[soundpad]\nvolume=30\nvolume_display=100")), 1.5);
+        assert!((SOUND_VOLUME_AT_100 - 0.2 * 0.2).abs() < 0.0001);
+    }
+    #[test]
     fn noise_presets_and_hotkey_roundtrip() {
         use keyboard::{Key, Modifiers, key::Named};
         let (mut app, _) = App::from_settings(Settings::for_test("[audio]\nintensity=105"))
@@ -3224,10 +3423,17 @@ mod controller_tests {
         assert!((app.peak - 0.6).abs() < 0.0001);
         let _ = app.update(Msg::Minimize);
         assert!(!app.ui_active());
-        let _ = app.update(Msg::WindowFocus(id, true));
-        assert!(app.ui_active());
         app.tray_ok = true;
         app.hint_shown = true;
+        let _ = app.update(Msg::Minimized(id));
+        assert_eq!(app.window, Some(id), "the title-bar minimize stays in the taskbar");
+        let _ = app.update(Msg::WindowFocus(id, true));
+        assert!(app.ui_active());
+        let _ = app.update(Msg::Minimized(id));
+        assert_eq!(app.hidden_window, Some(id), "a taskbar-click minimize hides to tray");
+        let _ = app.update(Msg::Show);
+        let _ = app.update(Msg::WindowFocus(id, true));
+        assert!(app.ui_active());
         let _ = app.update(Msg::Hide);
         let _ = app.update(Msg::WindowFocus(id, true));
         assert!(!app.ui_active()); // Late focus event cannot wake the hidden UI.
@@ -3447,7 +3653,7 @@ mod controller_tests {
 boost_key=119
 [soundpad]
 folder={}
-volume=150
+volume=30
 monitor=1
 stop_key=120
 sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
@@ -3480,7 +3686,7 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         assert_eq!(app.sound_hover, None);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 61);
-        for expected in [62, 63, 64, 65, 66, 67, 68, 20000, 69, 1000, 1001, 1002, 1003, 1004, 1005, 40] {
+        for expected in [62, 63, 64, 75, 65, 66, 67, 68, 20000, 69, 1000, 1001, 1002, 1003, 1004, 1005, 40] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected);
         }
@@ -3528,15 +3734,35 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         assert_eq!(app.sound_volume, 0.0);
         let _ = app.update(Msg::SoundpadHear(false));
         assert_eq!(app.monitor_mode(), 0);
+        // Loudness levelling: on by default; toggling reloads the library with fresh generations
+        // and the decode-task mirrors follow them.
+        assert!(app.sound_normalize);
+        assert_eq!(app.sound_window(), Some((-18.0, -12.0)));
+        let (sounds_before, clips_before) = (app.sound_generation, app.clip_loads);
+        app.focus = focus::soundpad::NORMALIZE;
+        let _ = app.key(Key::Named(Named::Space), Modifiers::empty(), false);
+        assert!(!app.sound_normalize);
+        assert_eq!(app.sound_window(), None);
+        assert_eq!(app.focus, focus::soundpad::NORMALIZE);
+        assert!(app.sound_generation > sounds_before && app.clip_loads > clips_before);
+        assert_eq!(app.sound_live.load(Ordering::Acquire), app.sound_generation);
+        assert_eq!(app.clip_live.load(Ordering::Acquire), app.clip_loads);
+        assert_eq!(app.sounds.len(), 2, "the reload keeps the library");
+        assert_eq!(app.sounds[1].key, 122 | 256, "the reload keeps keys");
         app.benchmark = false;
         app.settings.path = dir.join("settings.ini");
         app.save();
+        assert_eq!(app.settings.get("soundpad", "normalize"), Some("0"));
         assert_eq!(
             app.settings.get("soundpad", "sounds"),
             Some("121:30:0:airhorn.mp3.wav\t378:200:5:boom.wav")
         );
         assert_eq!(app.settings.get("soundpad", "sort"), Some("0"));
         assert_eq!(app.settings.get("soundpad", "stop_key"), Some("0"));
+        let _ = app.update(Msg::SoundpadVolume(100.0));
+        app.save();
+        assert_eq!(app.settings.get("soundpad", "volume_display"), Some("100"));
+        assert_eq!(app.settings.get("soundpad", "volume"), Some("20"));
         let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
         assert!(!app.soundpad_page);
         let _ = app.update(Msg::SoundpadPicked(true, Ok(vec![])));
@@ -3597,6 +3823,43 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         assert!(restart_requested(RESTART_EVENT));
         assert!(!restart_requested(EXIT_EVENT));
         assert!(!restart_requested(EXIT_EVENT | RESTART_EVENT));
+    }
+    #[test]
+    fn failed_session_restarts_with_backoff_and_gives_up() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut r = Recovery::default();
+        assert_eq!(r.observe(1, at(0)), None);
+        assert!(!r.take_due(at(100)) && !r.exhausted());
+        // A failure (mid-run or at start) is restarted after 2 s, once.
+        assert_eq!(r.observe(3, at(10)), None);
+        assert_eq!(r.observe(5, at(20)), Some(Duration::from_secs(2)));
+        assert_eq!(r.observe(5, at(21)), None, "a waiting restart is not rescheduled");
+        assert!(!r.take_due(at(21)));
+        assert!(r.take_due(at(22)));
+        assert!(!r.take_due(at(23)), "one restart per failure");
+        // Failed restarts back off, then stop.
+        for (i, delay) in RECOVERY_DELAYS.iter().enumerate().skip(1) {
+            let now = at(100 * i as u64);
+            assert_eq!(r.observe(5, now), Some(Duration::from_secs(*delay)));
+            assert!(r.take_due(now + Duration::from_secs(*delay)));
+        }
+        assert_eq!(r.observe(5, at(1000)), None);
+        assert!(r.exhausted());
+        // A healthy minute forgives the attempts; a manual restart clears a pending one.
+        let mut r = Recovery { attempts: 3, ..Recovery::default() };
+        assert_eq!(r.observe(5, at(0)), Some(Duration::from_secs(30)));
+        assert_eq!(r.observe(2, at(1)), None);
+        assert!(!r.take_due(at(1000)), "running again drops the pending restart");
+        assert_eq!(r.observe(3, at(61)), None);
+        assert_eq!(r.observe(5, at(62)), Some(Duration::from_secs(2)));
+        // Flapping: an old healthy stretch does not forgive a session that dies in seconds.
+        let mut r = Recovery::default();
+        assert_eq!(r.observe(3, at(0)), None);
+        assert_eq!(r.observe(5, at(3600)), Some(Duration::from_secs(2)));
+        assert!(r.take_due(at(3602)));
+        assert_eq!(r.observe(3, at(3603)), None);
+        assert_eq!(r.observe(5, at(3604)), Some(Duration::from_secs(5)));
     }
 
     #[test]
