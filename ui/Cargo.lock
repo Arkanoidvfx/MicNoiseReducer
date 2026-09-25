@@ -1670,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "micnoize"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "base64 0.22.1",
  "deep_filter",

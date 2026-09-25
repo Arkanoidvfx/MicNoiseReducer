@@ -549,6 +549,11 @@ fn slant(shapes: &mut Vec<Shape>, x: f32, y: f32, w: f32, h: f32, lean: f32, col
 
 fn geometry(clip: Rectangle, shapes: &[Shape]) -> Geometry {
     let mut frame = Frame::new(clip);
+    fill_shapes(&mut frame, shapes);
+    frame.into_geometry()
+}
+
+fn fill_shapes(frame: &mut Frame, shapes: &[Shape]) {
     for &Shape { x, y, w, h, lean, round, color } in shapes {
         let corners = [Point::new(x + lean, y), Point::new(x + lean + w, y), Point::new(x + w, y + h), Point::new(x, y + h)];
         let path = Path::new(|p| {
@@ -568,7 +573,6 @@ fn geometry(clip: Rectangle, shapes: &[Shape]) -> Geometry {
         });
         frame.fill(&path, color);
     }
-    frame.into_geometry()
 }
 
 /// The last drawn shapes. tiny-skia treats uncached geometry as changed on every frame, which
@@ -615,6 +619,21 @@ fn halo(shapes: &mut Vec<Shape>, x: f32, y: f32, w: f32, h: f32, radius: f32, co
             color: Color { a: color.a * 0.09, ..color },
         });
     }
+}
+
+fn text_width(content: &str, size: f32, font: Font) -> f32 {
+    measure(&Text {
+        content: content.to_owned(),
+        bounds: Size::INFINITE,
+        size: Pixels(size),
+        line_height: text::LineHeight::default(),
+        font,
+        align_x: text::Alignment::Left,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: text::Shaping::Basic,
+        wrapping: text::Wrapping::None,
+    })
+    .width
 }
 
 fn measure(text: &Text<String, Font>) -> Size {
@@ -703,63 +722,67 @@ impl<Message> Widget<Message, Theme, Renderer> for Caution {
     fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
         let b = layout.bounds();
         let now = Instant::now();
-        let born = tree.state.downcast_ref::<Born>().0.unwrap_or(now);
-        let age = now.saturating_duration_since(born).as_secs_f32();
+        // Without a frame event yet (a headless render) the tapes are shown fully rolled out.
+        let age = tree.state.downcast_ref::<Born>().0.map_or(1.0, |born| now.saturating_duration_since(born).as_secs_f32());
         let t = now.saturating_duration_since(self.clock.epoch).as_secs_f32();
         renderer.with_layer(b, |renderer| {
             renderer.fill_quad(
                 Quad { bounds: b, border: Border { radius: 10.0.into(), ..Border::default() }, ..Quad::default() },
                 Color { a: 0.035, ..HOT },
             );
-            for (k, top) in [0.28_f32, 0.64].into_iter().enumerate() {
-                let reveal = ((age - k as f32 * 0.12) / 0.55).clamp(0.0, 1.0);
-                if reveal <= 0.0 {
+            let word = "ЭКСПЕРИМЕНТАЛЬНО   ///   ";
+            let run = text_width(word, 11.0, numbers());
+            let mut frame = Frame::new(b);
+            // Crossed like police tape, not mirrored: they cross high on the card and stay above
+            // the slider's track, so the slider hides little of them.
+            let cross = Point::new(b.x + b.width * 0.62, b.y + b.height * 0.30);
+            for (k, degrees) in [-7.0_f32, 11.0].into_iter().enumerate() {
+                let fade = ((age - k as f32 * 0.12) / 0.55).clamp(0.0, 1.0);
+                if fade <= 0.0 {
                     continue;
                 }
-                let h = 24.0;
-                let y = b.y + b.height * top - h / 2.0;
-                let band = Rectangle { x: b.x, y, width: b.width * reveal, height: h };
-                renderer.with_layer(band, |renderer| {
-                    // 45° hatching like the mockup's repeating gradient: 14 px stripes across.
-                    let mut shapes = Vec::new();
-                    slant(&mut shapes, b.x, y, b.width, h, 0.0, Color { a: 0.08, ..HOT });
-                    let (stripe, period) = (14.0 * std::f32::consts::SQRT_2, 28.0 * std::f32::consts::SQRT_2);
-                    let mut x = b.x - h - period + (t * 6.0) % period;
-                    while x < b.x + b.width {
-                        slant(&mut shapes, x, y, stripe, h, h, Color { a: 0.13, ..HOT });
-                        x += period;
-                    }
-                    for edge in [y, y + h - 1.0] {
-                        slant(&mut shapes, b.x, edge, b.width, 1.0, 0.0, Color { a: 0.35, ..HOT });
-                    }
-                    // The stripes move every frame, so this band is not worth caching.
-                    renderer.draw_geometry(geometry(band, &shapes));
-                    // The word crawls; the two bands move in opposite directions.
-                    let run = 250.0;
-                    let speed = if k == 0 { -11.0 } else { 9.0 };
-                    let start = b.x - run + (t * speed).rem_euclid(run);
-                    for j in 0..((b.width / run) as usize + 3) {
-                        put(
-                            renderer,
-                            Text {
-                                content: "ЭКСПЕРИМЕНТАЛЬНО   ///   ".to_owned(),
-                                bounds: Size::new(run, h),
-                                size: Pixels(11.0),
-                                line_height: text::LineHeight::default(),
-                                font: numbers(),
-                                align_x: text::Alignment::Left,
-                                align_y: iced::alignment::Vertical::Center,
-                                shaping: text::Shaping::Basic,
-                                wrapping: text::Wrapping::None,
-                            },
-                            Point::new(start + j as f32 * run, y + h / 2.0),
-                            Color { a: 0.5, ..Color::from_rgb8(0xFF, 0x82, 0x78) },
-                            band,
-                        );
-                    }
-                });
+                let (h, len) = (24.0, b.width * 1.8);
+                let (x0, y0) = (-len / 2.0, -h / 2.0);
+                let mut shapes = vec![Shape { x: x0, y: y0, w: len, h, lean: 0.0, round: 0.0, color: Color { a: 0.08 * fade, ..HOT } }];
+                // 45° hatching like the mockup's repeating gradient: 14 px stripes across.
+                let (stripe, period) = (14.0 * std::f32::consts::SQRT_2, 28.0 * std::f32::consts::SQRT_2);
+                let mut x = x0 - h - period + (t * 6.0) % period;
+                while x < x0 + len {
+                    slant(&mut shapes, x, y0, stripe, h, h, Color { a: 0.13 * fade, ..HOT });
+                    x += period;
+                }
+                for edge in [y0, y0 + h - 1.0] {
+                    slant(&mut shapes, x0, edge, len, 1.0, 0.0, Color { a: 0.35 * fade, ..HOT });
+                }
+                frame.push_transform();
+                frame.translate(iced::Vector::new(cross.x, cross.y));
+                frame.rotate(degrees.to_radians());
+                fill_shapes(&mut frame, &shapes);
+                // The word crawls; the two tapes move in opposite directions.
+                let speed = if k == 0 { -11.0 } else { 9.0 };
+                let start = x0 - run + (t * speed).rem_euclid(run);
+                let repeat = (len / run) as usize + 2;
+                frame.fill_text(tape_text(word.repeat(repeat), Point::new(start, 0.0), Color { a: 0.5 * fade, ..Color::from_rgb8(0xFF, 0x82, 0x78) }));
+                frame.pop_transform();
             }
+            renderer.draw_geometry(frame.into_geometry());
         });
+    }
+}
+
+/// A tape's caption; rotated geometry text is drawn as glyph outlines, clipped with the card.
+fn tape_text(content: String, position: Point, color: Color) -> iced_tiny_skia::graphics::geometry::Text {
+    iced_tiny_skia::graphics::geometry::Text {
+        content,
+        position,
+        max_width: f32::INFINITY,
+        color,
+        size: Pixels(11.0),
+        line_height: text::LineHeight::default(),
+        font: numbers(),
+        align_x: text::Alignment::Left,
+        align_y: iced::alignment::Vertical::Center,
+        shaping: text::Shaping::Basic,
     }
 }
 
@@ -767,16 +790,19 @@ impl<Message> Widget<Message, Theme, Renderer> for Caution {
 /// Hovering holds it reversed so it can be read aloud.
 pub fn reverse_word<'a, Message: 'a>(word: &str, clock: Clock) -> Element<'a, Message> {
     let word: Vec<char> = word.trim().to_uppercase().chars().take(12).collect();
-    let word = if word.is_empty() { "ПРИВЕТ".chars().collect() } else { word };
-    Element::new(Reverse { word, clock })
+    let word: Vec<char> = if word.is_empty() { "ПРИВЕТ".chars().collect() } else { word };
+    let widths = word.iter().map(|c| text_width(&c.to_string(), 15.0, numbers())).collect();
+    Element::new(Reverse { word, widths, clock })
 }
 struct Reverse {
     word: Vec<char>,
+    /// Each letter's own advance, so Ж and Г keep natural spacing both ways round.
+    widths: Vec<f32>,
     clock: Clock,
 }
 #[derive(Default)]
 struct Hover(bool);
-const CELL: f32 = 11.5;
+const LETTER_GAP: f32 = 1.5;
 const REV_CYCLE: f32 = 4000.0;
 impl Reverse {
     fn cycle(&self, now: Instant) -> f32 {
@@ -802,7 +828,7 @@ impl Reverse {
         }
     }
     fn width(&self) -> f32 {
-        24.0 + CELL * self.word.len() as f32
+        24.0 + self.widths.iter().map(|w| w + LETTER_GAP).sum::<f32>() + 4.0
     }
 }
 impl<Message> Widget<Message, Theme, Renderer> for Reverse {
@@ -850,7 +876,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Reverse {
         };
         let glyph = |content: String, size: f32, font: Font| Text {
             content,
-            bounds: Size::new(CELL + 8.0, 28.0),
+            bounds: Size::new(40.0, 28.0),
             size: Pixels(size),
             line_height: text::LineHeight::default(),
             font,
@@ -867,17 +893,134 @@ impl<Message> Widget<Message, Theme, Renderer> for Reverse {
             if p > 0.5 { TAG } else { Color::from_rgb8(0x85, 0x86, 0x8D) },
             clip,
         );
-        let n = self.word.len();
         let arc = (p * std::f32::consts::PI).sin();
+        let advance = |w: &f32| w + LETTER_GAP;
         for (i, ch) in self.word.iter().enumerate() {
-            let d = (n as f32 - 1.0 - 2.0 * i as f32) * CELL;
-            let lift = if d == 0.0 { -4.0 } else { -d.signum() * (3.0 + d.abs() / 10.0) };
-            let x = b.x + 24.0 + i as f32 * CELL + CELL / 2.0 + d * p;
+            // Letter i starts after the letters before it, and ends up after those behind it.
+            let from = self.widths[..i].iter().map(advance).sum::<f32>();
+            let to = self.widths[i + 1..].iter().map(advance).sum::<f32>();
+            let d = to - from;
+            let lift = if d.abs() < 0.5 { -4.0 } else { -d.signum() * (3.0 + d.abs() / 10.0) };
+            let x = b.x + 24.0 + from + self.widths[i] / 2.0 + d * p;
             put(renderer, glyph(ch.to_string(), 15.0, numbers()), Point::new(x, b.center_y() + lift * arc), tint, clip);
         }
     }
     fn mouse_interaction(&self, _: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, _: &Rectangle, _: &Renderer) -> mouse::Interaction {
         if cursor.is_over(layout.bounds()) { mouse::Interaction::Text } else { mouse::Interaction::default() }
+    }
+}
+
+/// A hotkey keycap that sinks and lights up while its key is held, as in the mockup's `kpress`:
+/// a quick dip past the rest depth, then it settles; releasing springs back with a small lift.
+pub fn keycap<'a, Message: 'a>(label: &str, down: bool) -> Element<'a, Message> {
+    let width = text_width(label, 11.0, Font::with_name("Consolas")) + 14.0;
+    Element::new(Keycap { label: label.to_owned(), down, width })
+}
+struct Keycap {
+    label: String,
+    down: bool,
+    width: f32,
+}
+#[derive(Default)]
+struct KeyMotion {
+    down: bool,
+    since: Option<Instant>,
+}
+const CAP_H: f32 = 19.0;
+const TRAVEL: f32 = 3.0;
+const PRESS_MS: f32 = 280.0;
+const RELEASE_MS: f32 = 240.0;
+impl Keycap {
+    /// Depth in px, cap scale and orange mix for the current moment.
+    fn pose(&self, motion: &KeyMotion, now: Instant) -> (f32, f32, f32) {
+        let ms = motion.since.map_or(f32::MAX, |s| now.saturating_duration_since(s).as_secs_f32() * 1000.0);
+        let ease = |x: f32| 1.0 - (1.0 - x.clamp(0.0, 1.0)).powi(3);
+        if self.down {
+            let t = ms / PRESS_MS;
+            if t >= 1.0 {
+                return (TRAVEL, 1.0, 1.0);
+            }
+            let (depth, scale) = if t < 0.4 {
+                let k = ease(t / 0.4);
+                (TRAVEL * 1.5 * k, 1.0 - 0.1 * k)
+            } else {
+                let k = ease((t - 0.4) / 0.6);
+                (TRAVEL * (1.5 - 0.5 * k), 0.9 + 0.1 * k)
+            };
+            (depth, scale, ease(t / 0.35))
+        } else {
+            let t = ms / RELEASE_MS;
+            if t >= 1.0 {
+                return (0.0, 1.0, 0.0);
+            }
+            let depth = if t < 0.5 { TRAVEL - (TRAVEL + 1.2) * ease(t / 0.5) } else { -1.2 * (1.0 - ease((t - 0.5) / 0.5)) };
+            (depth, 1.0, 1.0 - ease(t / 0.5))
+        }
+    }
+}
+impl<Message> Widget<Message, Theme, Renderer> for Keycap {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<KeyMotion>() }
+    fn state(&self) -> tree::State { tree::State::new(KeyMotion { down: self.down, since: None }) }
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fixed(self.width), height: Length::Fixed(CAP_H + TRAVEL + 2.0) }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fixed(self.width), Length::Fixed(CAP_H + TRAVEL + 2.0))
+    }
+    fn update(&mut self, tree: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        if let Event::Window(window::Event::RedrawRequested(now)) = event {
+            let motion = tree.state.downcast_mut::<KeyMotion>();
+            if motion.down != self.down {
+                motion.down = self.down;
+                motion.since = Some(*now);
+            }
+            let span = if self.down { PRESS_MS } else { RELEASE_MS };
+            if motion.since.is_some_and(|s| now.saturating_duration_since(s).as_secs_f32() * 1000.0 < span) {
+                shell.request_redraw_at(RedrawRequest::NextFrame);
+            }
+        }
+    }
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let b = layout.bounds();
+        let (depth, scale, lit) = self.pose(tree.state.downcast_ref::<KeyMotion>(), Instant::now());
+        let mix = |a: Color, b: Color| Color { r: a.r + (b.r - a.r) * lit, g: a.g + (b.g - a.g) * lit, b: a.b + (b.b - a.b) * lit, a: 1.0 };
+        let top = b.y + 1.0;
+        let (w, h) = (b.width * scale, CAP_H * scale);
+        let cap = Rectangle { x: b.center_x() - w / 2.0, y: top + depth.max(-1.2) + (CAP_H - h) / 2.0, width: w, height: h };
+        for e in [6.0_f32, 4.0, 2.0] {
+            if lit > 0.0 {
+                renderer.fill_quad(
+                    Quad { bounds: cap.expand(e), border: Border { radius: (5.0 + e).into(), ..Border::default() }, ..Quad::default() },
+                    Color { a: 0.12 * lit, ..TAG },
+                );
+            }
+        }
+        // The key's side below the cap; a held cap sinks into it.
+        renderer.fill_quad(
+            Quad { bounds: Rectangle { x: b.x, y: top + TRAVEL, width: b.width, height: CAP_H }, border: Border { radius: 5.0.into(), ..Border::default() }, ..Quad::default() },
+            mix(Color::from_rgb8(0x11, 0x12, 0x14), Color::from_rgb8(0x8A, 0x4E, 0x1F)),
+        );
+        renderer.fill_quad(
+            Quad { bounds: cap, border: Border { color: mix(Color::from_rgb8(0x3A, 0x3B, 0x41), Color::from_rgb8(0xC9, 0x72, 0x2F)), width: 1.0, radius: 5.0.into() }, ..Quad::default() },
+            mix(Color::from_rgb8(0x2A, 0x2B, 0x30), TAG),
+        );
+        put(
+            renderer,
+            Text {
+                content: self.label.clone(),
+                bounds: Size::new(b.width, CAP_H),
+                size: Pixels(11.0 * scale),
+                line_height: text::LineHeight::default(),
+                font: Font::with_name("Consolas"),
+                align_x: text::Alignment::Center,
+                align_y: iced::alignment::Vertical::Center,
+                shaping: text::Shaping::Basic,
+                wrapping: text::Wrapping::None,
+            },
+            cap.center(),
+            mix(Color::from_rgb8(0xE8, 0xE3, 0xD9), DARK),
+            b.expand(8.0),
+        );
     }
 }
 

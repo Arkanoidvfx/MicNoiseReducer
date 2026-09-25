@@ -7,7 +7,7 @@ Read only the section needed. Commands assume the existing configured checkout a
 Use absolute paths so shell cwd cannot redirect the work:
 
 ```powershell
-$project = 'D:\Projects\Audio\MicNoize'
+$project = 'D:\Projects\Audio\MicNoiseReducer'
 $cmake = 'C:\Program Files\CMake\bin\cmake.exe'
 $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
 $env:CARGO_TARGET_DIR = Join-Path $project 'build\rust'

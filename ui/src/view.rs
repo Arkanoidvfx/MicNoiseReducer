@@ -1449,54 +1449,72 @@ impl App {
         );
         let pitch = card(
             column![
-                heading_row(glyph::NOTE, "Тон модели", label("от −24 до +24 полутонов", 11, FAINT).into()),
+                heading_row(glyph::NOTE, "Тон модели", label("±24 полутона", 11, FAINT).into()),
                 frame(
                     tacho(-24.0..=24.0, self.controls.rvc_options.pitch as f32, Msg::RvcPitch, clock)
                         .default(0.0)
                         .origin(0.0)
-                        .segments(24)
+                        .segments(16)
                         .format(|v| format!("{:+.0} пт", v).replace('-', "−")),
                     self.focus == PITCH,
                 ),
-                action(label(if self.rvc_advanced { "Скрыть параметры" } else { "Дополнительные параметры" }, 13, INK), Msg::RvcAdvanced, self.focus == ADVANCED, false),
+                label("Сдвигает тон готового голоса модели. Ctrl+клик — 0.", 11, FAINT),
             ]
-            .spacing(10),
-        );
-        let mut content = column![title("Смена голоса"), top, model, pitch].spacing(14);
-        if !self.rvc_import_note.is_empty() {
-            content = content.push(label(&self.rvc_import_note, 12, DIM));
-        }
+            .spacing(6),
+        )
+        .height(Length::Fill);
+        // The advanced settings open beside the pitch card, not below it, so the page never
+        // needs scrolling at the default window size.
+        let mut tuning = column![row![
+            heading_row(glyph::CHIP, "Тонкая настройка", Space::new().into()),
+            action(label(if self.rvc_advanced { "Скрыть" } else { "Показать" }, 12, INK), Msg::RvcAdvanced, self.focus == ADVANCED, false),
+        ]
+        .spacing(10)
+        .align_y(iced::Center)]
+        .spacing(8);
         if self.rvc_advanced {
             let index: Element<'_, Msg> = if self.rvc_has_index() {
-                frame(tacho(0.0..=100.0, self.controls.rvc_options.index as f32, Msg::RvcIndex, clock).default(0.0).segments(20).compact().phase(900.0), self.focus == INDEX)
+                frame(tacho(0.0..=100.0, self.controls.rvc_options.index as f32, Msg::RvcIndex, clock).default(0.0).segments(16).compact().phase(900.0), self.focus == INDEX)
             } else {
-                label("Недоступно без .index", 12, FAINT).into()
+                label("Недоступно: у модели нет .index", 12, FAINT).into()
             };
-            content = content.push(card(
-                column![
-                    heading_row(glyph::CHIP, "Влияние индекса", Space::new().into()),
-                    index,
-                    label(
-                        if self.rvc_has_index() { "Индекс усиливает сходство с обучающими примерами модели" } else { "У этой модели нет .index — регулятор индекса не влияет на звук" },
-                        11,
-                        FAINT,
-                    ),
-                    heading_row(glyph::VOLUME, "Вход модели", Space::new().into()),
-                    frame(tacho(50.0..=300.0, self.controls.rvc_options.gain as f32, Msg::RvcGain, clock).step(5.0).default(100.0).segments(20).compact().phase(1800.0), self.focus == GAIN),
+            tuning = tuning
+                .push(label("Влияние индекса", 12, DIM))
+                .push(index)
+                .push(label("Вход модели", 12, DIM))
+                .push(frame(tacho(50.0..=300.0, self.controls.rvc_options.gain as f32, Msg::RvcGain, clock).step(5.0).default(100.0).segments(16).compact().phase(1800.0), self.focus == GAIN))
+                .push(
                     row![
-                        label("Блок аудио, мс", 13, DIM),
-                        frame(repaint(self.controls.rvc_options.chunk, pick_list(rvc::CHUNKS, Some(self.controls.rvc_options.chunk), Msg::RvcChunk).style(device_style)), self.focus == CHUNK),
+                        label("Блок аудио, мс", 12, DIM),
+                        frame(repaint(self.controls.rvc_options.chunk, pick_list(rvc::CHUNKS, Some(self.controls.rvc_options.chunk), Msg::RvcChunk).text_size(13).style(device_style)), self.focus == CHUNK),
                         Space::new().width(Length::Fill),
                         action(label("Обновить модели", 12, INK), Msg::RvcRefresh, self.focus == REFRESH, false),
                     ]
-                    .spacing(10)
+                    .spacing(8)
                     .align_y(iced::Center),
-                    label("Задержка = блок + 200 мс, всегда постоянная. При лаге модели — тишина, не обычный голос. 100–150 мс: меньше задержка, выше нагрузка.", 11, FAINT),
-                    label("Только микрофон. Выключение завершает сервер и выгружает модель; повторный запуск требует загрузки.", 11, FAINT),
-                ]
-                .spacing(10),
+                )
+                .push(label("Задержка = блок + 200 мс. При лаге модели — тишина, не обычный голос.", 11, FAINT));
+        } else {
+            tuning = tuning.push(label(
+                if self.rvc_has_index() { "Индекс модели, громкость входа и размер блока аудио." } else { "Громкость входа и размер блока аудио." },
+                11,
+                FAINT,
             ));
         }
+        let mut content = column![
+            title("Смена голоса"),
+            top,
+            model,
+            row![pitch.width(Length::FillPortion(1)), card(tuning).width(Length::FillPortion(1)).height(Length::Fill)]
+                .spacing(14)
+                // Both cards share a height; Fill children in a Shrink row would collapse.
+                .height(if self.rvc_advanced { 276 } else { 156 }),
+        ]
+        .spacing(14);
+        if !self.rvc_import_note.is_empty() {
+            content = content.push(label(&self.rvc_import_note, 12, DIM));
+        }
+        content = content.push(label("Только микрофон. Выключение выгружает модель; повторный запуск снова её загружает.", 11, FAINT));
         content.into()
     }
 
@@ -2068,24 +2086,7 @@ impl App {
                 let name = key_name(key);
                 widget::Row::with_children(name.split(" + ").map(|part| {
                     let vk = match part { "Ctrl" => 0x11, "Alt" => 0x12, "Shift" => 0x10, _ => key & 255 };
-                    let down = lit || self.key_held(vk);
-                    let cap = container(label(part.to_owned(), 11, if down { ORANGE_DARK } else { Color::from_rgb8(0xE8, 0xE3, 0xD9) }).font(Font::with_name("Consolas")))
-                        .padding([3, 6])
-                        .style(move |_| container::Style {
-                            background: Some((if down { ORANGE } else { Color::from_rgb8(0x2A, 0x2B, 0x30) }).into()),
-                            border: Border { color: if down { Color::from_rgb8(0xC9, 0x72, 0x2F) } else { EDGE }, width: 1.0, radius: 5.0.into() },
-                            ..Default::default()
-                        });
-                    // The key's side: a pressed cap sinks into it. A drawn base, not a shadow:
-                    // tiny-skia's shadows ignore partial repaints and turn black without blur.
-                    container(cap)
-                        .padding(if down { iced::Padding { top: 2.0, ..Default::default() } } else { iced::Padding { bottom: 2.0, ..Default::default() } })
-                        .style(move |_| container::Style {
-                            background: Some((if down { Color::from_rgb8(0x8A, 0x4E, 0x1F) } else { RAIL }).into()),
-                            border: Border { radius: 5.0.into(), ..Border::default() },
-                            ..Default::default()
-                        })
-                        .into()
+                    tacho::keycap(part, lit || self.key_held(vk))
                 }))
                 .spacing(3)
                 .align_y(iced::Center)
@@ -2300,6 +2301,9 @@ mod tests {
             key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Loaded(2.4),
         }).collect();
         render(&app, "effects");
+        app.keys_down[0] = 1 << 0x11;
+        render(&app, "effects-ctrl-held");
+        app.keys_down = [0; 4];
         app.effects_page = false;
         app.soundpad_page = true;
         app.sound_folder = Some(PathBuf::from(r"E:\Dropbox\sounds"));
@@ -2313,6 +2317,9 @@ mod tests {
         app.soundpad_page = false;
         app.rvc_page = true;
         render(&app, "rvc");
+        app.rvc_advanced = true;
+        render(&app, "rvc-advanced");
+        app.rvc_advanced = false;
         app.rvc_page = false;
         app.details = true;
         render(&app, "settings");

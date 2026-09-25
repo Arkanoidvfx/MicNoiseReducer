@@ -5,7 +5,7 @@ description: "Work on Mic Noize in this Windows project: Rust/Iced UI, C++ NVIDI
 
 # Mic Noize
 
-Resolve all source paths below from the project root (the folder containing `AGENTS.md` and `CMakeLists.txt`). Default location: `D:\Projects\Audio\MicNoize`.
+Resolve all source paths below from the project root (the folder containing `AGENTS.md` and `CMakeLists.txt`). Default location: `D:\Projects\Audio\MicNoiseReducer`.
 
 The product and internal app name is **Mic Noize**. Installed program files live under `%LOCALAPPDATA%\MicNoize`; persistent settings and runtime live under `%APPDATA%\Mic Noize`. `MNR` means **Mic Noize Runtime**: preserve the `mnr_*` ABI, `MNR_*` environment variables, `/mnr/` routes, sidecar name and frozen TAG IPC `.v1` layout. Current audio/status IPC uses separate `.v2` objects.
 
