@@ -24,8 +24,14 @@ jobs:
     steps:
       - name: Check local runner
         if: inputs.smoke
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MNR_TELEMETRY_SECRET: ${{ secrets.MNR_TELEMETRY_SECRET }}
         run: |
           if (-not (Test-Path .\scripts\release-local.ps1)) { throw 'Local checkout missing.' }
+          if (-not $env:MNR_TELEMETRY_SECRET) { throw 'Release secret missing.' }
+          gh auth status *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release token unavailable.' }
           "Local runner ready: $env:COMPUTERNAME"
       - name: Build, verify and publish
         if: '!inputs.smoke'
