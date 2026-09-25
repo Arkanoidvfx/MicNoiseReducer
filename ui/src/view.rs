@@ -415,20 +415,11 @@ impl App {
     }
 
     pub fn view(&self, _: window::Id) -> Element<'_, Msg> {
-        let logo = widget::Row::with_children([10, 22, 14].into_iter().map(|h| {
-            container(Space::new().width(3).height(h))
-                .style(|_| container::Style {
-                    background: Some(ORANGE.into()),
-                    border: Border { radius: 3.0.into(), ..Default::default() },
-                    ..Default::default()
-                })
-                .into()
-        }))
-        .spacing(3)
-        .align_y(iced::Center);
+        let voice = ((db(self.peak) + 72.0) / 72.0).clamp(0.0, 1.0);
+        let logo = tacho::logo(26.0, voice);
         let titlebar = row![
             mouse_area(
-                container(row![logo, bold("Mic Noize", 15, INK)].spacing(12).align_y(iced::Center))
+                container(row![logo, bold("Mic Noize", 15, INK)].spacing(10).align_y(iced::Center))
                     .padding([0, 16])
                     .width(Length::Fill)
                     .height(46)
@@ -444,6 +435,34 @@ impl App {
             ..Default::default()
         });
 
+        let body = widget::stack![
+            self.body(),
+            tacho::page_shift(self.page_shift.as_ref(), Msg::PageShiftDone),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill);
+        let root = column![
+            titlebar,
+            container(Space::new().height(1)).width(Length::Fill).style(|_| container::Style {
+                background: Some(LINE.into()),
+                ..Default::default()
+            }),
+            row![self.rail(), body].height(Length::Fill),
+        ];
+        container(root)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(BG.into()),
+                text_color: Some(INK),
+                border: Border { color: Color::from_rgb8(0x2A, 0x2B, 0x30), width: 1.0, radius: 12.0.into() },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// The current page with its error banner and scrolling, right of the rail.
+    fn body(&self) -> Element<'_, Msg> {
         let content: Element<'_, Msg> = if self.logs_page {
             self.logs_view()
         } else if self.soundpad_page {
@@ -477,7 +496,7 @@ impl App {
         }
         // The soundpad owns its own scrollable list (and the "body" id) so its toolbar and
         // sidebar stay put while hundreds of clips scroll.
-        let body: Element<'_, Msg> = if self.soundpad_page && self.sound_folder.is_some() {
+        if self.soundpad_page && self.sound_folder.is_some() {
             page.push(container(content).width(Length::Fill).height(Length::Fill)).padding([20, 26]).into()
         } else {
             page.push(
@@ -491,40 +510,47 @@ impl App {
             )
             .padding(iced::Padding { top: 20.0, right: 14.0, bottom: 6.0, left: 26.0 })
             .into()
-        };
-        let root = column![
-            titlebar,
-            container(Space::new().height(1)).width(Length::Fill).style(|_| container::Style {
-                background: Some(LINE.into()),
-                ..Default::default()
-            }),
-            row![self.rail(), body].height(Length::Fill),
-        ];
-        container(root)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_| container::Style {
-                background: Some(BG.into()),
-                text_color: Some(INK),
-                border: Border { color: Color::from_rgb8(0x2A, 0x2B, 0x30), width: 1.0, radius: 12.0.into() },
-                ..Default::default()
-            })
-            .into()
+        }
+    }
+
+    /// The page area painted offscreen, small, for the page-switch pixelation.
+    pub fn page_mosaic(&self) -> Option<std::sync::Arc<tacho::Mosaic>> {
+        use iced::advanced::{Layout, Renderer as _, graphics::Viewport};
+        let area = tacho::page_area()?;
+        let (w, h) = ((area.width / tacho::MOSAIC_CELL).ceil() as u32, (area.height / tacho::MOSAIC_CELL).ceil() as u32);
+        let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
+        let mut tree = iced::advanced::widget::Tree::empty();
+        let mut element = self.body();
+        tree.diff(element.as_widget());
+        let layout = element.as_widget_mut().layout(&mut tree, &renderer, &iced::advanced::layout::Limits::new(Size::ZERO, area));
+        let full = iced::Rectangle::with_size(area);
+        renderer.reset(full);
+        element.as_widget().draw(&tree, &mut renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&layout), iced::mouse::Cursor::Unavailable, &full);
+        let mut pixels = tiny_skia::Pixmap::new(w, h)?;
+        let mut mask = tiny_skia::Mask::new(w, h)?;
+        renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(Size::new(w, h), 1.0 / tacho::MOSAIC_CELL), &[full], BG);
+        // The renderer writes BGRA.
+        let cells = pixels.data().as_chunks::<4>().0.iter().map(|p| [p[2], p[1], p[0]]).collect();
+        Some(std::sync::Arc::new(tacho::Mosaic { width: w as usize, height: h as usize, cells }))
     }
 
     /// Left rail: what the app does, in order of use; settings and a ready update at the bottom.
     fn rail(&self) -> Element<'_, Msg> {
         let item = |glyph: &'static str, name: &'static str, page: u8, selected: bool| {
             let focused = self.focus == focus::tab(page);
+            // The row fills the 40 px button and centres vertically; the glyph gets a fixed,
+            // centred cell so icons of different widths line the labels up.
             button(focus_target(
                 row![
-                    icon(glyph, 15, if selected { ORANGE } else { DIM }),
+                    container(icon(glyph, 15, if selected { ORANGE } else { DIM })).center(18),
                     label(name, 14, if selected { INK } else { DIM }),
                 ]
-                .spacing(12)
+                .spacing(11)
+                .height(Length::Fill)
                 .align_y(iced::Center),
                 focused,
-            ))
+            )
+            .height(Length::Fill))
             .width(Length::Fill)
             .height(40)
             .padding([0, 12])
@@ -758,8 +784,9 @@ impl App {
 
         let before = self.in_peak;
         let after = self.peak;
-        // From −90 dB: a quiet microphone's own hiss (about −70…−80 dB) already shows.
-        let level = |p: f32| ((db(p) + 90.0) / 90.0).clamp(0.0, 1.0);
+        // From −72 dB: the raw microphone's hiss (about −60 dB) shows on «До», while what is
+        // left after the denoiser (around −80 dB) reads as silence on «После».
+        let level = |p: f32| ((db(p) + 72.0) / 72.0).clamp(0.0, 1.0);
         let meters = card(
             column![
                 row![label("До", 12, DIM).width(56), tacho::level_meter(level(before), true, Color::from_rgb8(0x8A, 0x8B, 0x92)), container(numbers(db_text(before), 12, DIM)).align_right(64)]
@@ -2049,10 +2076,11 @@ impl App {
         ]
         .spacing(8);
         let diagnostics = column![
+            numbers(format!("NVIDIA {:.2} мс   очередь {:.1} мс", self.snapshot.process_ms, self.snapshot.queue_ms), 13, DIM),
             numbers(
                 format!(
-                    "NVIDIA {:.2} мс   очередь {:.1} мс   пропуски {} / {}   pitch {:.1} мс (макс {:.2} мс)",
-                    self.snapshot.process_ms, self.snapshot.queue_ms, self.snapshot.underruns, self.snapshot.drops, self.snapshot.pitch_delay_ms, self.snapshot.pitch_max_ms
+                    "пропуски {} / {}   pitch {:.1} мс (макс {:.2} мс)",
+                    self.snapshot.underruns, self.snapshot.drops, self.snapshot.pitch_delay_ms, self.snapshot.pitch_max_ms
                 ),
                 13,
                 DIM,
@@ -2067,13 +2095,25 @@ impl App {
             .align_y(iced::Center),
         ]
         .spacing(8);
+        // Two columns under the device card, so the page fits the default window unscrolled.
         column![
             title("Настройки"),
             card(column![heading_row(glyph::MIC, "Микрофон и выход", Space::new().into()), route].spacing(10)),
-            card(column![heading_row(glyph::REFRESH, "Запуск", Space::new().into()), startup].spacing(10)),
-            card(column![heading_row(glyph::OUTPUT, "Виртуальный микрофон", Space::new().into()), device].spacing(10)),
-            card(column![heading_row(glyph::SAVE, "Обновления", Space::new().into()), updates].spacing(10)),
-            card(column![heading_row(glyph::CHIP, "Диагностика", Space::new().into()), diagnostics].spacing(10)),
+            row![
+                column![
+                    card(column![heading_row(glyph::REFRESH, "Запуск", Space::new().into()), startup].spacing(10)),
+                    card(column![heading_row(glyph::SAVE, "Обновления", Space::new().into()), updates].spacing(10)),
+                ]
+                .spacing(14)
+                .width(Length::FillPortion(1)),
+                column![
+                    card(column![heading_row(glyph::OUTPUT, "Виртуальный микрофон", Space::new().into()), device].spacing(10)),
+                    card(column![heading_row(glyph::CHIP, "Диагностика", Space::new().into()), diagnostics].spacing(10)),
+                ]
+                .spacing(14)
+                .width(Length::FillPortion(1)),
+            ]
+            .spacing(14),
         ]
         .spacing(14)
         .into()
@@ -2240,6 +2280,51 @@ mod tests {
         // Same damage grouping and rasterizer as the window compositor; excludes OS presentation.
     }
     /// Renders every page headlessly: `MNR_DESIGN_DIR=<dir> cargo test design_snapshots -- --ignored`.
+    /// Frames of the page-switch pixelation, with their draw + raster time.
+    #[test]
+    #[ignore]
+    fn page_shift_frames() {
+        use iced::advanced::{Renderer as _, Layout, graphics::Viewport};
+        let dir = PathBuf::from(std::env::var("MNR_DESIGN_DIR").expect("MNR_DESIGN_DIR"));
+        let (w, h) = (1040.0_f32, 740.0_f32);
+        let size = Size::new(w as u32, h as u32);
+        let full = iced::Rectangle::with_size(Size::new(w, h));
+        let frame = |app: &App| {
+            let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
+            let mut tree = iced::advanced::widget::Tree::empty();
+            let mut element = app.view(window::Id::unique());
+            tree.diff(element.as_widget());
+            let layout = element.as_widget_mut().layout(&mut tree, &renderer, &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(w, h)));
+            let start = Instant::now();
+            renderer.reset(full);
+            element.as_widget().draw(&tree, &mut renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&layout), iced::mouse::Cursor::Unavailable, &full);
+            let mut pixels = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
+            let mut mask = tiny_skia::Mask::new(size.width, size.height).unwrap();
+            renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, 1.0), &[full], BG);
+            (pixels, start.elapsed().as_secs_f64() * 1000.0)
+        };
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.window = Some(window::Id::unique());
+        let _ = frame(&app); // lays out the page area
+        let started = Instant::now();
+        let from = app.page_mosaic().unwrap();
+        app.effects_page = true;
+        let to = app.page_mosaic().unwrap();
+        eprintln!("two offscreen pages: {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        for ms in [0u64, 60, 120, 169, 200, 260, 330, 370] {
+            app.page_shift = Some((from.clone(), to.clone(), Instant::now() - Duration::from_millis(ms)));
+            let (pixels, took) = frame(&app);
+            eprintln!("frame at {ms} ms: {took:.1} ms");
+            let mut data = pixels.data().to_vec();
+            for px in data.as_chunks_mut::<4>().0 {
+                px.swap(0, 2);
+            }
+            let mut encoder = png::Encoder::new(std::fs::File::create(dir.join(format!("shift-{ms:03}.png"))).unwrap(), size.width, size.height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&data).unwrap();
+        }
+    }
     #[test]
     #[ignore]
     fn design_snapshots() {

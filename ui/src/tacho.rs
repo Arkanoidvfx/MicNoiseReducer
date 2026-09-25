@@ -1033,8 +1033,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Keycap {
     }
 }
 
-/// The До / После level bars. The raw microphone is drawn as ragged, flickering bars with
-/// static over the empty part; the denoised output as crisp slanted segments in the sliders'
+/// The До / После level bars. The raw microphone is drawn as ragged, gently flickering bars; the denoised output as crisp slanted segments in the sliders'
 /// style, with a glowing head and a peak mark that holds, then sinks. `level` is 0..1.
 pub fn level_meter<'a, Message: 'a>(level: f32, noisy: bool, color: Color) -> Element<'a, Message> {
     Element::new(LevelMeter { level: level.clamp(0.0, 1.0), noisy, color })
@@ -1127,8 +1126,9 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
             m.painted.draw(renderer, b.expand(10.0), shapes);
             return;
         }
-        // The meter redraws with every level update; the flicker frame follows real time.
-        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| (d.as_millis() / 70) as u32);
+        // The meter redraws with every level update; the flicker frame follows real time,
+        // slow enough to read as a restless signal rather than strobing.
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| (d.as_millis() / 160) as u32);
         const BARS: u32 = 60;
         let gap = 2.0;
         let w = (b.width - gap * (BARS - 1) as f32) / BARS as f32;
@@ -1138,19 +1138,182 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
             let r = grain(i, t);
             if i < lit {
                 // Ragged heights and uneven brightness: hiss, not a clean signal.
-                let h = METER_H * (0.35 + 0.65 * r);
-                let k = 0.75 + 0.5 * grain(i + 97, t);
+                let h = METER_H * (0.55 + 0.45 * r);
+                let k = 0.85 + 0.3 * grain(i + 97, t);
                 let c = Color { r: (self.color.r * k).min(1.0), g: (self.color.g * k).min(1.0), b: (self.color.b * k).min(1.0), a: 1.0 };
                 renderer.fill_quad(Quad { bounds: Rectangle { x, y: b.y + (METER_H - h) / 2.0, width: w, height: h }, ..Quad::default() }, c);
             } else {
                 renderer.fill_quad(Quad { bounds: Rectangle { x, y: b.y + METER_H / 2.0 - 1.0, width: w, height: 2.0 }, ..Quad::default() }, track);
-                // Static over the empty part.
-                if r > 0.62 {
-                    let y = b.y + 1.0 + (METER_H - 4.0) * grain(i + 211, t);
-                    renderer.fill_quad(Quad { bounds: Rectangle { x, y, width: w, height: 2.0 }, ..Quad::default() }, Color { a: 0.35, ..self.color });
-                }
             }
         }
+    }
+}
+
+/// The app mark from the design canvas: grey noise specks on the left turning into clean orange
+/// voice bars on a dark tile. The bars rise a little with the output `level` (0..1).
+pub fn logo<'a, Message: 'a>(size: f32, level: f32) -> Element<'a, Message> {
+    Element::new(Logo { size, level: level.clamp(0.0, 1.0) })
+}
+struct Logo {
+    size: f32,
+    level: f32,
+}
+/// x, y, w, h, corner radius and grey level on the mark's 64-unit grid; grey 0 means orange.
+const LOGO_BARS: [(f32, f32, f32, f32, f32, u8); 9] = [
+    (8.0, 29.0, 4.0, 4.0, 1.0, 0x4A),
+    (13.0, 21.0, 4.0, 4.0, 1.0, 0x5E),
+    (13.0, 37.0, 3.0, 3.0, 1.0, 0x5E),
+    (18.0, 28.0, 4.0, 4.0, 1.0, 0x7A),
+    (24.0, 20.0, 5.0, 10.0, 2.5, 0x8E),
+    (24.0, 33.0, 5.0, 11.0, 2.5, 0x8E),
+    (33.0, 24.0, 6.0, 16.0, 3.0, 0),
+    (42.0, 13.0, 6.0, 38.0, 3.0, 0),
+    (51.0, 20.0, 6.0, 24.0, 3.0, 0),
+];
+impl<Message> Widget<Message, Theme, Renderer> for Logo {
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fixed(self.size), height: Length::Fixed(self.size) }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fixed(self.size), Length::Fixed(self.size))
+    }
+    fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let b = layout.bounds();
+        let k = self.size / 64.0;
+        renderer.fill_quad(
+            Quad { bounds: b, border: Border { color: Color::from_rgb8(0x2A, 0x2B, 0x30), width: 1.0, radius: (14.0 * k).into() }, ..Quad::default() },
+            Color::from_rgb8(0x1B, 0x1C, 0x1F),
+        );
+        for (x, y, w, h, r, grey) in LOGO_BARS {
+            let (y, h, color) = if grey == 0 {
+                // Voice bars grow about their centre with the level, never past the tile.
+                let grown = (h * (1.0 + 0.4 * self.level)).min(54.0);
+                (y + (h - grown) / 2.0, grown, TAG)
+            } else {
+                (y, h, Color::from_rgb8(grey, grey + 1, grey + 7))
+            };
+            renderer.fill_quad(
+                Quad {
+                    bounds: Rectangle { x: b.x + x * k, y: b.y + y * k, width: w * k, height: h * k },
+                    border: Border { radius: (r * k).into(), ..Border::default() },
+                    snap: false,
+                    ..Quad::default()
+                },
+                color,
+            );
+        }
+    }
+}
+
+/// A page painted offscreen at 1/[`MOSAIC_CELL`] scale: one RGB cell per 4×4 logical px.
+pub struct Mosaic {
+    pub width: usize,
+    pub height: usize,
+    pub cells: Vec<[u8; 3]>,
+}
+pub const MOSAIC_CELL: f32 = 4.0;
+const SHIFT_OUT_MS: f32 = 170.0;
+const SHIFT_IN_MS: f32 = 210.0;
+const BLOCK_MAX: f32 = 48.0;
+/// The page area's last laid-out size, so pages can be painted offscreen at the same size.
+// ponytail: one window, one page area; a per-window map if the UI ever opens a second one.
+static PAGE_AREA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn page_area() -> Option<Size> {
+    let v = PAGE_AREA.load(std::sync::atomic::Ordering::Relaxed);
+    let size = Size::new(f32::from_bits((v >> 32) as u32), f32::from_bits(v as u32));
+    (size.width >= 1.0 && size.height >= 1.0).then_some(size)
+}
+
+/// The page switch: the old page pixelates into big blocks, then the new one resolves out of
+/// them. `shift` holds both pages and the start; `done` is sent when it has played out.
+pub fn page_shift<'a, Message: Clone + 'a>(shift: Option<&(std::sync::Arc<Mosaic>, std::sync::Arc<Mosaic>, Instant)>, done: Message) -> Element<'a, Message> {
+    Element::new(PageShift { shift: shift.cloned(), done })
+}
+struct PageShift<Message> {
+    shift: Option<(std::sync::Arc<Mosaic>, std::sync::Arc<Mosaic>, Instant)>,
+    done: Message,
+}
+impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fill, height: Length::Fill }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        let node = layout::atomic(limits, Length::Fill, Length::Fill);
+        let size = node.size();
+        PAGE_AREA.store(((size.width.to_bits() as u64) << 32) | size.height.to_bits() as u64, std::sync::atomic::Ordering::Relaxed);
+        node
+    }
+    fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        if let (Event::Window(window::Event::RedrawRequested(now)), Some((_, _, start))) = (event, &self.shift) {
+            if now.saturating_duration_since(*start).as_secs_f32() * 1000.0 >= SHIFT_OUT_MS + SHIFT_IN_MS {
+                shell.publish(self.done.clone());
+            } else {
+                shell.request_redraw_at(RedrawRequest::NextFrame);
+            }
+        }
+    }
+    fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let Some((from, to, start)) = &self.shift else { return };
+        let b = layout.bounds();
+        let ms = Instant::now().saturating_duration_since(*start).as_secs_f32() * 1000.0;
+        let ease = |x: f32| x * x * (3.0 - 2.0 * x);
+        let (page, block, alpha) = if ms < SHIFT_OUT_MS {
+            let p = ms / SHIFT_OUT_MS;
+            (from, MOSAIC_CELL + (BLOCK_MAX - MOSAIC_CELL) * p * p, 1.0)
+        } else {
+            let p = ((ms - SHIFT_OUT_MS) / SHIFT_IN_MS).min(1.0);
+            // The last stretch fades over the real, sharp page underneath.
+            (to, BLOCK_MAX - (BLOCK_MAX - MOSAIC_CELL) * ease(p), ((1.0 - p) / 0.3).min(1.0))
+        };
+        let k = ((block / MOSAIC_CELL).round() as usize).max(1);
+        let side = k as f32 * MOSAIC_CELL;
+        let (cols, rows) = (page.width.div_ceil(k), page.height.div_ceil(k));
+        renderer.with_layer(b, |renderer| {
+            for row in 0..rows {
+                // Average each k×k group of cells, then merge equal neighbours into one quad:
+                // flat backgrounds cost one quad per row instead of one per block.
+                let mut run: Option<(usize, [u8; 3])> = None;
+                for col in 0..=cols {
+                    let color = (col < cols).then(|| {
+                        let mut sum = [0u32; 3];
+                        let mut count = 0;
+                        for y in row * k..((row + 1) * k).min(page.height) {
+                            for x in col * k..((col + 1) * k).min(page.width) {
+                                let c = page.cells[y * page.width + x];
+                                for i in 0..3 {
+                                    sum[i] += c[i] as u32;
+                                }
+                                count += 1;
+                            }
+                        }
+                        sum.map(|v| (v / count.max(1)) as u8)
+                    });
+                    let same = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 3);
+                    match (run, color) {
+                        (Some((_, c)), Some(next)) if same(c, next) => {}
+                        (current, next) => {
+                            if let Some((first, c)) = current {
+                                renderer.fill_quad(
+                                    Quad {
+                                        bounds: Rectangle {
+                                            x: b.x + first as f32 * side,
+                                            y: b.y + row as f32 * side,
+                                            // A hair of overlap hides anti-aliased seams.
+                                            width: (col - first) as f32 * side + 0.6,
+                                            height: side + 0.6,
+                                        },
+                                        snap: false,
+                                        ..Quad::default()
+                                    },
+                                    Color { a: alpha, ..Color::from_rgb8(c[0], c[1], c[2]) },
+                                );
+                            }
+                            run = next.map(|c| (col, c));
+                        }
+                    }
+                }
+            }
+        });
     }
 }
 

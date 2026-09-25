@@ -392,6 +392,11 @@ fn set_app_autostart(enabled: bool) -> Result<(), String> {
     }
 }
 
+fn tag_autostart_default(settings: &Settings, current: bool) -> bool {
+    // A missing settings file is a new install. Existing installs keep their task setting.
+    settings.number("ui", "tag_autostart", if settings.path.exists() { current as i32 } else { 1 }, 0, 1) != 0
+}
+
 #[derive(Debug, Clone)]
 enum Msg {
     HeadphonePanel(bool),
@@ -412,6 +417,7 @@ enum Msg {
     WindowFocus(window::Id, bool),
     /// Windows minimized the window (0×0 resize), e.g. a taskbar click on the active window.
     Minimized(window::Id),
+    Restored(window::Id),
     MinimizedState(window::Id, Option<bool>),
     Hide,
     Show,
@@ -521,6 +527,8 @@ enum Msg {
     AcceptBind,
     Key(keyboard::Key, keyboard::Modifiers, bool),
     Noop,
+    /// The page-switch pixelation has played out.
+    PageShiftDone,
     Screenshot(window::Screenshot),
 }
 /// Which sidebar entry filters the clip list.
@@ -596,6 +604,8 @@ struct App {
     in_peak: f32,
     /// Bound keys held right now (bitset by virtual-key code), for the pressed keycaps.
     keys_down: [u64; 4],
+    /// The old and new page, painted small, while the page switch pixelates between them.
+    page_shift: Option<(std::sync::Arc<tacho::Mosaic>, std::sync::Arc<tacho::Mosaic>, Instant)>,
     headphone_output: Option<Device>,
     headphone_denoise: bool,
     headphone_intensity: f32,
@@ -918,6 +928,9 @@ impl App {
         let core_installing = !cfg!(test)
             && (!components::core_installed(&runtime_root)
                 || arch.as_ref().is_some_and(|a| !components::models_installed(&runtime_root, a)));
+        let tag_task_enabled = !cfg!(test) && engine::tag_autostart(-1).unwrap_or(false);
+        let autostart = tag_autostart_default(&settings, tag_task_enabled);
+        let autostart_busy = !cfg!(test) && !core_installing && autostart != tag_task_enabled;
         if !cfg!(test) {
             logs::note(
                 &runtime_root,
@@ -999,6 +1012,7 @@ impl App {
                 opened_at: None,
                 in_peak: 0.0,
                 keys_down: [0; 4],
+                page_shift: None,
                 headphone_output: None,
                 headphone_denoise,
                 headphone_intensity,
@@ -1084,8 +1098,8 @@ impl App {
                 focus_visible: false,
                 dirty: None,
                 hint_shown,
-                autostart: !cfg!(test) && engine::tag_autostart(-1).unwrap_or(false),
-                autostart_busy: false,
+                autostart,
+                autostart_busy,
                 task_warning: String::new(),
                 app_autostart,
                 tray_ok: true,
@@ -1118,6 +1132,11 @@ impl App {
                         async move { components::install_core(&component_root, arch.as_deref()) },
                         Msg::CoreInstalled,
                     )
+                } else {
+                    Task::none()
+                },
+                if autostart_busy {
+                    Task::perform(async move { engine::tag_autostart(i32::from(autostart)) }, Msg::AutostartUpdated)
                 } else {
                     Task::none()
                 },
@@ -1212,6 +1231,7 @@ impl App {
         }
         self.settings.set("ui", "tray_hint", self.hint_shown as i32);
         self.settings.set("ui", "app_autostart", self.app_autostart as i32);
+        self.settings.set("ui", "tag_autostart", self.autostart as i32);
         if let Some(folder) = &self.sound_folder {
             self.settings
                 .set("soundpad", "folder", folder.to_string_lossy());
@@ -1273,6 +1293,9 @@ impl App {
     }
     fn running(&self) -> bool {
         matches!(self.snapshot.state, 1..=4)
+    }
+    fn page_key(&self) -> [bool; 5] {
+        [self.soundpad_page, self.logs_page, self.details, self.rvc_page, self.effects_page]
     }
     fn ui_active(&self) -> bool {
         self.window.is_some() && self.window_focused
@@ -1978,7 +2001,7 @@ impl App {
                 }
                 if let Some(id) = self
                     .window
-                    .filter(|_| !self.window_focused && !self.own_minimize && self.tray_ok)
+                    .filter(|_| !self.own_minimize && self.tray_ok)
                 {
                     return Task::batch([
                         next,
@@ -2001,6 +2024,11 @@ impl App {
                 // Like OBS: clicking the taskbar icon of the active window hides it to tray.
                 if self.window == Some(id) && !self.own_minimize {
                     return self.update(Msg::Hide);
+                }
+            }
+            Msg::Restored(id) => {
+                if self.window == Some(id) {
+                    self.own_minimize = false;
                 }
             }
             Msg::MinimizedState(id, Some(true)) => {
@@ -2197,6 +2225,8 @@ impl App {
                 if self.binding.is_some() {
                     let _ = self.update(Msg::CancelBind);
                 }
+                let before = self.page_key();
+                let from = (!cfg!(test) && self.ui_active()).then(|| self.page_mosaic()).flatten();
                 self.soundpad_page = page == 4;
                 // Page 3 is no longer a page: the headphone panel opens over Шумодав.
                 self.headphone_page = page == 3;
@@ -2207,6 +2237,10 @@ impl App {
                 self.effects_page = page == 6;
                 self.reverse_edit = false;
                 self.focus = focus::NONE;
+                // Only a real page change pixelates; re-selecting the same page stays still.
+                self.page_shift = from
+                    .filter(|_| self.page_key() != before)
+                    .and_then(|from| Some((from, self.page_mosaic()?, Instant::now())));
                 let snap = iced::widget::operation::snap_to(
                     "body",
                     iced::widget::scrollable::RelativeOffset::START,
@@ -2325,7 +2359,7 @@ impl App {
             Msg::AutostartUpdated(result) => {
                 self.autostart_busy = false;
                 match result {
-                    Ok(enabled) => self.autostart = enabled,
+                    Ok(enabled) => { self.autostart = enabled; self.save(); }
                     Err(e) => self.message = format!("Автозапуск не изменён: {e}"),
                 }
             }
@@ -2476,6 +2510,11 @@ impl App {
                         self.log_message();
                         self.driver_ready=false;
                         self.message="Установите виртуальный микрофон кнопкой в настройках; Windows запросит права администратора.".into();
+                    }
+                    if !self.autostart_busy && engine::tag_autostart(-1).ok() != Some(self.autostart) {
+                        self.autostart_busy = true;
+                        let enabled = self.autostart;
+                        return Task::perform(async move { engine::tag_autostart(i32::from(enabled)) }, Msg::AutostartUpdated);
                     }
                 }
             }
@@ -3192,6 +3231,7 @@ impl App {
                 }
             }
             Msg::Noop => {}
+            Msg::PageShiftDone => self.page_shift = None,
         }
         Task::none()
     }
@@ -3721,6 +3761,9 @@ impl App {
                     {
                         return Some(Msg::Minimized(id));
                     }
+                    iced::Event::Window(window::Event::Resized(_)) => {
+                        return Some(Msg::Restored(id));
+                    }
                     _ => {}
                 }
                 match event {
@@ -3831,6 +3874,16 @@ fn main() {
 #[cfg(test)]
 mod controller_tests {
     use super::*;
+    #[test]
+    fn tag_autostart_defaults_on_only_for_new_installs() {
+        let mut settings = Settings::for_test("");
+        assert!(tag_autostart_default(&settings, false));
+        settings.path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert!(!tag_autostart_default(&settings, false));
+        assert!(tag_autostart_default(&settings, true));
+        settings.set("ui", "tag_autostart", 0);
+        assert!(!tag_autostart_default(&settings, true));
+    }
     #[test]
     fn repair_requires_confirmation_and_exit_prevents_resume() {
         use keyboard::{Key,Modifiers,key::Named};
@@ -4039,8 +4092,17 @@ mod controller_tests {
         assert_eq!(app.window, Some(id), "the title-bar minimize stays in the taskbar");
         let _ = app.update(Msg::Minimized(id));
         assert_eq!(app.window, Some(id), "repeat resize cannot hide the title-bar minimize");
+        let _ = app.update(Msg::Restored(id));
+        assert!(!app.own_minimize, "restoring through the taskbar clears the title-bar minimize latch");
+        let _ = app.update(Msg::Minimized(id));
+        assert_eq!(app.hidden_window, Some(id), "the next taskbar click hides even without a focus event");
+        let _ = app.update(Msg::Show);
         let _ = app.update(Msg::WindowFocus(id, true));
         assert!(app.ui_active());
+        let _ = app.update(Msg::MinimizedState(id, Some(true)));
+        assert_eq!(app.hidden_window, Some(id), "a missed focus and resize event still hides to tray");
+        let _ = app.update(Msg::Show);
+        let _ = app.update(Msg::WindowFocus(id, true));
         let _ = app.update(Msg::WindowFocus(id, false));
         let _ = app.update(Msg::MinimizedState(id, Some(false)));
         assert_eq!(app.window, Some(id), "losing focus alone does not hide the window");
