@@ -100,7 +100,7 @@ The first transition from the published 0.2.5 uses `MicNoize-Upgrade-<version>.z
 
 "Выпусти обнову" means all of this, without asking again:
 
-1. Local checks for what changed (at least `cargo test --release --locked`; native checks for C++ changes). The local release command reruns full `verify.ps1` before packaging.
+1. Local checks for what changed (at least `cargo test --release --locked`; native checks for C++ changes). For UI-only checks, set `$env:CARGO_TARGET_DIR = Join-Path $project 'build\rust'` and `$env:CARGO_HOME = Join-Path $project '.cache\cargo'` before Cargo, matching `verify.ps1`; a standalone Clippy run is redundant because the release runner runs it. The local release command reruns full `verify.ps1` before packaging.
 2. Bump the patch version in `release/version.txt`, `ui/Cargo.toml` and the `micnoize` entry of `ui/Cargo.lock` (all three, or `--locked` fails).
 3. Rewrite `release/notes.md` (Russian, user-facing: what changed for the user, what is not verified). It becomes the GitHub Release text.
 4. `CHANGELOG.md`: dated `патч X.Y.Z` entry listing what the release contains.
