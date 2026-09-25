@@ -506,9 +506,11 @@ impl App {
             ..Default::default()
         });
 
+        // Under an opaque mosaic the page is not drawn at all; it returns as the mosaic fades.
+        let page: Element<'_, Msg> = if self.page_shift.is_some() && !self.page_shift_revealed { Space::new().into() } else { self.body() };
         let body = widget::stack![
-            self.body(),
-            tacho::page_shift(self.page_shift.as_ref(), Msg::PageShiftDone),
+            page,
+            tacho::page_shift(self.page_shift.as_ref(), Msg::PageShiftReveal, Msg::PageShiftDone),
         ]
         .width(Length::Fill)
         .height(Length::Fill);
@@ -2486,9 +2488,7 @@ mod tests {
             for step in 0..24u64 {
                 app.page_shift = Some((from.clone(), to.clone(), begin - Duration::from_millis(step * 16)));
                 let (regions, took) = windowed(&app, &mut tree, &mut previous, &mut renderer, &mut pixels);
-                if step % 4 == 0 {
-                    eprintln!("windowed frame {step}: {regions} damage regions, {took:.1} ms");
-                }
+                eprintln!("windowed frame {:3} ms: {regions} damage regions, {took:.1} ms", step * 16);
             }
         }
         for ms in [0u64, 60, 120, 169, 200, 260, 330, 370] {

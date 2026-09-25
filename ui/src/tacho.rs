@@ -1226,14 +1226,25 @@ pub fn page_area() -> Option<Size> {
 
 /// The page switch: the old page pixelates into big blocks, then the new one resolves out of
 /// them. `shift` holds both pages and the start; `done` is sent when it has played out.
-pub fn page_shift<'a, Message: Clone + 'a>(shift: Option<&(std::sync::Arc<Mosaic>, std::sync::Arc<Mosaic>, Instant)>, done: Message) -> Element<'a, Message> {
-    Element::new(PageShift { shift: shift.cloned(), done })
+/// `reveal` is sent when the mosaic starts to fade: until then it hides the page completely, so the
+/// page underneath need not be drawn at all.
+pub fn page_shift<'a, Message: Clone + 'a>(shift: Option<&(std::sync::Arc<Mosaic>, std::sync::Arc<Mosaic>, Instant)>, reveal: Message, done: Message) -> Element<'a, Message> {
+    Element::new(PageShift { shift: shift.cloned(), reveal, done })
 }
 struct PageShift<Message> {
     shift: Option<(std::sync::Arc<Mosaic>, std::sync::Arc<Mosaic>, Instant)>,
+    reveal: Message,
     done: Message,
 }
+/// When the new page starts to show through the fading mosaic.
+const SHIFT_REVEAL_MS: f32 = SHIFT_OUT_MS + SHIFT_IN_MS * 0.7;
+#[derive(Default)]
+struct ShiftState {
+    revealed: Option<Instant>,
+}
 impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<ShiftState>() }
+    fn state(&self) -> tree::State { tree::State::new(ShiftState::default()) }
     fn size(&self) -> Size<Length> {
         Size { width: Length::Fill, height: Length::Fill }
     }
@@ -1243,9 +1254,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
         PAGE_AREA.store(((size.width.to_bits() as u64) << 32) | size.height.to_bits() as u64, std::sync::atomic::Ordering::Relaxed);
         node
     }
-    fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+    fn update(&mut self, tree: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
         if let (Event::Window(window::Event::RedrawRequested(now)), Some((_, _, start))) = (event, &self.shift) {
-            if now.saturating_duration_since(*start).as_secs_f32() * 1000.0 >= SHIFT_OUT_MS + SHIFT_IN_MS {
+            let ms = now.saturating_duration_since(*start).as_secs_f32() * 1000.0;
+            let state = tree.state.downcast_mut::<ShiftState>();
+            if ms >= SHIFT_REVEAL_MS && state.revealed != Some(*start) {
+                state.revealed = Some(*start);
+                shell.publish(self.reveal.clone());
+            }
+            if ms >= SHIFT_OUT_MS + SHIFT_IN_MS {
                 shell.publish(self.done.clone());
             } else {
                 shell.request_redraw_at(RedrawRequest::NextFrame);
@@ -1256,59 +1273,49 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
         let Some((from, to, start)) = &self.shift else { return };
         let b = layout.bounds();
         let ms = Instant::now().saturating_duration_since(*start).as_secs_f32() * 1000.0;
-        let ease = |x: f32| x * x * (3.0 - 2.0 * x);
         let (page, block, alpha) = if ms < SHIFT_OUT_MS {
+            // Blocks grow at an even pace, so every frame shows a new size.
             let p = ms / SHIFT_OUT_MS;
-            (from, MOSAIC_CELL + (BLOCK_MAX - MOSAIC_CELL) * p * p, 1.0)
+            (from, MOSAIC_CELL + (BLOCK_MAX - MOSAIC_CELL) * p, 1.0)
         } else {
+            // Coarse blocks resolve quickly, the fine last steps settle gently; the last stretch
+            // fades over the real, sharp page underneath.
             let p = ((ms - SHIFT_OUT_MS) / SHIFT_IN_MS).min(1.0);
-            // The last stretch fades over the real, sharp page underneath.
-            (to, BLOCK_MAX - (BLOCK_MAX - MOSAIC_CELL) * ease(p), ((1.0 - p) / 0.3).min(1.0))
+            (to, BLOCK_MAX - (BLOCK_MAX - MOSAIC_CELL) * (1.0 - (1.0 - p).powi(3)), ((1.0 - p) / (1.0 - 0.7)).min(1.0))
         };
-        let k = ((block / MOSAIC_CELL).round() as usize).max(1);
-        let side = k as f32 * MOSAIC_CELL;
-        let (cols, rows) = (page.width.div_ceil(k), page.height.div_ceil(k));
+        // Any whole-pixel block size, sampled from the fixed small mosaic: the picture changes on
+        // every frame instead of in 4 px jumps, which read as a low frame rate.
+        let side = block.round().max(MOSAIC_CELL);
+        let (cols, rows) = ((b.width / side).ceil() as usize, (b.height / side).ceil() as usize);
         // One cached geometry for the whole mosaic: the window then repaints a single region per
         // frame. Thousands of separate quads made it repaint the page dozens of times a frame.
         let mut shapes = Vec::new();
-        {
-            for row in 0..rows {
-                // Average each k×k group of cells, then merge equal neighbours into one shape:
-                // flat backgrounds cost one per row instead of one per block.
-                let mut run: Option<(usize, [u8; 3])> = None;
-                for col in 0..=cols {
-                    let color = (col < cols).then(|| {
-                        let mut sum = [0u32; 3];
-                        let mut count = 0;
-                        for y in row * k..((row + 1) * k).min(page.height) {
-                            for x in col * k..((col + 1) * k).min(page.width) {
-                                let c = page.cells[y * page.width + x];
-                                for i in 0..3 {
-                                    sum[i] += c[i] as u32;
-                                }
-                                count += 1;
-                            }
+        for row in 0..rows {
+            // Merge equal neighbours into one shape: flat backgrounds cost one per row.
+            let mut run: Option<(usize, [u8; 3])> = None;
+            for col in 0..=cols {
+                let color = (col < cols).then(|| {
+                    let (u0, v0) = (col as f32 * side / b.width, row as f32 * side / b.height);
+                    let (u1, v1) = (((col + 1) as f32 * side / b.width).min(1.0), ((row + 1) as f32 * side / b.height).min(1.0));
+                    sample(page, u0, v0, u1, v1).map(|v| v.round() as u8)
+                });
+                let same = |a: [u8; 3], z: [u8; 3]| a.iter().zip(z).all(|(x, y)| x.abs_diff(y) <= 3);
+                match (run, color) {
+                    (Some((_, c)), Some(next)) if same(c, next) => {}
+                    (current, next) => {
+                        if let Some((first, c)) = current {
+                            // A hair of overlap hides anti-aliased seams.
+                            slant(
+                                &mut shapes,
+                                b.x + first as f32 * side,
+                                b.y + row as f32 * side,
+                                (col - first) as f32 * side + 0.6,
+                                side + 0.6,
+                                0.0,
+                                Color { a: alpha, ..Color::from_rgb8(c[0], c[1], c[2]) },
+                            );
                         }
-                        sum.map(|v| (v / count.max(1)) as u8)
-                    });
-                    let same = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 3);
-                    match (run, color) {
-                        (Some((_, c)), Some(next)) if same(c, next) => {}
-                        (current, next) => {
-                            if let Some((first, c)) = current {
-                                // A hair of overlap hides anti-aliased seams.
-                                slant(
-                                    &mut shapes,
-                                    b.x + first as f32 * side,
-                                    b.y + row as f32 * side,
-                                    (col - first) as f32 * side + 0.6,
-                                    side + 0.6,
-                                    0.0,
-                                    Color { a: alpha, ..Color::from_rgb8(c[0], c[1], c[2]) },
-                                );
-                            }
-                            run = next.map(|c| (col, c));
-                        }
+                        run = next.map(|c| (col, c));
                     }
                 }
             }
@@ -1515,7 +1522,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for MorphWidget<Message> {
                 renderer.fill_quad(Quad { bounds: Rectangle { x, y, width: w, height: h }, snap: true, ..Quad::default() }, KEY);
             }
         }
-        let side = (block / MOSAIC_CELL).round().max(1.0) * MOSAIC_CELL;
+        let side = block.round().max(MOSAIC_CELL);
         let cols = (frame.width / side).ceil().max(1.0) as usize;
         let rows = (frame.height / side).ceil().max(1.0) as usize;
         for row in 0..rows {

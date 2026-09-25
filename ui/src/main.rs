@@ -555,6 +555,8 @@ enum Msg {
     Noop,
     /// The page-switch pixelation has played out.
     PageShiftDone,
+    /// The page-switch mosaic starts to fade: draw the new page under it again.
+    PageShiftReveal,
     /// «Перезапустить»: the window's position and size, to shrink it into the update window.
     DecayGeometry(Option<iced::Point>, Size),
     /// The window's native handle: colour-key it for a morph.
@@ -644,6 +646,7 @@ struct App {
     keys_down: [u64; 4],
     /// The old and new page, painted small, while the page switch pixelates between them.
     page_shift: Option<(std::sync::Arc<tacho::Mosaic>, std::sync::Arc<tacho::Mosaic>, Instant)>,
+    page_shift_revealed: bool,
     /// The update shrink («Перезапустить») or grow (first start after an update).
     morph: Option<MorphView>,
     /// The downloaded update's version, for the update window.
@@ -1071,6 +1074,7 @@ impl App {
                 in_peak: 0.0,
                 keys_down: [0; 4],
                 page_shift: None,
+                page_shift_revealed: false,
                 morph: None,
                 update_version: None,
                 intro,
@@ -2337,6 +2341,7 @@ impl App {
                 self.page_shift = from
                     .filter(|_| self.page_key() != before)
                     .and_then(|from| Some((from, self.page_mosaic()?, Instant::now())));
+                self.page_shift_revealed = false;
                 let snap = iced::widget::operation::snap_to(
                     "body",
                     iced::widget::scrollable::RelativeOffset::START,
@@ -3327,7 +3332,11 @@ impl App {
                 }
             }
             Msg::Noop => {}
-            Msg::PageShiftDone => self.page_shift = None,
+            Msg::PageShiftDone => {
+                self.page_shift = None;
+                self.page_shift_revealed = false;
+            }
+            Msg::PageShiftReveal => self.page_shift_revealed = true,
             Msg::DecayGeometry(position, size) => {
                 let Some(position) = position else { return self.hand_over(None) };
                 let center = iced::Point::new(position.x + size.width / 2.0, position.y + size.height / 2.0);
