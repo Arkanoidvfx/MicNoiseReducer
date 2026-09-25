@@ -1,8 +1,8 @@
 [CmdletBinding()]
-param([ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version, [switch]$Smoke, [switch]$DryRun)
+param([ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version, [switch]$Smoke)
 
 $ErrorActionPreference = 'Stop'
-if (@($Smoke, $DryRun, [bool]$Version | Where-Object { $_ }).Count -ne 1) { throw 'Specify exactly one of -Version, -Smoke or -DryRun.' }
+if (-not $Smoke -and -not $Version) { throw 'Specify -Version for a release or -Smoke for a runner check.' }
 $root = Split-Path -Parent $PSScriptRoot
 $repo = 'Arkanoidvfx/MicNoize'
 $runnerDir = Join-Path $root '.cache\actions-runner'
@@ -10,7 +10,7 @@ $name = 'micnoize-' + [Environment]::MachineName.ToLowerInvariant() + '-' + [gui
 $runner = $null
 $registered = $false
 
-if ($Version) { & (Join-Path $PSScriptRoot 'release-local.ps1') -Version $Version -CheckOnly }
+if (-not $Smoke) { & (Join-Path $PSScriptRoot 'release-local.ps1') -Version $Version -CheckOnly }
 if (-not (Test-Path -LiteralPath (Join-Path $runnerDir 'config.cmd'))) {
     $release = & gh api repos/actions/runner/releases/latest | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Could not find the official GitHub runner.' }
@@ -50,16 +50,14 @@ try {
     }
     if (-not $online) { throw 'Runner did not connect in 45 seconds.' }
     $ghArgs = @('workflow','run','release-local.yml','-R',$repo)
-    if ($Smoke) { $ghArgs += @('-f','smoke=true') }
-    elseif ($DryRun) { $ghArgs += @('-f','dry_run=true') }
-    else { $ghArgs += @('-f',"version=$Version") }
+    if ($Smoke) { $ghArgs += @('-f','smoke=true') } else { $ghArgs += @('-f',"version=$Version") }
     $url = & gh @ghArgs
     if ($LASTEXITCODE -ne 0 -or $url -notmatch '/runs/(\d+)') { throw 'Could not dispatch the local release workflow.' }
     $runId = $Matches[1]
     Write-Output "Local runner job: $url"
     & gh run watch $runId -R $repo --exit-status *> (Join-Path $root 'results\local-runner-job.log')
     if ($LASTEXITCODE -ne 0) { throw "Local runner job failed: $url" }
-    if ($Version) {
+    if (-not $Smoke) {
         $draft = & gh release view "v$Version" -R $repo --json isDraft --jq '.isDraft'
         if ($LASTEXITCODE -ne 0 -or $draft -ne 'false') { throw 'Published release not found.' }
     }
