@@ -331,8 +331,26 @@ fn remove_upgrade_task(j:&Journal)->Result<(),String> {
     if j.legacy.is_none(){return Err("Удаление задачи разрешено только при откате legacy-перехода".into());}
     native(|e,n|unsafe{mnr_tag_remove_task(e,n)},1).map(|_|())
 }
+fn retain_current_package(j:&Journal)->Result<(),String> {
+    let source=folder(j).join("candidate.nupkg");
+    check_hash(&source,&j.candidate_hash)?;
+    let parts:Vec<_>=j.after.version.split('.').collect();
+    if parts.len()!=3 || parts.iter().any(|part|part.is_empty() || !part.bytes().all(|b|b.is_ascii_digit())) {
+        return Err("Неверная версия полного пакета".into());
+    }
+    let packages=j.install.join("packages");
+    fs::create_dir_all(&packages).map_err(|e|e.to_string())?;
+    let destination=packages.join(format!("MicNoize-{}-win-x64-stable-v2-full.nupkg",j.after.version));
+    if destination.exists(){return check_hash(&destination,&j.candidate_hash);}
+    let pending=destination.with_extension("pending");
+    copy_synced(&source,&pending)?;
+    check_hash(&pending,&j.candidate_hash)?;
+    fs::rename(&pending,&destination).map_err(|e|e.to_string())?;
+    Ok(())
+}
 fn complete_legacy(j:&mut Journal,rollback:bool)->Result<(),String> {
     j.phase=Phase::Complete;save(j)?;
+    if !rollback{retain_current_package(j)?;}
     if rollback{legacy_runs(j,true)?;}else{write_run("MicNoize",j.legacy.as_ref().and_then(|old|old.app_login.as_deref()))?;}
     let hold=j.runtime.join(".update/hold");if hold.exists(){fs::remove_file(hold).map_err(|e|e.to_string())?;}
     j.legacy=None;save(j)?;run_recovery(None,&j.runtime)
@@ -672,7 +690,7 @@ pub fn startup() -> Result<bool,String> {
     if j.phase!=Phase::RollingBack && j.after.installed(&j.install).is_ok() {
         let hold=runtime.join(".update/hold");if hold.exists(){fs::remove_file(&hold).map_err(|e|e.to_string())?;}
         let ready=verify_ready(&runtime);
-        if ready.is_ok(){*RESUME.lock().map_err(|e|e.to_string())?=j.resume;release(&mut j)?;return Ok(true);}
+        if ready.is_ok(){retain_current_package(&j)?;*RESUME.lock().map_err(|e|e.to_string())?=j.resume;release(&mut j)?;return Ok(true);}
     }
     if j.rollback_attempts>=2{return Err("Автоматический откат не завершился. Предыдущий пакет сохранён в .update; требуется восстановление установки".into());}
     atomic(&runtime.join(".update/hold"),b"rollback")?; stop()?; task(0)?;
@@ -683,6 +701,26 @@ pub fn startup() -> Result<bool,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn migrated_package_is_cached_for_the_next_safe_update() {
+        let t=temp();let runtime=t.0.join("runtime");
+        let bytes=b"complete candidate package";
+        let candidate_hash=hash(&mut &bytes[..]).unwrap();
+        let mut j=Journal{schema:1,transaction:uuid::Uuid::new_v4().to_string(),install:t.0.clone(),runtime,
+            phase:Phase::Complete,before:bundle("0.2.5",b"old",b"old host"),after:bundle("0.2.7",b"new",b"new host"),
+            previous_hash:"a".repeat(64),candidate_hash,updater_hash:"b".repeat(64),task_enabled:true,
+            applier:None,rollback_attempts:0,resume:None,legacy:None};
+        fs::create_dir_all(folder(&j)).unwrap();
+        fs::write(folder(&j).join("candidate.nupkg"),bytes).unwrap();
+        let cached=j.install.join("packages/MicNoize-0.2.7-win-x64-stable-v2-full.nupkg");
+        retain_current_package(&j).unwrap();
+        assert_eq!(fs::read(&cached).unwrap(),bytes);
+        retain_current_package(&j).unwrap();
+        fs::write(&cached,b"corrupt").unwrap();
+        assert!(retain_current_package(&j).is_err());
+        j.after.version="../../escape".into();
+        assert!(retain_current_package(&j).is_err());
+    }
     #[test]
     fn legacy_backup_survives_package_cleanup_and_refuses_corruption() {
         let t=temp();let runtime=t.0.join("runtime");fs::create_dir_all(runtime.join("bin")).unwrap();
