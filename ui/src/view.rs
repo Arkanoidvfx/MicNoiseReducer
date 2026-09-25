@@ -234,6 +234,59 @@ fn focus_target<'a>(
         content
     }
 }
+/// Any element painted offscreen at 1/[`tacho::MOSAIC_CELL`] scale, as RGB cells.
+pub fn mosaic_of<'a, M: 'a>(mut element: Element<'a, M>, area: Size) -> Option<std::sync::Arc<tacho::Mosaic>> {
+    use iced::advanced::{Layout, Renderer as _, graphics::Viewport};
+    let (w, h) = ((area.width / tacho::MOSAIC_CELL).ceil() as u32, (area.height / tacho::MOSAIC_CELL).ceil() as u32);
+    let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
+    let mut tree = iced::advanced::widget::Tree::empty();
+    tree.diff(element.as_widget());
+    let layout = element.as_widget_mut().layout(&mut tree, &renderer, &iced::advanced::layout::Limits::new(Size::ZERO, area));
+    let full = iced::Rectangle::with_size(area);
+    renderer.reset(full);
+    element.as_widget().draw(&tree, &mut renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&layout), iced::mouse::Cursor::Unavailable, &full);
+    let mut pixels = tiny_skia::Pixmap::new(w, h)?;
+    let mut mask = tiny_skia::Mask::new(w, h)?;
+    renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(Size::new(w, h), 1.0 / tacho::MOSAIC_CELL), &[full], BG);
+    // The renderer writes BGRA.
+    let cells = pixels.data().as_chunks::<4>().0.iter().map(|p| [p[2], p[1], p[0]]).collect();
+    Some(std::sync::Arc::new(tacho::Mosaic { width: w as usize, height: h as usize, cells }))
+}
+
+/// The update window (design variant A): the app's mark, what is happening, the versions in
+/// large type and the running bar.
+pub const UPDATE_CARD: Size = Size::new(440.0, 176.0);
+pub fn update_card<'a, M: 'a>(stage: tacho::BarStage, from: &str, to: &str) -> Element<'a, M> {
+    let done = stage == tacho::BarStage::Done;
+    let (title_text, version, color) = if done {
+        ("Готово", to.to_owned(), GREEN)
+    } else {
+        ("Обновляем Mic Noize", format!("{from} → {to}"), ORANGE)
+    };
+    container(column![
+        container(row![tacho::logo(18.0, 0.0), bold("Mic Noize", 13, INK)].spacing(10).align_y(iced::Center)).padding([0, 14]).center_y(38),
+        container(Space::new().height(1)).width(Length::Fill).style(|_| container::Style { background: Some(LINE.into()), ..Default::default() }),
+        column![column![label(title_text, 14, DIM), numbers(version, 28, color)].spacing(2), tacho::run_bar(stage)]
+            .spacing(16)
+            .padding(iced::Padding { top: 18.0, right: 20.0, bottom: 22.0, left: 20.0 }),
+    ])
+    .width(UPDATE_CARD.width)
+    .height(UPDATE_CARD.height)
+    .style(|_| container::Style {
+        background: Some(Color::from_rgb8(0x15, 0x16, 0x19).into()),
+        border: Border { color: Color::from_rgb8(0x2A, 0x2B, 0x30), width: 1.0, radius: 12.0.into() },
+        ..Default::default()
+    })
+    .into()
+}
+/// The update card centred on the colour key, so a keyed window shows only the card.
+pub fn update_card_on_key<'a, M: 'a>(stage: tacho::BarStage, from: &str, to: &str) -> Element<'a, M> {
+    container(update_card(stage, from, to))
+        .center(Length::Fill)
+        .style(|_| container::Style { background: Some(tacho::KEY.into()), ..Default::default() })
+        .into()
+}
+
 /// tiny-skia repaints only damaged regions and places vertically centred control text from its
 /// anchor down, so a pick_list or text_input whose label changes would keep the top half of
 /// the old one (hovering repaints it). An invisible background that changes with the label
@@ -414,7 +467,25 @@ impl App {
         !self.details && !self.rvc_page && !self.soundpad_page && !self.logs_page && !self.effects_page
     }
 
+    /// The window: the app, with the update morph layer on top (empty unless morphing). The
+    /// layer is always there so the app's widgets keep their state when a morph starts.
     pub fn view(&self, _: window::Id) -> Element<'_, Msg> {
+        let (base, anim): (Element<'_, Msg>, _) = match &self.morph {
+            None => (self.root(), None),
+            Some(m) => (
+                match m.base {
+                    MorphBase::Root => self.root(),
+                    MorphBase::Card(stage) => update_card_on_key(stage, &m.from_version, &m.to_version),
+                    MorphBase::Key => container(Space::new()).width(Length::Fill).height(Length::Fill).style(|_| container::Style { background: Some(tacho::KEY.into()), ..Default::default() }).into(),
+                },
+                m.anim.as_ref(),
+            ),
+        };
+        widget::stack![base, tacho::morph(anim)].width(Length::Fill).height(Length::Fill).into()
+    }
+
+    /// The whole app window without any morph.
+    fn root(&self) -> Element<'_, Msg> {
         let voice = ((db(self.peak) + 72.0) / 72.0).clamp(0.0, 1.0);
         let logo = tacho::logo(26.0, voice);
         let titlebar = row![
@@ -515,25 +586,12 @@ impl App {
 
     /// The page area painted offscreen, small, for the page-switch pixelation.
     pub fn page_mosaic(&self) -> Option<std::sync::Arc<tacho::Mosaic>> {
-        use iced::advanced::{Layout, Renderer as _, graphics::Viewport};
-        let area = tacho::page_area()?;
-        let (w, h) = ((area.width / tacho::MOSAIC_CELL).ceil() as u32, (area.height / tacho::MOSAIC_CELL).ceil() as u32);
-        let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
-        let mut tree = iced::advanced::widget::Tree::empty();
-        let mut element = self.body();
-        tree.diff(element.as_widget());
-        let layout = element.as_widget_mut().layout(&mut tree, &renderer, &iced::advanced::layout::Limits::new(Size::ZERO, area));
-        let full = iced::Rectangle::with_size(area);
-        renderer.reset(full);
-        element.as_widget().draw(&tree, &mut renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&layout), iced::mouse::Cursor::Unavailable, &full);
-        let mut pixels = tiny_skia::Pixmap::new(w, h)?;
-        let mut mask = tiny_skia::Mask::new(w, h)?;
-        renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(Size::new(w, h), 1.0 / tacho::MOSAIC_CELL), &[full], BG);
-        // The renderer writes BGRA.
-        let cells = pixels.data().as_chunks::<4>().0.iter().map(|p| [p[2], p[1], p[0]]).collect();
-        Some(std::sync::Arc::new(tacho::Mosaic { width: w as usize, height: h as usize, cells }))
+        mosaic_of(self.body(), tacho::page_area()?)
     }
-
+    /// The whole window painted offscreen, small, for the update morphs.
+    pub fn window_mosaic(&self, size: Size) -> Option<std::sync::Arc<tacho::Mosaic>> {
+        mosaic_of(self.root(), size)
+    }
     /// Left rail: what the app does, in order of use; settings and a ready update at the bottom.
     fn rail(&self) -> Element<'_, Msg> {
         let item = |glyph: &'static str, name: &'static str, page: u8, selected: bool| {
@@ -2093,6 +2151,8 @@ impl App {
             ]
             .spacing(8)
             .align_y(iced::Center),
+            // Plays «Перезапустить» → update window → restart for real, without installing.
+            action(label("Проверить анимацию обновления", 13, INK), Msg::RehearseUpdate, self.focus == REHEARSE, false),
         ]
         .spacing(8);
         // Two columns under the device card, so the page fits the default window unscrolled.
@@ -2280,6 +2340,83 @@ mod tests {
         // Same damage grouping and rasterizer as the window compositor; excludes OS presentation.
     }
     /// Renders every page headlessly: `MNR_DESIGN_DIR=<dir> cargo test design_snapshots -- --ignored`.
+    #[test]
+    fn update_points_parse() {
+        assert_eq!(crate::update_window::parse_point("960.5, 540"), Some(iced::Point::new(960.5, 540.0)));
+        assert_eq!(crate::update_window::parse_point("centered"), None);
+        assert_eq!(crate::update_window::parse_point("1,NaN"), None);
+    }
+
+    /// Frames of the update shrink and grow; keyed (see-through) pixels are drawn as a checker.
+    #[test]
+    #[ignore]
+    fn update_morph_frames() {
+        use iced::advanced::{Renderer as _, Layout, graphics::Viewport};
+        let dir = PathBuf::from(std::env::var("MNR_DESIGN_DIR").expect("MNR_DESIGN_DIR"));
+        let (w, h) = (1040.0_f32, 740.0_f32);
+        let size = Size::new(w as u32, h as u32);
+        let full = iced::Rectangle::with_size(Size::new(w, h));
+        let save = |app: &App, name: String| {
+            let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
+            let mut tree = iced::advanced::widget::Tree::empty();
+            let mut element = app.view(window::Id::unique());
+            tree.diff(element.as_widget());
+            let layout = element.as_widget_mut().layout(&mut tree, &renderer, &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(w, h)));
+            let start = Instant::now();
+            renderer.reset(full);
+            element.as_widget().draw(&tree, &mut renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&layout), iced::mouse::Cursor::Unavailable, &full);
+            let mut pixels = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
+            let mut mask = tiny_skia::Mask::new(size.width, size.height).unwrap();
+            renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, 1.0), &[full], BG);
+            eprintln!("{name}: {:.1} ms", start.elapsed().as_secs_f64() * 1000.0);
+            let mut data = pixels.data().to_vec();
+            for (i, px) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                px.swap(0, 2);
+                if px[0] == 1 && px[1] == 0 && px[2] == 1 {
+                    let (x, y) = (i % size.width as usize / 16, i / size.width as usize / 16);
+                    let v = if (x + y) % 2 == 0 { 0x50 } else { 0x68 };
+                    px[0] = v; px[1] = v; px[2] = v + 0x10;
+                }
+            }
+            let mut encoder = png::Encoder::new(std::fs::File::create(dir.join(format!("{name}.png"))).unwrap(), size.width, size.height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&data).unwrap();
+        };
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.window = Some(window::Id::unique());
+        let window = Size::new(w, h);
+        let card = iced::Rectangle { x: (w - UPDATE_CARD.width) / 2.0, y: (h - UPDATE_CARD.height) / 2.0, width: UPDATE_CARD.width, height: UPDATE_CARD.height };
+        let root = app.window_mosaic(window).unwrap();
+        let waiting = mosaic_of::<Msg>(update_card(tacho::BarStage::Waiting, "0.2.14", "0.2.15"), UPDATE_CARD).unwrap();
+        let done = mosaic_of::<Msg>(update_card(tacho::BarStage::Done, "", "0.2.15"), UPDATE_CARD).unwrap();
+        for (kind, from, to, from_rect, to_rect, timeline, times) in [
+            ("shrink", root.clone(), waiting, iced::Rectangle::with_size(window), card, tacho::MorphTimeline::SHRINK, [0u64, 150, 320, 450, 700, 900]),
+            ("grow", done, root, card, iced::Rectangle::with_size(window), tacho::MorphTimeline::GROW, [0, 150, 300, 450, 700, 900]),
+        ] {
+            for ms in times {
+                let base = match (kind, ms) {
+                    ("shrink", ms) if ms < 120 => MorphBase::Root,
+                    ("shrink", ms) if ms >= 800 => MorphBase::Card(tacho::BarStage::Waiting),
+                    ("grow", ms) if ms < 100 => MorphBase::Card(tacho::BarStage::Done),
+                    ("grow", ms) if ms >= 820 => MorphBase::Root,
+                    _ => MorphBase::Key,
+                };
+                app.morph = Some(MorphView {
+                    base,
+                    from_version: "0.2.14".into(),
+                    to_version: "0.2.15".into(),
+                    anim: Some(tacho::Morph { from: from.clone(), to: to.clone(), from_rect, to_rect, start: Instant::now() - Duration::from_millis(ms), timeline, events: Vec::new() }),
+                    hwnd: None,
+                    center: None,
+                });
+                save(&app, format!("morph-{kind}-{ms:03}"));
+            }
+        }
+        app.morph = Some(MorphView { base: MorphBase::Card(tacho::BarStage::Running(Instant::now() - Duration::from_millis(270))), from_version: "0.2.14".into(), to_version: "0.2.15".into(), anim: None, hwnd: None, center: None });
+        save(&app, "update-window".into());
+    }
+
     /// Frames of the page-switch pixelation, with their draw + raster time.
     #[test]
     #[ignore]
@@ -2303,14 +2440,57 @@ mod tests {
             renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, 1.0), &[full], BG);
             (pixels, start.elapsed().as_secs_f64() * 1000.0)
         };
+        // As the window does it: repaint only the regions that changed since the last frame.
+        let windowed = |app: &App, tree: &mut iced::advanced::widget::Tree, previous: &mut Vec<iced_tiny_skia::Layer>, renderer: &mut iced::Renderer, pixels: &mut tiny_skia::Pixmap| {
+            use iced::advanced::graphics::damage;
+            let mut element = app.view(window::Id::unique());
+            tree.diff(element.as_widget());
+            let layout = element.as_widget_mut().layout(tree, renderer, &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(w, h)));
+            let start = Instant::now();
+            renderer.reset(full);
+            element.as_widget().draw(tree, renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&layout), iced::mouse::Cursor::Unavailable, &full);
+            let changes = damage::group(damage::diff(previous, renderer.layers(), |layer| vec![layer.bounds], iced_tiny_skia::Layer::damage), full);
+            *previous = renderer.layers().to_vec();
+            let mut mask = tiny_skia::Mask::new(size.width, size.height).unwrap();
+            renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, 1.0), &changes, BG);
+            (changes.len(), start.elapsed().as_secs_f64() * 1000.0)
+        };
         let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
         app.window = Some(window::Id::unique());
         let _ = frame(&app); // lays out the page area
+        app.sound_folder = Some(PathBuf::from("test sounds"));
+        app.sounds = (0..454).map(|i| Sound {
+            name: format!("Section {} - Sound {i:03}.wav", i / 5), path: PathBuf::new(),
+            key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Unloaded,
+        }).collect();
+        for (name, page) in [("main", 0u8), ("effects", 6), ("soundpad", 4), ("rvc", 1), ("settings", 2), ("logs", 5)] {
+            let _ = app.update(Msg::Page(page));
+            let started = Instant::now();
+            let mosaic = app.page_mosaic();
+            eprintln!("mosaic {name}: {:.1} ms ({:?})", started.elapsed().as_secs_f64() * 1000.0, mosaic.map(|m| (m.width, m.height)));
+        }
+        let _ = app.update(Msg::Page(0));
+        app.page_shift = None;
         let started = Instant::now();
         let from = app.page_mosaic().unwrap();
         app.effects_page = true;
         let to = app.page_mosaic().unwrap();
         eprintln!("two offscreen pages: {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        {
+            let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
+            let mut pixels = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
+            let mut previous = Vec::new();
+            let mut tree = iced::advanced::widget::Tree::empty();
+            let begin = Instant::now() - Duration::from_millis(1);
+            app.page_shift = Some((from.clone(), to.clone(), begin));
+            for step in 0..24u64 {
+                app.page_shift = Some((from.clone(), to.clone(), begin - Duration::from_millis(step * 16)));
+                let (regions, took) = windowed(&app, &mut tree, &mut previous, &mut renderer, &mut pixels);
+                if step % 4 == 0 {
+                    eprintln!("windowed frame {step}: {regions} damage regions, {took:.1} ms");
+                }
+            }
+        }
         for ms in [0u64, 60, 120, 169, 200, 260, 330, 370] {
             app.page_shift = Some((from.clone(), to.clone(), Instant::now() - Duration::from_millis(ms)));
             let (pixels, took) = frame(&app);

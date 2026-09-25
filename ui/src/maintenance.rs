@@ -486,7 +486,7 @@ pub fn upgrade_legacy(install:&Path,candidate:&Path)->Result<(),String> {
         legacy_call(&j,true)?;
         task(0)?;
         native(|e,n|unsafe{mnr_tag_repair_lines(e,n)},1)?;
-        apply(&mut j,false)
+        apply(&mut j,false,None)
     })();
     if let Err(error)=action {
         // Release the UI gate before the recovery routine acquires it itself.
@@ -524,14 +524,19 @@ fn restore_update_metadata(j:&Journal)->Result<(),String> {
     if !updater.exists(){atomic(&updater,&fs::read(folder(j).join("Update.exe")).map_err(|e|e.to_string())?)?;}
     Ok(())
 }
-fn apply(j: &mut Journal, previous: bool) -> Result<(), String> {
+/// `window`: where the watcher shows the app's own update window ("x,y" centre in logical px, or
+/// "centered"); Velopack then runs silently. Without it Velopack shows its standard dialog.
+fn apply(j: &mut Journal, previous: bool, window: Option<&str>) -> Result<(), String> {
     let files = folder(j); let package = files.join(if previous {"previous.nupkg"} else {"candidate.nupkg"});
     check_hash(&package, if previous {&j.previous_hash} else {&j.candidate_hash})?;
     check_hash(&files.join("Update.exe"),&j.updater_hash)?;
     if previous {restore_update_metadata(j)?;}
     // Windows keeps a handle to a process's working directory. Helpers must not
     // inherit replaceable `current`, or their own lifetime prevents rollback.
-    let mut child=Command::new(files.join("Update.exe")).current_dir(&files).creation_flags(0x08000000)
+    let mut child=Command::new(files.join("Update.exe"));
+    child.current_dir(&files).creation_flags(0x08000000);
+    if window.is_some(){child.arg("--silent");}
+    let mut child=child
         .arg("apply").arg("--norestart").arg("--package").arg(package).arg("--root").arg(&j.install)
         .arg("--waitPid").arg(std::process::id().to_string()).spawn().map_err(|e| e.to_string())?;
     let created=process_created(child.as_raw_handle() as isize);
@@ -543,9 +548,12 @@ fn apply(j: &mut Journal, previous: bool) -> Result<(), String> {
     // Survives the old UI and catches an updater that exits without restarting it.
     let watcher=(|| {
         let created=process_created(unsafe{GetCurrentProcess()}).ok_or("UI process identity unavailable")?;
-        Command::new(files.join("Recovery.exe")).current_dir(&files).creation_flags(0x08000000)
+        let mut watcher=Command::new(files.join("Recovery.exe"));
+        watcher.current_dir(&files).creation_flags(0x08000000)
             .arg("--recover-update").arg(&j.runtime).arg("--watch-update")
-            .arg(std::process::id().to_string()).arg(created.to_string()).spawn().map_err(|e|e.to_string())?;
+            .arg(std::process::id().to_string()).arg(created.to_string());
+        if let Some(at)=window{watcher.arg("--update-window").arg(at);}
+        watcher.spawn().map_err(|e|e.to_string())?;
         Ok::<(),String>(())
     })();
     if let Err(error)=watcher {child.kill().map_err(|e|format!("{error}; cannot cancel owned updater: {e}"))?;let _=child.wait();return Err(error);}
@@ -576,7 +584,7 @@ pub fn prepare(candidate: &velopack::VelopackAsset) -> Result<(), String> {
     j.updater_hash = hash(&mut File::open(files.join("Update.exe")).map_err(|e|e.to_string())?)?;
     save(&j)
 }
-pub fn apply_prepared(intent:Option<crate::ResumeIntent>) -> Result<(), String> {
+pub fn apply_prepared(intent:Option<crate::ResumeIntent>,window:Option<String>) -> Result<(), String> {
     use velopack::locator::{auto_locate_app_manifest,LocationContext};
     let _lock=Lock::acquire()?;
     let location=auto_locate_app_manifest(LocationContext::FromCurrentExe).map_err(|e|e.to_string())?;
@@ -586,9 +594,19 @@ pub fn apply_prepared(intent:Option<crate::ResumeIntent>) -> Result<(), String> 
     j.before.installed(&location.get_root_dir())?;
     j.resume=intent;save(&j)?;
     let files=folder(&j);
+    let ready=crate::update_window::ready_file(&j.runtime);let _=fs::remove_file(&ready);
     if let Err(error) = (|| { run_recovery(Some(&files.join("Recovery.exe")),&j.runtime)?; atomic(&state.join("hold"),b"update")?; stop()?; task(0)?;
-        j.phase=Phase::Applying; save(&j)?; apply(&mut j,false) })() { if !applier_alive(&j){release(&mut j)?;} return Err(error); }
+        j.phase=Phase::Applying; save(&j)?; apply(&mut j,false,window.as_deref()) })() { if !applier_alive(&j){release(&mut j)?;} return Err(error); }
+    // The UI stays on screen until the watcher's identical update window covers it, so the
+    // hand-over shows no gap. Velopack waits for this process to exit before touching files.
+    if window.is_some() {
+        for _ in 0..60 {if ready.exists(){break;}std::thread::sleep(std::time::Duration::from_millis(50));}
+    }
     std::process::exit(0)
+}
+/// Versions of the update in progress, for the update window: (installed, incoming).
+pub fn update_versions(runtime: &Path) -> Option<(String, String)> {
+    read(runtime).ok().map(|j| (j.before.version, j.after.version))
 }
 fn read(runtime: &Path) -> Result<Journal, String> {
     let mut bytes=Vec::new();File::open(runtime.join(".update/journal.json")).map_err(|e|e.to_string())?.take(16385).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
@@ -699,7 +717,7 @@ pub fn startup() -> Result<bool,String> {
         if j.rollback_attempts>=2{return Err("Откат старой установки не завершён; исходный комплект сохранён в .update".into());}
         atomic(&runtime.join(".update/hold"),b"legacy rollback")?;
         stop_upgrade_host(&j)?;
-        j.phase=Phase::RollingBack;j.rollback_attempts+=1;save(&j)?;apply(&mut j,true)?;
+        j.phase=Phase::RollingBack;j.rollback_attempts+=1;save(&j)?;apply(&mut j,true,None)?;
         return Ok(false);
     }
     // The copied recovery executable must not validate a newer protocol with its old native ABI.
@@ -726,7 +744,7 @@ pub fn startup() -> Result<bool,String> {
     }
     if j.rollback_attempts>=2{return Err("Автоматический откат не завершился. Предыдущий пакет сохранён в .update; требуется восстановление установки".into());}
     atomic(&runtime.join(".update/hold"),b"rollback")?; stop()?; task(0)?;
-    j.phase=Phase::RollingBack;j.rollback_attempts+=1;save(&j)?;apply(&mut j,true)?;
+    j.phase=Phase::RollingBack;j.rollback_attempts+=1;save(&j)?;apply(&mut j,true,None)?;
     Ok(false)
 }
 

@@ -1268,10 +1268,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
         let k = ((block / MOSAIC_CELL).round() as usize).max(1);
         let side = k as f32 * MOSAIC_CELL;
         let (cols, rows) = (page.width.div_ceil(k), page.height.div_ceil(k));
-        renderer.with_layer(b, |renderer| {
+        // One cached geometry for the whole mosaic: the window then repaints a single region per
+        // frame. Thousands of separate quads made it repaint the page dozens of times a frame.
+        let mut shapes = Vec::new();
+        {
             for row in 0..rows {
-                // Average each k×k group of cells, then merge equal neighbours into one quad:
-                // flat backgrounds cost one quad per row instead of one per block.
+                // Average each k×k group of cells, then merge equal neighbours into one shape:
+                // flat backgrounds cost one per row instead of one per block.
                 let mut run: Option<(usize, [u8; 3])> = None;
                 for col in 0..=cols {
                     let color = (col < cols).then(|| {
@@ -1293,18 +1296,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
                         (Some((_, c)), Some(next)) if same(c, next) => {}
                         (current, next) => {
                             if let Some((first, c)) = current {
-                                renderer.fill_quad(
-                                    Quad {
-                                        bounds: Rectangle {
-                                            x: b.x + first as f32 * side,
-                                            y: b.y + row as f32 * side,
-                                            // A hair of overlap hides anti-aliased seams.
-                                            width: (col - first) as f32 * side + 0.6,
-                                            height: side + 0.6,
-                                        },
-                                        snap: false,
-                                        ..Quad::default()
-                                    },
+                                // A hair of overlap hides anti-aliased seams.
+                                slant(
+                                    &mut shapes,
+                                    b.x + first as f32 * side,
+                                    b.y + row as f32 * side,
+                                    (col - first) as f32 * side + 0.6,
+                                    side + 0.6,
+                                    0.0,
                                     Color { a: alpha, ..Color::from_rgb8(c[0], c[1], c[2]) },
                                 );
                             }
@@ -1313,7 +1312,240 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
                     }
                 }
             }
-        });
+        }
+        let cache = geometry(b, &shapes).cache(Group::unique(), None);
+        renderer.draw_geometry(Geometry::load(&cache));
+    }
+}
+
+/// The colour Windows keys out of a colour-keyed (layered) window: pixels of exactly this colour
+/// are transparent and let clicks through. Nothing in the palette is this dark purple-black.
+pub const KEY: Color = Color::from_rgb8(1, 0, 1);
+
+/// What the update window's bar shows.
+#[derive(Clone, Copy, PartialEq)]
+pub enum BarStage {
+    /// Empty: shown until the window is on screen, so every process draws the same frame.
+    Waiting,
+    /// A solid block of lit segments runs across from this moment; no fading trail.
+    Running(Instant),
+    Done,
+}
+
+/// The update window's bar in the sliders' segment style.
+pub fn run_bar<'a, Message: 'a>(stage: BarStage) -> Element<'a, Message> {
+    Element::new(RunBar { stage })
+}
+struct RunBar {
+    stage: BarStage,
+}
+const BAR_SEGMENTS: usize = 24;
+const BAR_BLOCK: usize = 5;
+const BAR_STEP_MS: u64 = 30;
+impl RunBar {
+    fn position(&self, now: Instant) -> usize {
+        match self.stage {
+            BarStage::Running(since) => (now.saturating_duration_since(since).as_millis() as u64 / BAR_STEP_MS) as usize % (BAR_SEGMENTS + BAR_BLOCK),
+            _ => 0,
+        }
+    }
+}
+impl<Message> Widget<Message, Theme, Renderer> for RunBar {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<Painted>() }
+    fn state(&self) -> tree::State { tree::State::new(Painted::default()) }
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fill, height: Length::Fixed(20.0) }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, Length::Fixed(20.0))
+    }
+    fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        if let (Event::Window(window::Event::RedrawRequested(now)), BarStage::Running(since)) = (event, self.stage) {
+            let step = Duration::from_millis(BAR_STEP_MS);
+            let elapsed = now.saturating_duration_since(since);
+            let next = since + step * (elapsed.as_millis() as u32 / BAR_STEP_MS as u32 + 1);
+            shell.request_redraw_at(RedrawRequest::At(next));
+        }
+    }
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let b = layout.bounds();
+        let (w, h) = (13.0, 20.0);
+        let pos = self.position(Instant::now());
+        let mut shapes = Vec::with_capacity(BAR_SEGMENTS * 2);
+        let green = |t: f32| {
+            let (lo, hi) = ([36.0, 84.0, 52.0], [111.0, 217.0, 138.0]);
+            let c = |i: usize| (lo[i] + (hi[i] - lo[i]) * t) / 255.0;
+            Color::from_rgb(c(0), c(1), c(2))
+        };
+        for i in 0..BAR_SEGMENTS {
+            let x = b.x + (h * SKEW / 2.0) + (b.width - w - h * SKEW) * i as f32 / (BAR_SEGMENTS - 1) as f32;
+            let lit = match self.stage {
+                BarStage::Running(_) => (i < pos && i + BAR_BLOCK >= pos).then(|| if i + 1 == pos { HEAD } else { lerp(i as f32 / BAR_SEGMENTS as f32) }),
+                BarStage::Done => Some(if i + 1 == BAR_SEGMENTS { Color::from_rgb8(0xD9, 0xFF, 0xE2) } else { green(i as f32 / BAR_SEGMENTS as f32) }),
+                BarStage::Waiting => None,
+            };
+            match lit {
+                Some(color) => segment(&mut shapes, x, b.y, w, h, color),
+                None => {
+                    segment(&mut shapes, x, b.y, w, h, OFF_EDGE);
+                    segment(&mut shapes, x + 1.0, b.y + 1.0, w - 2.0, h - 2.0, OFF);
+                }
+            }
+        }
+        tree.state.downcast_ref::<Painted>().draw(renderer, b.expand(8.0), shapes);
+    }
+}
+
+/// A window turning into another: the frame moves between two rectangles while its content is a
+/// mosaic blending the two pictures; outside the frame is [`KEY`], see-through on a keyed window.
+#[derive(Clone)]
+pub struct Morph<Message> {
+    pub from: std::sync::Arc<Mosaic>,
+    pub to: std::sync::Arc<Mosaic>,
+    /// Frame rectangles relative to the window's top-left.
+    pub from_rect: Rectangle,
+    pub to_rect: Rectangle,
+    pub start: Instant,
+    pub timeline: MorphTimeline,
+    /// Sent once each when their time (ms) has passed; the last one ends the morph.
+    pub events: Vec<(f32, Message)>,
+}
+/// Times in ms: the frame moves over `move_ms`, pixels grow to `BLOCK_MAX` over `pixelate`,
+/// hold, and sharpen over `sharpen`; `blend` crosses the pictures; `fade_in`/`fade_out` blend
+/// the mosaic with the real window underneath at both ends.
+#[derive(Clone, Copy)]
+pub struct MorphTimeline {
+    pub fade_in: f32,
+    pub move_ms: (f32, f32),
+    pub pixelate: f32,
+    pub sharpen: (f32, f32),
+    pub blend: (f32, f32),
+    pub fade_out: (f32, f32),
+}
+impl MorphTimeline {
+    /// The app shrinking into the update window.
+    pub const SHRINK: Self = Self { fade_in: 120.0, move_ms: (120.0, 570.0), pixelate: 320.0, sharpen: (570.0, 920.0), blend: (320.0, 500.0), fade_out: (800.0, 920.0) };
+    /// The update window growing into the app.
+    pub const GROW: Self = Self { fade_in: 100.0, move_ms: (0.0, 500.0), pixelate: 300.0, sharpen: (520.0, 950.0), blend: (230.0, 430.0), fade_out: (820.0, 950.0) };
+}
+#[derive(Default)]
+struct MorphState {
+    fired: usize,
+}
+pub fn morph<'a, Message: Clone + 'a>(morph: Option<&Morph<Message>>) -> Element<'a, Message> {
+    Element::new(MorphWidget { morph: morph.cloned() })
+}
+struct MorphWidget<Message> {
+    morph: Option<Morph<Message>>,
+}
+/// Average colour of the part of `m` under the normalised rectangle `[u0, u1) × [v0, v1)`.
+fn sample(m: &Mosaic, u0: f32, v0: f32, u1: f32, v1: f32) -> [f32; 3] {
+    let x0 = ((u0 * m.width as f32) as usize).min(m.width - 1);
+    let y0 = ((v0 * m.height as f32) as usize).min(m.height - 1);
+    let x1 = ((u1 * m.width as f32).ceil() as usize).clamp(x0 + 1, m.width);
+    let y1 = ((v1 * m.height as f32).ceil() as usize).clamp(y0 + 1, m.height);
+    let mut sum = [0.0f32; 3];
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let c = m.cells[y * m.width + x];
+            for i in 0..3 {
+                sum[i] += c[i] as f32;
+            }
+        }
+    }
+    let n = ((x1 - x0) * (y1 - y0)) as f32;
+    sum.map(|v| v / n)
+}
+impl<Message: Clone> Widget<Message, Theme, Renderer> for MorphWidget<Message> {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<MorphState>() }
+    fn state(&self) -> tree::State { tree::State::new(MorphState::default()) }
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fill, height: Length::Fill }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, Length::Fill)
+    }
+    fn update(&mut self, tree: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        let (Event::Window(window::Event::RedrawRequested(now)), Some(m)) = (event, &self.morph) else { return };
+        let state = tree.state.downcast_mut::<MorphState>();
+        let ms = now.saturating_duration_since(m.start).as_secs_f32() * 1000.0;
+        while let Some((at, message)) = m.events.get(state.fired) {
+            if ms < *at {
+                break;
+            }
+            shell.publish(message.clone());
+            state.fired += 1;
+        }
+        if state.fired < m.events.len() {
+            shell.request_redraw_at(RedrawRequest::NextFrame);
+        }
+    }
+    fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let Some(m) = &self.morph else { return };
+        let b = layout.bounds();
+        let ms = Instant::now().saturating_duration_since(m.start).as_secs_f32() * 1000.0;
+        let tl = m.timeline;
+        let span = |a: f32, z: f32| ((ms - a) / (z - a)).clamp(0.0, 1.0);
+        let ease = |x: f32| x * x * (3.0 - 2.0 * x);
+        let k = ease(span(tl.move_ms.0, tl.move_ms.1));
+        let block = if ms < tl.sharpen.0 {
+            MOSAIC_CELL + (BLOCK_MAX - MOSAIC_CELL) * ease(span(0.0, tl.pixelate))
+        } else {
+            BLOCK_MAX - (BLOCK_MAX - MOSAIC_CELL) * ease(span(tl.sharpen.0, tl.sharpen.1))
+        };
+        let blend = ease(span(tl.blend.0, tl.blend.1));
+        let alpha = span(0.0, tl.fade_in).min(1.0 - span(tl.fade_out.0, tl.fade_out.1));
+        let lerp_rect = |a: Rectangle, z: Rectangle| Rectangle {
+            x: b.x + a.x + (z.x - a.x) * k,
+            y: b.y + a.y + (z.y - a.y) * k,
+            width: a.width + (z.width - a.width) * k,
+            height: a.height + (z.height - a.height) * k,
+        };
+        let frame = lerp_rect(m.from_rect, m.to_rect);
+        let mut shapes = Vec::new();
+        // Keyed surroundings are pixel-snapped quads, never anti-aliased: an edge blended with the
+        // key rounds to a near-key colour Windows would not cut out, leaving hairlines.
+        for (x, y, w, h) in [
+            (b.x, b.y, b.width, frame.y - b.y),
+            (b.x, frame.y + frame.height, b.width, b.y + b.height - frame.y - frame.height),
+            (b.x, frame.y, frame.x - b.x, frame.height),
+            (frame.x + frame.width, frame.y, b.x + b.width - frame.x - frame.width, frame.height),
+        ] {
+            if w > 0.01 && h > 0.01 {
+                renderer.fill_quad(Quad { bounds: Rectangle { x, y, width: w, height: h }, snap: true, ..Quad::default() }, KEY);
+            }
+        }
+        let side = (block / MOSAIC_CELL).round().max(1.0) * MOSAIC_CELL;
+        let cols = (frame.width / side).ceil().max(1.0) as usize;
+        let rows = (frame.height / side).ceil().max(1.0) as usize;
+        for row in 0..rows {
+            let mut run: Option<(usize, [u8; 3])> = None;
+            for col in 0..=cols {
+                let color = (col < cols).then(|| {
+                    let (u0, v0) = (col as f32 * side / frame.width, row as f32 * side / frame.height);
+                    let (u1, v1) = (((col + 1) as f32 * side / frame.width).min(1.0), ((row + 1) as f32 * side / frame.height).min(1.0));
+                    let a = sample(&m.from, u0, v0, u1, v1);
+                    let z = sample(&m.to, u0, v0, u1, v1);
+                    [0, 1, 2].map(|i| (a[i] + (z[i] - a[i]) * blend).round() as u8)
+                });
+                let same = |a: [u8; 3], z: [u8; 3]| a.iter().zip(z).all(|(x, y)| x.abs_diff(y) <= 3);
+                match (run, color) {
+                    (Some((_, c)), Some(next)) if same(c, next) => {}
+                    (current, next) => {
+                        if let Some((first, c)) = current {
+                            let x = frame.x + first as f32 * side;
+                            let y = frame.y + row as f32 * side;
+                            let w = ((col - first) as f32 * side).min(frame.x + frame.width - x);
+                            let h = side.min(frame.y + frame.height - y);
+                            slant(&mut shapes, x, y, w + 0.6, h + 0.6, 0.0, Color { a: alpha, ..Color::from_rgb8(c[0], c[1], c[2]) });
+                        }
+                        run = next.map(|c| (col, c));
+                    }
+                }
+            }
+        }
+        let cache = geometry(b, &shapes).cache(Group::unique(), None);
+        renderer.draw_geometry(Geometry::load(&cache));
     }
 }
 

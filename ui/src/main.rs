@@ -12,6 +12,7 @@ mod soundpad;
 mod telemetry;
 mod updater;
 mod maintenance;
+mod update_window;
 mod view;
 use engine::{Config, Controls, Device, Engine, Reply, Snapshot};
 use iced::{Element, Font, Size, Subscription, Task, Theme, keyboard, window};
@@ -65,6 +66,30 @@ struct LocalTime {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetLocalTime(time: *mut LocalTime);
+}
+/// What lies under the update morph's layer.
+#[derive(Clone, Copy)]
+enum MorphBase {
+    Root,
+    Card(tacho::BarStage),
+    Key,
+}
+#[derive(Clone, Copy, Debug)]
+enum MorphStep {
+    HideBase,
+    ShowCard,
+    ShowRoot,
+    Done,
+}
+struct MorphView {
+    base: MorphBase,
+    from_version: String,
+    to_version: String,
+    anim: Option<tacho::Morph<Msg>>,
+    /// The keyed window's handle, to un-key it afterwards.
+    hwnd: Option<u64>,
+    /// Set for the shrink: where the watcher's update window must stand.
+    center: Option<iced::Point>,
 }
 fn clip_name() -> String {
     let mut t = LocalTime::default();
@@ -230,6 +255,7 @@ mod focus {
         pub const REPAIR_CANCEL: usize = 93;
         pub const REPAIR_LINES: usize = 94;
         pub const LOGS: usize = 95;
+        pub const REHEARSE: usize = 96;
     }
     pub mod effects {
         pub const INPUT: usize = 35;
@@ -529,6 +555,18 @@ enum Msg {
     Noop,
     /// The page-switch pixelation has played out.
     PageShiftDone,
+    /// «Перезапустить»: the window's position and size, to shrink it into the update window.
+    DecayGeometry(Option<iced::Point>, Size),
+    /// The window's native handle: colour-key it for a morph.
+    Keyed(u64),
+    /// A point in the running morph's timeline.
+    MorphStep(MorphStep),
+    /// After an update: the hidden window is keyed and shown as the update window; then it grows.
+    IntroStart,
+    /// Plays the whole update hand-over for real, without installing anything.
+    RehearseUpdate,
+    /// The rehearsal's update window is on screen (or could not start).
+    RehearsalReady(Result<(), String>),
     Screenshot(window::Screenshot),
 }
 /// Which sidebar entry filters the clip list.
@@ -606,6 +644,14 @@ struct App {
     keys_down: [u64; 4],
     /// The old and new page, painted small, while the page switch pixelates between them.
     page_shift: Option<(std::sync::Arc<tacho::Mosaic>, std::sync::Arc<tacho::Mosaic>, Instant)>,
+    /// The update shrink («Перезапустить») or grow (first start after an update).
+    morph: Option<MorphView>,
+    /// The downloaded update's version, for the update window.
+    update_version: Option<String>,
+    /// First start after an update: the update window's centre to grow out of.
+    intro: Option<iced::Point>,
+    /// Quitting to rehearse the update animations instead of applying an update.
+    rehearse_after_quit: bool,
     headphone_output: Option<Device>,
     headphone_denoise: bool,
     headphone_intensity: f32,
@@ -772,20 +818,24 @@ fn window_icon() -> window::Icon {
         .expect("valid embedded application icon")
 }
 impl App {
-    fn open(_scale: f32) -> (window::Id, Task<Msg>) {
+    fn window_size() -> Size {
+        if std::env::args().any(|s| s == "--ui-small") { Size::new(620.0, 440.0) } else { Size::new(1040.0, 740.0) }
+    }
+    /// `intro`: open hidden, centred on the update window it will grow out of.
+    fn open(_scale: f32, intro: Option<iced::Point>) -> (window::Id, Task<Msg>) {
         let small = std::env::args().any(|s| s == "--ui-small");
+        let size = Self::window_size();
         let (id, task) = window::open(window::Settings {
-            size: if small {
-                Size::new(620.0, 440.0)
-            } else {
-                Size::new(1040.0, 740.0)
-            },
+            size,
             min_size: Some(if small {
                 Size::new(620.0, 440.0) // Explicit QA mode only.
             } else {
                 Size::new(960.0, 680.0)
             }),
-            position: window::Position::Centered,
+            position: intro.map_or(window::Position::Centered, |c| {
+                window::Position::Specific(iced::Point::new(c.x - size.width / 2.0, c.y - size.height / 2.0))
+            }),
+            visible: intro.is_none(),
             icon: Some(window_icon()),
             decorations: false,
             exit_on_close_request: false,
@@ -916,10 +966,18 @@ impl App {
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v >= 1.0 && *v <= 2.0)
             .unwrap_or(1.0);
-        let (window, open) = if cfg!(test) || args.iter().any(|s| s == "--start-tray") {
+        let tray_start = cfg!(test) || args.iter().any(|s| s == "--start-tray");
+        // After an update the watcher's window waits for this one to take over.
+        let intro = if cfg!(test) { None } else { update_window::take_handoff(&runtime_root) };
+        // Without a hand-over to play, a waiting update window may close right away.
+        if !cfg!(test) && (intro.is_none() || tray_start) {
+            update_window::signal_ui_shown(&runtime_root);
+        }
+        let intro = intro.filter(|_| !tray_start);
+        let (window, open) = if tray_start {
             (None, Task::none())
         } else {
-            let (id, task) = Self::open(qa_scale);
+            let (id, task) = Self::open(qa_scale, intro);
             (Some(id), task)
         };
         let gpu = if cfg!(test) { Err(String::new()) } else { engine::gpu() };
@@ -1013,6 +1071,10 @@ impl App {
                 in_peak: 0.0,
                 keys_down: [0; 4],
                 page_shift: None,
+                morph: None,
+                update_version: None,
+                intro,
+                rehearse_after_quit: false,
                 headphone_output: None,
                 headphone_denoise,
                 headphone_intensity,
@@ -1293,6 +1355,21 @@ impl App {
     }
     fn running(&self) -> bool {
         matches!(self.snapshot.state, 1..=4)
+    }
+    /// After the shrink: the real update, or the rehearsal's stand-in watcher.
+    fn hand_over(&self, center: Option<iced::Point>) -> Task<Msg> {
+        if !self.rehearse_after_quit {
+            return self.apply_update(center);
+        }
+        let runtime = self.runtime_root.clone();
+        Task::perform(async move { update_window::rehearse(&runtime, center) }, Msg::RehearsalReady)
+    }
+    /// Hands the update to Velopack and the watcher; `center` places the watcher's update
+    /// window (centred on screen when the app window is not shown).
+    fn apply_update(&self, center: Option<iced::Point>) -> Task<Msg> {
+        let intent = self.update_resume;
+        let at = center.map_or("centered".to_owned(), |c| format!("{:.1},{:.1}", c.x, c.y));
+        Task::batch([Task::perform(async move { updater::apply_and_restart(intent, Some(at)) }, Msg::UpdateApplied), timer(false)])
     }
     fn page_key(&self) -> [bool; 5] {
         [self.soundpad_page, self.logs_page, self.details, self.rvc_page, self.effects_page]
@@ -1774,9 +1851,12 @@ impl App {
                                     "rvc_latency_ms": self.snapshot.rvc_latency_ms,
                                 }),
                             );
-                            if self.apply_after_quit {
-                                let intent=self.update_resume;
-                                return Task::batch([Task::perform(async move{updater::apply_and_restart(intent)},Msg::UpdateApplied),timer(false)]);
+                            if self.apply_after_quit || self.rehearse_after_quit {
+                                // Shrink into the update window first when the window is on screen.
+                                if let Some(id)=self.window.filter(|_|!cfg!(test)) {
+                                    return window::position(id).then(move |position| window::size(id).map(move |size| Msg::DecayGeometry(position,size)));
+                                }
+                                return self.hand_over(None);
                             }
                             if !cfg!(test) { logs::note(&self.runtime_root,"Выход: движок остановлен, завершение UI"); }
                             return exit_ui();
@@ -2013,6 +2093,18 @@ impl App {
             Msg::Opened(id) => {
                 self.window = Some(id);
                 self.opened_at = Some(Instant::now());
+                if self.intro.take().is_some() {
+                    // Stand in for the watcher's update window first: same card, same place.
+                    self.morph = Some(MorphView {
+                        base: MorphBase::Card(tacho::BarStage::Done),
+                        from_version: String::new(),
+                        to_version: env!("CARGO_PKG_VERSION").into(),
+                        anim: None,
+                        hwnd: None,
+                        center: None,
+                    });
+                    return window::raw_id::<Msg>(id).map(Msg::Keyed);
+                }
             }
             Msg::WindowFocus(id, focused) => {
                 if self.window == Some(id) {
@@ -2065,7 +2157,7 @@ impl App {
                         .chain(window::minimize(id, false))
                         .chain(window::gain_focus(id));
                 }
-                let (id, t) = Self::open(self.qa_scale);
+                let (id, t) = Self::open(self.qa_scale, None);
                 self.window = Some(id);
                 return t;
             }
@@ -2118,6 +2210,7 @@ impl App {
                     }
                     updater::Status::Ready(version) => {
                         self.update_ready = true;
+                        self.update_version = Some(version.clone());
                         self.update_status = format!("Версия {version} скачана и готова");
                     }
                     updater::Status::Unavailable(error) => {
@@ -2147,6 +2240,9 @@ impl App {
                 }
             }
             Msg::UpdateApplied(result) => {
+                if result.is_err() && let Some(m)=self.morph.take() && let Some(hwnd)=m.hwnd {
+                    update_window::color_key(hwnd,false);
+                }
                 if let Err(error)=result {
                     self.quitting=false;self.busy=false;self.apply_after_quit=false;
                     self.engine.resume_after_failed_update();
@@ -3232,6 +3328,110 @@ impl App {
             }
             Msg::Noop => {}
             Msg::PageShiftDone => self.page_shift = None,
+            Msg::DecayGeometry(position, size) => {
+                let Some(position) = position else { return self.hand_over(None) };
+                let center = iced::Point::new(position.x + size.width / 2.0, position.y + size.height / 2.0);
+                let to_version = self.update_version.clone().filter(|_| !self.rehearse_after_quit).unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
+                let from = self.window_mosaic(size);
+                let to = view::mosaic_of::<Msg>(view::update_card(tacho::BarStage::Waiting, env!("CARGO_PKG_VERSION"), &to_version), view::UPDATE_CARD);
+                let (Some(from), Some(to), Some(id)) = (from, to, self.window) else { return self.hand_over(Some(center)) };
+                let card = iced::Rectangle {
+                    x: (size.width - view::UPDATE_CARD.width) / 2.0,
+                    y: (size.height - view::UPDATE_CARD.height) / 2.0,
+                    width: view::UPDATE_CARD.width,
+                    height: view::UPDATE_CARD.height,
+                };
+                self.morph = Some(MorphView {
+                    base: MorphBase::Root,
+                    from_version: env!("CARGO_PKG_VERSION").into(),
+                    to_version,
+                    anim: Some(tacho::Morph {
+                        from,
+                        to,
+                        from_rect: iced::Rectangle::with_size(size),
+                        to_rect: card,
+                        start: Instant::now(),
+                        timeline: tacho::MorphTimeline::SHRINK,
+                        events: vec![(120.0, Msg::MorphStep(MorphStep::HideBase)), (800.0, Msg::MorphStep(MorphStep::ShowCard)), (920.0, Msg::MorphStep(MorphStep::Done))],
+                    }),
+                    hwnd: None,
+                    center: Some(center),
+                });
+                return window::raw_id::<Msg>(id).map(Msg::Keyed);
+            }
+            Msg::Keyed(hwnd) => {
+                if let Some(m) = &mut self.morph {
+                    update_window::color_key(hwnd, true);
+                    m.hwnd = Some(hwnd);
+                    // The intro's window is still hidden: show it as the update window, then grow.
+                    if m.anim.is_none() && let Some(id) = self.window {
+                        return Task::batch([
+                            window::set_mode(id, window::Mode::Windowed),
+                            Task::perform(async { std::thread::sleep(Duration::from_millis(60)) }, |_| Msg::IntroStart),
+                        ]);
+                    }
+                }
+            }
+            Msg::IntroStart => {
+                update_window::signal_ui_shown(&self.runtime_root);
+                let size = Self::window_size();
+                let card = iced::Rectangle {
+                    x: (size.width - view::UPDATE_CARD.width) / 2.0,
+                    y: (size.height - view::UPDATE_CARD.height) / 2.0,
+                    width: view::UPDATE_CARD.width,
+                    height: view::UPDATE_CARD.height,
+                };
+                let from = view::mosaic_of::<Msg>(view::update_card(tacho::BarStage::Done, "", env!("CARGO_PKG_VERSION")), view::UPDATE_CARD);
+                let to = self.window_mosaic(size);
+                match (&mut self.morph, from, to) {
+                    (Some(m), Some(from), Some(to)) => {
+                        m.anim = Some(tacho::Morph {
+                            from,
+                            to,
+                            from_rect: card,
+                            to_rect: iced::Rectangle::with_size(size),
+                            start: Instant::now(),
+                            timeline: tacho::MorphTimeline::GROW,
+                            events: vec![(100.0, Msg::MorphStep(MorphStep::HideBase)), (820.0, Msg::MorphStep(MorphStep::ShowRoot)), (950.0, Msg::MorphStep(MorphStep::Done))],
+                        });
+                    }
+                    _ => return self.update(Msg::MorphStep(MorphStep::Done)),
+                }
+            }
+            Msg::RehearseUpdate => {
+                if !self.quitting && !self.busy && !self.driver_installing && !self.core_installing {
+                    self.rehearse_after_quit = true;
+                    return self.update(Msg::Quit);
+                }
+            }
+            Msg::RehearsalReady(result) => {
+                self.rehearse_after_quit = false;
+                return match result {
+                    Ok(()) => exit_ui(),
+                    Err(error) => self.update(Msg::UpdateApplied(Err(format!("Проверка анимации: {error}")))),
+                };
+            }
+            Msg::MorphStep(step) => {
+                let Some(m) = &mut self.morph else { return Task::none() };
+                match step {
+                    MorphStep::HideBase => m.base = MorphBase::Key,
+                    MorphStep::ShowCard => m.base = MorphBase::Card(tacho::BarStage::Waiting),
+                    MorphStep::ShowRoot => m.base = MorphBase::Root,
+                    MorphStep::Done => {
+                        m.anim = None;
+                        // Shrunk into the update window: now hand over to the watcher.
+                        if let Some(center) = m.center {
+                            return self.hand_over(Some(center));
+                        }
+                        if let Some(hwnd) = m.hwnd {
+                            update_window::color_key(hwnd, false);
+                        }
+                        self.morph = None;
+                        // The sliders' warm-up sweep plays once the app is fully there.
+                        self.opened_at = Some(Instant::now());
+                    }
+                }
+            }
         }
         Task::none()
     }
@@ -3347,7 +3547,7 @@ impl App {
                 if self.update_ready {
                     items.push(APPLY_UPDATE);
                 }
-                items.extend([LOGS, QUIT]);
+                items.extend([LOGS, QUIT, REHEARSE]);
                 items.extend(tabs);
                 items
             } else if self.rvc_page {
@@ -3622,6 +3822,7 @@ impl App {
                 AUTOSTART if activate => Msg::Autostart(!self.autostart),
                 APP_AUTOSTART if activate => Msg::AppAutostart(!self.app_autostart),
                 LOGS if activate => Msg::Page(5),
+                REHEARSE if activate => Msg::RehearseUpdate,
                 _ => Msg::Noop,
             }
         } else {
@@ -3817,6 +4018,34 @@ fn main() {
             if unsafe{MessageBoxW(0,text.as_ptr(),title.as_ptr(),0x24)}!=6{return Ok(());}
             return maintenance::upgrade_legacy(&install,&packages[0]);
         }
+        // The watcher of a silent update shows the app's own update window while it works.
+        if args.iter().any(|arg|arg=="--watch-update") && let Some(at)=args.iter().position(|arg|arg=="--update-window") {
+            let runtime=args.iter().position(|arg|arg=="--recover-update").and_then(|i|args.get(i+1)).map(PathBuf::from).ok_or("Recovery runtime missing")?;
+            let center=args.get(at+1).and_then(|v|v.to_str()).and_then(update_window::parse_point);
+            return update_window::watch(runtime,center,None,maintenance::startup);
+        }
+        // The settings' rehearsal: a stand-in watcher that pretends to install, then restarts
+        // the app so it grows out of the update window exactly as after a real update.
+        if let Some(at)=args.iter().position(|arg|arg=="--ui-update-rehearsal") {
+            let runtime=paths::Paths::resolve()?.runtime_root().to_path_buf();
+            std::fs::create_dir_all(runtime.join(".update")).map_err(|e|e.to_string())?;
+            let center=args.get(at+1).and_then(|v|v.to_str()).and_then(update_window::parse_point);
+            let exe=std::env::current_exe().map_err(|e|e.to_string())?;
+            let version=env!("CARGO_PKG_VERSION").to_owned();
+            return update_window::watch(runtime,center,Some((version.clone(),version)),move||{
+                // The old UI exits as soon as this window stands; the pause is the "install".
+                std::thread::sleep(Duration::from_secs(3));
+                Command::new(&exe).spawn().map_err(|e|e.to_string())?;
+                Ok(false)
+            });
+        }
+        // QA: the update window alone, on a throwaway state folder, with a pretend install.
+        if args.iter().any(|arg|arg=="--ui-update-preview") {
+            let runtime=std::env::temp_dir().join("micnoize-update-preview");
+            std::fs::create_dir_all(runtime.join(".update")).map_err(|e|e.to_string())?;
+            let center=args.iter().position(|arg|arg=="--ui-update-preview").and_then(|i|args.get(i+1)).and_then(|v|v.to_str()).and_then(update_window::parse_point);
+            return update_window::watch(runtime,center,Some(("0.2.14".into(),"0.2.15".into())),||{std::thread::sleep(Duration::from_secs(4));Ok(false)});
+        }
         if !maintenance::startup()? { return Ok(()); }
         if args.iter().any(|arg|arg=="--ui-benchmark") && let Some(at)=args.iter().position(|arg|arg=="--check-update-package") {
             let package=args.get(at+1).ok_or("Check package path missing")?;
@@ -3885,10 +4114,42 @@ mod controller_tests {
         assert!(!tag_autostart_default(&settings, true));
     }
     #[test]
+    fn update_shrink_and_grow_walk_their_steps() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let id = App::open(1.0, None).0;
+        app.window = Some(id);
+        app.update_version = Some("9.9.9".into());
+        // «Перезапустить»: the window shrinks into the update window, then hands over.
+        let _ = app.update(Msg::DecayGeometry(Some(iced::Point::new(100.0, 50.0)), Size::new(1040.0, 740.0)));
+        let m = app.morph.as_ref().expect("shrink starts");
+        assert!(matches!(m.base, MorphBase::Root) && m.anim.is_some());
+        assert_eq!(m.center, Some(iced::Point::new(620.0, 420.0)));
+        assert_eq!(m.to_version, "9.9.9");
+        let _ = app.update(Msg::MorphStep(MorphStep::HideBase));
+        assert!(matches!(app.morph.as_ref().unwrap().base, MorphBase::Key));
+        let _ = app.update(Msg::MorphStep(MorphStep::ShowCard));
+        assert!(matches!(app.morph.as_ref().unwrap().base, MorphBase::Card(tacho::BarStage::Waiting)));
+        let _ = app.update(Msg::MorphStep(MorphStep::Done));
+        assert!(app.morph.as_ref().is_some_and(|m| m.anim.is_none()), "the card stays until the process exits");
+        // A failed hand-over gives the app back.
+        let _ = app.update(Msg::UpdateApplied(Err("test".into())));
+        assert!(app.morph.is_none());
+        // First start after an update: stand in as the update window, then grow into the app.
+        app.intro = Some(iced::Point::new(620.0, 420.0));
+        let _ = app.update(Msg::Opened(id));
+        assert!(matches!(app.morph.as_ref().unwrap().base, MorphBase::Card(tacho::BarStage::Done)));
+        let _ = app.update(Msg::IntroStart);
+        assert!(app.morph.as_ref().unwrap().anim.is_some());
+        let _ = app.update(Msg::MorphStep(MorphStep::HideBase));
+        let _ = app.update(Msg::MorphStep(MorphStep::ShowRoot));
+        let _ = app.update(Msg::MorphStep(MorphStep::Done));
+        assert!(app.morph.is_none() && app.intro.is_none());
+    }
+    #[test]
     fn repair_requires_confirmation_and_exit_prevents_resume() {
         use keyboard::{Key,Modifiers,key::Named};
         let (mut app,_) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
-        app.window=Some(App::open(1.0).0);app.details=true;app.snapshot.state=2;app.focus=focus::NONE;
+        app.window=Some(App::open(1.0, None).0);app.details=true;app.snapshot.state=2;app.focus=focus::NONE;
         let (mut refresh,mut repair)=(false,false);
         for _ in 0..40 {let _=app.key(Key::Named(Named::Tab),Modifiers::empty(),false);refresh|=app.focus==focus::settings::REFRESH;repair|=app.focus==focus::settings::REPAIR;}
         assert!(refresh && repair,"Running routes need keyboard access to both device actions");
@@ -4022,7 +4283,7 @@ mod controller_tests {
         assert_eq!(app.controls.intensity, 1.05);
         assert_eq!(app.controls.alternate_intensity, 0.15);
         assert_eq!(app.keys[12], 0);
-        app.window = Some(App::open(1.0).0);
+        app.window = Some(App::open(1.0, None).0);
         app.focus = 37;
         let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
         assert_eq!(app.controls.alternate_intensity, 0.16);
@@ -4071,7 +4332,7 @@ mod controller_tests {
     #[test]
     fn background_window_stops_meter_updates_and_restores_on_focus() {
         let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
-        let id = App::open(1.0).0;
+        let id = App::open(1.0, None).0;
         app.window = Some(id);
         assert!(!app.ui_active());
         let _ = app.update(Msg::WindowFocus(id, true));
@@ -4127,7 +4388,7 @@ mod controller_tests {
     fn ready_update_is_reachable_from_any_page() {
         use keyboard::{Key, Modifiers, key::Named};
         let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
-        app.window = Some(App::open(1.0).0);
+        app.window = Some(App::open(1.0, None).0);
         let tab = |app: &mut App| {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         };
@@ -4195,7 +4456,7 @@ mod controller_tests {
             .unwrap();
         assert!(app.effects_monitor && !app.boost_monitor);
         assert_eq!(app.monitor_mode(), 2);
-        app.window = Some(App::open(1.0).0);
+        app.window = Some(App::open(1.0, None).0);
         let _ = app.update(Msg::Page(6));
         app.focus = 31;
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
@@ -4237,7 +4498,7 @@ mod controller_tests {
         };
         app.inputs = vec![mic.clone()];
         app.outputs = vec![headphones.clone(), virtual_out.clone()];
-        app.window = Some(App::open(1.0).0);
+        app.window = Some(App::open(1.0, None).0);
         app.focus = 35;
         let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
         assert_eq!(app.input, Some(mic.clone()));
@@ -4263,7 +4524,7 @@ mod controller_tests {
     fn logs_page_is_reachable_by_keyboard() {
         use iced::keyboard::{Key, Modifiers, key::Named};
         let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
-        app.window = Some(App::open(1.0).0);
+        app.window = Some(App::open(1.0, None).0);
         let _ = app.update(Msg::Page(5));
         assert!(app.logs_page && !app.details && !app.soundpad_page && !app.headphone_page);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
@@ -4305,7 +4566,7 @@ mod controller_tests {
         let _ = app.update(Msg::HeadphoneIntensity(250.0));
         assert_eq!(app.headphone_intensity, 2.0);
         assert_eq!(app.controls.intensity, microphone);
-        app.window = Some(App::open(1.0).0);
+        app.window = Some(App::open(1.0, None).0);
         app.focus = 55;
         let _ = app.key(Key::Named(Named::ArrowRight), Modifiers::empty(), false);
         assert_eq!(app.headphone_pitch, 3);
@@ -4346,7 +4607,7 @@ mod controller_tests {
         assert!(app.clips[5].name.contains("2026-09-22"));
         assert!(!folder.join("Запись 2026-09-20 14-05-10.wav").exists());
         assert_eq!(soundpad::decode(&app.clips[0].path).unwrap().len(), 480);
-        app.window = Some(App::open(1.0).0);
+        app.window = Some(App::open(1.0, None).0);
         let _ = app.update(Msg::ClipPlay(0));
         assert_eq!(app.clips[0].state, SoundState::Loading);
         assert_eq!(app.clip_pending_play, Some(0));
@@ -4420,7 +4681,7 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         assert_eq!(app.monitor_mode(), 1);
         app.monitor_all = false;
         app.effects_monitor = false;
-        app.window = Some(App::open(1.0).0);
+        app.window = Some(App::open(1.0, None).0);
         let _ = app.update(Msg::Page(4));
         assert!(app.soundpad_page && !app.details);
         let _ = app.update(Msg::SoundHover(0, true));
@@ -4646,7 +4907,7 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         let (other, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
         drop(other);
         // Keyboard handlers require a window ID; do not execute the window-open task.
-        app.window = Some(App::open(1.0).0);
+        app.window = Some(App::open(1.0, None).0);
         app.keys = [0; 13];
         use keyboard::{Key, Modifiers, key::Named};
         // Шумодав: devices, the headphone gear, the folded route, then the two strengths.

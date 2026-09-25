@@ -77,6 +77,23 @@ fn event(tag: &str, name: &str, details: serde_json::Value) -> serde_json::Value
     json!({"tag": tag, "name": name, "data": details})
 }
 
+fn support_label(user: &str, computer: &str) -> Option<String> {
+    let user = user.trim();
+    let computer = computer.trim();
+    if user.is_empty() || computer.is_empty() {
+        return None;
+    }
+    let label: String = format!("{user}@{computer}")
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .scan(0, |len, ch| {
+            *len += ch.len_utf16();
+            (*len <= 96).then_some(ch)
+        })
+        .collect();
+    Some(label)
+}
+
 fn send(data: &Path, events: Vec<serde_json::Value>) -> Result<(), String> {
     let install_path = data.join("install-id.txt");
     let install_id = std::fs::read_to_string(&install_path)
@@ -106,6 +123,10 @@ fn send(data: &Path, events: Vec<serde_json::Value>) -> Result<(), String> {
         "session_id": session.to_string(),
         "session_started_at": started_iso,
         "app_version": VERSION,
+        "support_identity": support_label(
+            &std::env::var("USERNAME").unwrap_or_default(),
+            &std::env::var("COMPUTERNAME").unwrap_or_default(),
+        ).map(|label| json!({"enabled": true, "source": "windows", "label": label})),
         "events": events
     }))
     .map_err(|e| e.to_string())?;
@@ -162,5 +183,23 @@ mod tests {
     fn unix_epoch_formats_as_utc() {
         assert_eq!(chrono_free_utc(0), "1970-01-01T00:00:00");
         assert_eq!(chrono_free_utc(1_767_225_600), "2026-01-01T00:00:00");
+    }
+
+    #[test]
+    fn support_label_matches_worker_limit() {
+        assert_eq!(
+            support_label(" Alice ", " PC ").as_deref(),
+            Some("Alice@PC")
+        );
+        assert_eq!(support_label("Ali\nce", "PC").as_deref(), Some("Alice@PC"));
+        assert_eq!(support_label("", "PC"), None);
+        assert_eq!(support_label(&"a".repeat(100), "PC").unwrap().len(), 96);
+        assert_eq!(
+            support_label(&"😀".repeat(50), "PC")
+                .unwrap()
+                .encode_utf16()
+                .count(),
+            96
+        );
     }
 }
