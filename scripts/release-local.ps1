@@ -50,10 +50,13 @@ foreach ($asset in $assets) {
 if ($LASTEXITCODE -ne 0) { throw 'GitHub CLI authentication is required to publish.' }
 
 $paths = $assets.FullName
-& gh release create $tag @paths -R $repo --draft --target $publicCommit --title "Mic Noize $tag" --notes-file (Join-Path $root 'release\notes.md')
-if ($LASTEXITCODE -ne 0) { throw 'Could not upload draft release.' }
-$release = & gh api "repos/$repo/releases/tags/$tag" | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0 -or -not $release.draft -or @($release.assets).Count -ne $assets.Count) { throw 'Draft release asset count or status mismatch.' }
+$existing = & gh release view $tag -R $repo --json isDraft,assets,targetCommitish 2>$null
+if ($LASTEXITCODE -ne 0) {
+    & gh release create $tag @paths -R $repo --draft --target $publicCommit --title "Mic Noize $tag" --notes-file (Join-Path $root 'release\notes.md')
+    if ($LASTEXITCODE -ne 0) { throw 'Could not upload draft release.' }
+}
+$release = & gh release view $tag -R $repo --json isDraft,assets,targetCommitish | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or -not $release.isDraft -or $release.targetCommitish -ne $publicCommit -or @($release.assets).Count -ne $assets.Count) { throw 'Draft release source, asset count or status mismatch.' }
 foreach ($asset in $assets) {
     $remote = @($release.assets | Where-Object name -eq $asset.Name)
     if ($remote.Count -ne 1 -or $remote[0].digest -ne ('sha256:' + (Get-FileHash -LiteralPath $asset.FullName).Hash.ToLowerInvariant())) {

@@ -40,5 +40,7 @@ jobs:
           MNR_TELEMETRY_SECRET: ${{ secrets.MNR_TELEMETRY_SECRET }}
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          .\scripts\release-local.ps1 -Version $env:RELEASE_VERSION
+          if (-not (Test-Path "Releases/v$env:RELEASE_VERSION/.release-source.json")) {
+            .\scripts\release-local.ps1 -Version $env:RELEASE_VERSION
+          }
           .\scripts\release-local.ps1 -Version $env:RELEASE_VERSION -Publish

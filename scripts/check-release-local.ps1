@@ -31,6 +31,31 @@ try {
     }
     Write-Output 'Changed asset rejected before GitHub publication.'
 
+    Set-Content (Join-Path $output 'Setup.exe') 'Setup.exe'
+    $global:published = $false
+    $global:draftTarget = 'other-commit'
+    function gh {
+        $global:LASTEXITCODE = 0
+        if ($args[0] -eq 'auth') { return }
+        if ($args[0] -eq 'release' -and $args[1] -eq 'view') {
+            return @{isDraft=$true;targetCommitish=$global:draftTarget;assets=@($names | ForEach-Object {
+                @{name=$_;digest='sha256:' + (Get-FileHash (Join-Path $output $_)).Hash.ToLowerInvariant()}
+            })} | ConvertTo-Json -Depth 4
+        }
+        if ($args[0] -eq 'release' -and $args[1] -eq 'edit') { $global:published = $true; return }
+        throw 'An existing draft must not be recreated.'
+    }
+    try {
+        & (Join-Path $tempRoot 'scripts\release-local.ps1') -Version 1.2.3 -Publish | Out-Null
+        throw 'Draft for another commit was accepted.'
+    } catch {
+        if ($_.Exception.Message -notlike 'Draft release source, asset count or status mismatch.*') { throw }
+    }
+    $global:draftTarget = 'commit'
+    & (Join-Path $tempRoot 'scripts\release-local.ps1') -Version 1.2.3 -Publish | Out-Null
+    if (-not $global:published) { throw 'Verified draft was not published.' }
+    Write-Output 'Matching draft resumed without reupload.'
+
     $previousLocalAppData = $env:LOCALAPPDATA
     try {
         $env:LOCALAPPDATA = $tempRoot
