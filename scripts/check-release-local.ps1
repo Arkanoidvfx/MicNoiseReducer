@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
 $tempRoot = Join-Path $project ('.tmp\release-local-check-' + [guid]::NewGuid().ToString('N'))
 $output = Join-Path $tempRoot 'Releases\v1.2.3'
-$names = @('MicNoize-1.2.3-win-x64-stable-v2-full.nupkg', 'MicNoize-Upgrade-1.2.3.zip', 'Setup.exe', 'checksums.sha256')
+$names = @('MicNoize-1.2.3-win-x64-stable-v2-full.nupkg', 'MicNoize-Upgrade-1.2.3.zip', 'Setup.exe', 'checksums.sha256', 'Repair-0.2.8-update.ps1')
 try {
     New-Item -ItemType Directory -Force (Join-Path $tempRoot 'scripts'),(Join-Path $tempRoot 'release'),$output | Out-Null
     Copy-Item (Join-Path $PSScriptRoot 'release-local.ps1') (Join-Path $tempRoot 'scripts\release-local.ps1')

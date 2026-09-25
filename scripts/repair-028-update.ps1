@@ -1,4 +1,4 @@
-# Run only after Mic Noize 0.2.8 has downloaded 0.2.9 and reports that the
+# Run only after Mic Noize 0.2.8 has downloaded a newer version and reports that the
 # previous full package is missing. The application performs the update itself.
 $ErrorActionPreference = 'Stop'
 $install = Join-Path $env:LOCALAPPDATA 'MicNoize'
@@ -7,9 +7,6 @@ if (-not (Test-Path -LiteralPath $versionFile) -or ([xml](Get-Content -LiteralPa
     throw 'This repair applies only to an installed Mic Noize 0.2.8.'
 }
 $packages = Join-Path $install 'packages'
-if (-not (Test-Path -LiteralPath (Join-Path $packages 'MicNoize-0.2.9-win-x64-stable-v2-full.nupkg'))) {
-    throw 'First download 0.2.9 in Mic Noize and wait for the missing previous package error.'
-}
 $name = 'MicNoize-0.2.8-win-x64-stable-v2-full.nupkg'
 $expected = '065f9e7c0fc83005840ffb76f7b1f02a8894456afa3cdaca3bdfe190c93d5bae'
 $destination = Join-Path $packages $name

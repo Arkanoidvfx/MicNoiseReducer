@@ -398,6 +398,8 @@ enum Msg {
     RouteToggle,
     ReverseWord(String),
     ReverseEdit(bool),
+    /// A left click anywhere; ends the reverse word edit when it left the field.
+    PointerDown,
     HeadphoneToggle,
     HeadphoneOutput(Device),
     HeadphoneNoise(bool),
@@ -592,6 +594,8 @@ struct App {
     epoch: Instant,
     opened_at: Option<Instant>,
     in_peak: f32,
+    /// Bound keys held right now (bitset by virtual-key code), for the pressed keycaps.
+    keys_down: [u64; 4],
     headphone_output: Option<Device>,
     headphone_denoise: bool,
     headphone_intensity: f32,
@@ -708,6 +712,23 @@ fn newest_clips(folder: &Path) -> Vec<Sound> {
         }
     }
     clips
+}
+/// Which keys of `bindings` (virtual key plus the Ctrl/Alt/Shift bits) are held now. Only
+/// bound keys are read, and only while the window is focused, to animate their keycaps.
+fn held_keys(bindings: impl Iterator<Item = u32>) -> [u64; 4] {
+    #[link(name = "user32")]
+    unsafe extern "system" { fn GetAsyncKeyState(key: i32) -> i16; }
+    let mut down = [0u64; 4];
+    for binding in bindings.filter(|b| *b != 0) {
+        let mods = binding >> 8;
+        let vks = [binding & 255, if mods & 1 != 0 { 0x11 } else { 0 }, if mods & 2 != 0 { 0x12 } else { 0 }, if mods & 4 != 0 { 0x10 } else { 0 }];
+        for vk in vks.into_iter().filter(|vk| *vk != 0) {
+            if unsafe { GetAsyncKeyState(vk as i32) } < 0 {
+                down[(vk / 64) as usize] |= 1 << (vk % 64);
+            }
+        }
+    }
+    down
 }
 fn timer(visible: bool) -> Task<Msg> {
     Task::perform(
@@ -975,6 +996,7 @@ impl App {
                 epoch: Instant::now(),
                 opened_at: None,
                 in_peak: 0.0,
+                keys_down: [0; 4],
                 headphone_output: None,
                 headphone_denoise,
                 headphone_intensity,
@@ -1615,6 +1637,12 @@ impl App {
         match msg {
             Msg::Tick => {
                 self.ticks += 1;
+                self.keys_down = if self.ui_active() && !cfg!(test) {
+                    let bound = self.keys.iter().copied().chain(self.sounds.iter().map(|s| s.key)).chain([self.sound_stop_key]);
+                    held_keys(bound)
+                } else {
+                    [0; 4]
+                };
                 if !cfg!(test) && self.ticks.is_multiple_of(20) {
                     self.engine.request_device_state();
                     let warning = engine::tag_task_warning();
@@ -2145,6 +2173,13 @@ impl App {
             }
             Msg::RouteToggle => self.route_open = !self.route_open,
             Msg::ReverseWord(word) => self.reverse_word = word.chars().take(12).collect(),
+            Msg::PointerDown => {
+                if self.reverse_edit {
+                    // The field has already handled the click: it stays focused only if clicked.
+                    return iced::widget::operation::is_focused("reverse-word")
+                        .map(|inside| if inside { Msg::Noop } else { Msg::ReverseEdit(false) });
+                }
+            }
             Msg::ReverseEdit(edit) => {
                 self.reverse_edit = edit;
                 if !edit && self.reverse_word.trim().is_empty() {
@@ -3691,6 +3726,9 @@ impl App {
                     iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                         iced::mouse::Button::Left,
                     )) => Some(Msg::DragEnd),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    )) => Some(Msg::PointerDown),
                     _ => None,
                 }
             }),

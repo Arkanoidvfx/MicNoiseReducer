@@ -65,6 +65,8 @@ if ($setup) {
 }
 if ($Version -eq '0.2.9') {
     Copy-Item (Join-Path $PSScriptRoot 'repair-028-update.ps1') (Join-Path $releases 'Repair-0.2.8-to-0.2.9.ps1')
+} elseif ([version]$Version -ge [version]'0.2.10') {
+    Copy-Item (Join-Path $PSScriptRoot 'repair-028-update.ps1') (Join-Path $releases 'Repair-0.2.8-update.ps1')
 }
 Get-ChildItem $releases -File | Where-Object Name -ne 'checksums.sha256' | Get-FileHash -Algorithm SHA256 |
     ForEach-Object { "$($_.Hash)  $([IO.Path]::GetFileName($_.Path))" } |

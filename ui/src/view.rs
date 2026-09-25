@@ -5,7 +5,7 @@ use iced::widget::{
     self, Space, button, column, container, mouse_area, pick_list, row, scrollable, text,
     text_input,
 };
-use iced::{Border, Color, Length, Shadow, Vector};
+use iced::{Border, Color, Length};
 
 // Keep an off-screen keyboard target mounted without mounting every row on the way to it.
 fn sound_rows(count: usize, scroll: f32, viewport: f32, pitch: f32, focus: Option<usize>) -> Vec<usize> {
@@ -234,6 +234,17 @@ fn focus_target<'a>(
         content
     }
 }
+/// tiny-skia repaints only damaged regions and places vertically centred control text from its
+/// anchor down, so a pick_list or text_input whose label changes would keep the top half of
+/// the old one (hovering repaints it). An invisible background that changes with the label
+/// damages the whole control instead.
+fn repaint<'a>(key: impl std::hash::Hash, content: impl Into<Element<'a, Msg>>) -> Element<'a, Msg> {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    let h = BuildHasherDefault::<DefaultHasher>::default().hash_one(key);
+    let byte = |shift: u32| ((h >> shift) & 0xFF) as f32 / 255.0;
+    let tint = Color { r: byte(0), g: byte(8), b: byte(16), a: 0.0 };
+    container(content).style(move |_| container::Style { background: Some(tint.into()), ..Default::default() }).into()
+}
 fn frame<'a>(content: impl Into<Element<'a, Msg>>, focused: bool) -> Element<'a, Msg> {
     focus_target(content, focused)
         .padding(3)
@@ -392,6 +403,9 @@ fn db_text(peak: f32) -> String {
 impl App {
     fn clock(&self) -> Clock {
         Clock { epoch: self.epoch, opened: self.opened_at, animate: self.ui_active() }
+    }
+    fn key_held(&self, vk: u32) -> bool {
+        self.keys_down[(vk / 64 % 4) as usize] >> (vk % 64) & 1 != 0
     }
     fn page_main(&self) -> bool {
         !self.details && !self.rvc_page && !self.soundpad_page && !self.logs_page && !self.effects_page
@@ -588,12 +602,12 @@ impl App {
             column![
                 label("Микрофон", 12, DIM),
                 frame(
-                    pick_list(self.inputs.as_slice(), self.input.as_ref(), Msg::Input)
+                    repaint(self.input.as_ref().map(ToString::to_string), pick_list(self.inputs.as_slice(), self.input.as_ref(), Msg::Input)
                         .placeholder("Выберите микрофон")
                         .text_size(13)
                         .padding([6, 10])
                         .width(Length::Fill)
-                        .style(device_style),
+                        .style(device_style)),
                     self.focus == INPUT,
                 ),
             ]
@@ -642,12 +656,12 @@ impl App {
             column![
                 label("Наушники", 12, DIM),
                 frame(
-                    pick_list(self.headphone_outputs(), self.headphone_output.clone(), Msg::HeadphoneOutput)
+                    repaint(self.headphone_output.as_ref().map(ToString::to_string), pick_list(self.headphone_outputs(), self.headphone_output.clone(), Msg::HeadphoneOutput)
                         .placeholder("Выберите наушники")
                         .text_size(13)
                         .padding([6, 10])
                         .width(Length::Fill)
-                        .style(device_style),
+                        .style(device_style)),
                     self.focus == focus::headphones::OUTPUT,
                 ),
             ]
@@ -906,13 +920,20 @@ impl App {
             content = content.push(label(&self.headphone_message, 12, RED));
         }
         content = content.push(label("Выход в микшере Windows: Mic Noize Headphones. После остановки верните физические наушники.", 11, FAINT));
-        container(content)
+        let panel = container(content)
             .padding([14, 16])
             .width(410)
             .style(|_| container::Style {
                 background: Some(Color::from_rgb8(0x1F, 0x20, 0x23).into()),
                 border: Border { color: EDGE, width: 1.0, radius: 12.0.into() },
-                shadow: Shadow { color: Color { a: 0.55, ..Color::BLACK }, offset: Vector::new(0.0, 18.0), blur_radius: 40.0 },
+                ..Default::default()
+            });
+        // A dark ring instead of a drop shadow: tiny-skia repaints shadows over partial redraws.
+        container(panel)
+            .padding(3)
+            .style(|_| container::Style {
+                background: Some(Color { a: 0.45, ..Color::BLACK }.into()),
+                border: Border { radius: 15.0.into(), ..Border::default() },
                 ..Default::default()
             })
             .into()
@@ -1154,14 +1175,14 @@ impl App {
     fn reverse_demo(&self) -> Element<'_, Msg> {
         if self.reverse_edit {
             return frame(
-                text_input("ваше слово", &self.reverse_word)
+                repaint(&self.reverse_word, text_input("ваше слово", &self.reverse_word)
                     .id("reverse-word")
                     .size(14)
                     .padding([4, 8])
                     .width(180)
                     .on_input(Msg::ReverseWord)
                     .on_submit(Msg::ReverseEdit(false))
-                    .style(input_style),
+                    .style(input_style)),
                 self.focus == focus::effects::REVERSE_WORD,
             );
         }
@@ -1376,7 +1397,7 @@ impl App {
             column![
                 row![
                     container(frame(
-                        pick_list(
+                        repaint(self.controls.rvc_options.slot, pick_list(
                             self.rvc_models.as_slice(),
                             self.rvc_models.iter().find(|m| m.slot == self.controls.rvc_options.slot).cloned(),
                             Msg::RvcModel,
@@ -1385,7 +1406,7 @@ impl App {
                         .text_size(13)
                         .padding([6, 10])
                         .width(Length::Fill)
-                        .style(device_style),
+                        .style(device_style)),
                         self.focus == MODEL,
                     ))
                     .width(Length::Fill),
@@ -1401,13 +1422,13 @@ impl App {
                 .align_y(iced::Center),
                 row![
                     container(frame(
-                        text_input("Название модели", &self.rvc_name)
+                        repaint(&self.rvc_name, text_input("Название модели", &self.rvc_name)
                             .id("rvc-name")
                             .size(13)
                             .padding([6, 10])
                             .on_input_maybe(self.rvc_can_manage().then_some(Msg::RvcName))
                             .on_submit_maybe(self.rvc_can_manage().then_some(Msg::RvcRename))
-                            .style(input_style),
+                            .style(input_style)),
                         self.focus == NAME,
                     ))
                     .width(Length::Fill),
@@ -1464,7 +1485,7 @@ impl App {
                     frame(tacho(50.0..=300.0, self.controls.rvc_options.gain as f32, Msg::RvcGain, clock).step(5.0).default(100.0).segments(20).compact().phase(1800.0), self.focus == GAIN),
                     row![
                         label("Блок аудио, мс", 13, DIM),
-                        frame(pick_list(rvc::CHUNKS, Some(self.controls.rvc_options.chunk), Msg::RvcChunk).style(device_style), self.focus == CHUNK),
+                        frame(repaint(self.controls.rvc_options.chunk, pick_list(rvc::CHUNKS, Some(self.controls.rvc_options.chunk), Msg::RvcChunk).style(device_style)), self.focus == CHUNK),
                         Space::new().width(Length::Fill),
                         action(label("Обновить модели", 12, INK), Msg::RvcRefresh, self.focus == REFRESH, false),
                     ]
@@ -1533,22 +1554,22 @@ impl App {
         if self.sound_folder.is_some() {
             toolbar = toolbar.push(
                 container(frame(
-                    text_input("Поиск", &self.sound_filter)
+                    repaint(&self.sound_filter, text_input("Поиск", &self.sound_filter)
                         .id("sound-filter")
                         .size(13)
                         .padding([6, 10])
                         .on_input(Msg::SoundpadFilter)
-                        .style(input_style),
+                        .style(input_style)),
                     self.focus == FILTER,
                 ))
                 .width(220),
             );
             toolbar = toolbar.push(frame(
-                pick_list(SoundSort::ALL, Some(self.sound_sort), Msg::SoundpadSort)
+                repaint(self.sound_sort.to_string(), pick_list(SoundSort::ALL, Some(self.sound_sort), Msg::SoundpadSort)
                     .text_size(13)
                     .padding([6, 10])
                     .width(150)
-                    .style(device_style),
+                    .style(device_style)),
                 self.focus == SORT,
             ));
         }
@@ -1712,7 +1733,7 @@ impl App {
             sidebar = sidebar.push(
                 column![
                     frame(
-                        text_input(
+                        repaint(&self.section_name, text_input(
                             custom.and_then(|i| self.sections.get(i)).map(|s| s.name.as_str()).unwrap_or("Название раздела"),
                             &self.section_name,
                         )
@@ -1721,7 +1742,7 @@ impl App {
                         .padding([5, 8])
                         .on_input(Msg::SectionName)
                         .on_submit(Msg::SectionRename)
-                        .style(input_style),
+                        .style(input_style)),
                         self.focus == SECTION_NAME,
                     ),
                     action(label("Удалить раздел", 12, RED), Msg::SectionDelete, self.focus == SECTION_DELETE, false).width(Length::Fill),
@@ -1920,21 +1941,21 @@ impl App {
             column![
                 row![
                     label("Микрофон", 12, FAINT).width(150),
-                    frame(pick_list(self.inputs.as_slice(), self.input.as_ref(), Msg::Input).placeholder("Микрофон отключён / не выбран").width(Length::Fill).text_size(13).style(device_style), self.focus == INPUT),
+                    frame(repaint(self.input.as_ref().map(ToString::to_string), pick_list(self.inputs.as_slice(), self.input.as_ref(), Msg::Input).placeholder("Микрофон отключён / не выбран").width(Length::Fill).text_size(13).style(device_style)), self.focus == INPUT),
                 ]
                 .align_y(iced::Center),
                 row![
                     label("Передать голос в", 12, FAINT).width(150),
-                    frame(pick_list(self.outputs.as_slice(), self.output.as_ref(), Msg::Output).placeholder("Выберите выход").width(Length::Fill).text_size(13).style(device_style), self.focus == OUTPUT),
+                    frame(repaint(self.output.as_ref().map(ToString::to_string), pick_list(self.outputs.as_slice(), self.output.as_ref(), Msg::Output).placeholder("Выберите выход").width(Length::Fill).text_size(13).style(device_style)), self.focus == OUTPUT),
                 ]
                 .align_y(iced::Center),
                 row![
                     label("Модель", 12, FAINT).width(150),
-                    frame(pick_list([1, 2], Some(self.version), Msg::Version).width(90).style(device_style), self.focus == VERSION),
+                    frame(repaint(self.version, pick_list([1, 2], Some(self.version), Msg::Version).width(90).style(device_style)), self.focus == VERSION),
                     label("v2 экспериментальная", 12, FAINT),
                     Space::new().width(Length::Fill),
                     label("Буфер, мс", 12, FAINT),
-                    frame(pick_list([10, 20, 30, 40, 60, 80], Some(self.buffer), Msg::Buffer).width(80).style(device_style), self.focus == BUFFER),
+                    frame(repaint(self.buffer, pick_list([10, 20, 30, 40, 60, 80], Some(self.buffer), Msg::Buffer).width(80).style(device_style)), self.focus == BUFFER),
                 ]
                 .spacing(10)
                 .align_y(iced::Center),
@@ -2046,12 +2067,22 @@ impl App {
             } else {
                 let name = key_name(key);
                 widget::Row::with_children(name.split(" + ").map(|part| {
-                    container(label(part.to_owned(), 11, if lit { ORANGE_DARK } else { Color::from_rgb8(0xE8, 0xE3, 0xD9) }).font(Font::with_name("Consolas")))
+                    let vk = match part { "Ctrl" => 0x11, "Alt" => 0x12, "Shift" => 0x10, _ => key & 255 };
+                    let down = lit || self.key_held(vk);
+                    let cap = container(label(part.to_owned(), 11, if down { ORANGE_DARK } else { Color::from_rgb8(0xE8, 0xE3, 0xD9) }).font(Font::with_name("Consolas")))
                         .padding([3, 6])
                         .style(move |_| container::Style {
-                            background: Some((if lit { ORANGE } else { Color::from_rgb8(0x2A, 0x2B, 0x30) }).into()),
-                            border: Border { color: if lit { Color::from_rgb8(0xC9, 0x72, 0x2F) } else { EDGE }, width: 1.0, radius: 5.0.into() },
-                            shadow: Shadow { color: if lit { Color { a: 0.5, ..ORANGE } } else { Color { a: 0.35, ..Color::BLACK } }, offset: Vector::new(0.0, if lit { 0.0 } else { 1.5 }), blur_radius: if lit { 10.0 } else { 0.0 } },
+                            background: Some((if down { ORANGE } else { Color::from_rgb8(0x2A, 0x2B, 0x30) }).into()),
+                            border: Border { color: if down { Color::from_rgb8(0xC9, 0x72, 0x2F) } else { EDGE }, width: 1.0, radius: 5.0.into() },
+                            ..Default::default()
+                        });
+                    // The key's side: a pressed cap sinks into it. A drawn base, not a shadow:
+                    // tiny-skia's shadows ignore partial repaints and turn black without blur.
+                    container(cap)
+                        .padding(if down { iced::Padding { top: 2.0, ..Default::default() } } else { iced::Padding { bottom: 2.0, ..Default::default() } })
+                        .style(move |_| container::Style {
+                            background: Some((if down { Color::from_rgb8(0x8A, 0x4E, 0x1F) } else { RAIL }).into()),
+                            border: Border { radius: 5.0.into(), ..Border::default() },
                             ..Default::default()
                         })
                         .into()

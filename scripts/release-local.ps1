@@ -31,6 +31,7 @@ if (-not $Publish) {
 $assets = @(Get-ChildItem -LiteralPath $output -File | Where-Object Name -ne '.release-source.json')
 $required = @("MicNoize-$Version-win-x64-stable-v2-full.nupkg", "MicNoize-Upgrade-$Version.zip", 'Setup.exe', 'checksums.sha256')
 if ($Version -eq '0.2.9') { $required += 'Repair-0.2.8-to-0.2.9.ps1' }
+if ([version]$Version -ge [version]'0.2.10') { $required += 'Repair-0.2.8-update.ps1' }
 foreach ($name in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $output $name))) { throw "Release asset missing: $name" }
 }

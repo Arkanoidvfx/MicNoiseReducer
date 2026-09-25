@@ -373,9 +373,9 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             }
             let y = track.y + track.height + lift - height;
             if self.enabled && is_head {
-                halo(&mut shapes, x, y, w, height, if self.compact { 9.0 } else { 14.0 }, Color { a: 0.9, ..GLOW });
+                halo(&mut shapes, x, y, w, height, if self.compact { 7.0 } else { 11.0 }, Color { a: 0.6, ..GLOW });
             } else if self.enabled && hot {
-                halo(&mut shapes, x, y, w, height, 8.0, Color { a: 0.5 * pulse, ..HOT });
+                halo(&mut shapes, x, y, w, height, 6.0, Color { a: 0.35 * pulse, ..HOT });
             }
             if lit {
                 segment(&mut shapes, x, y, w, height, Color { a: color.a * alpha, ..color });
@@ -827,13 +827,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Reverse {
             Event::Window(window::Event::RedrawRequested(now)) if self.clock.animate && !*hover => {
                 let t = self.cycle(*now);
                 let moving = (0.25..0.40).contains(&t) || (0.75..0.90).contains(&t);
-                let wait = if moving {
-                    33.0
+                if moving {
+                    shell.request_redraw_at(RedrawRequest::NextFrame);
                 } else {
                     let edge = [0.25, 0.75, 1.25].into_iter().find(|e| *e > t).unwrap_or(1.25);
-                    (edge - t) * REV_CYCLE
-                };
-                shell.request_redraw_at(RedrawRequest::At(*now + Duration::from_millis(wait.max(16.0) as u64)));
+                    let wait = ((edge - t) * REV_CYCLE).max(16.0);
+                    shell.request_redraw_at(RedrawRequest::At(*now + Duration::from_millis(wait as u64)));
+                }
             }
             _ => {}
         }
