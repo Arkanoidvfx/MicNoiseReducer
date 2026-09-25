@@ -23,4 +23,5 @@ fn main() {
     println!("cargo:rerun-if-changed={}", icon.display());
     println!("cargo:rerun-if-changed=../build/native/Release/mic_engine.lib");
     println!("cargo:rerun-if-changed=../build/native/Release/rubberband.lib");
+    println!("cargo:rerun-if-env-changed=MNR_TELEMETRY_SECRET");
 }

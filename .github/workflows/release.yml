@@ -1,8 +1,6 @@
 name: Release Mic Noize
 
 on:
-  push:
-    tags: ["v*.*.*"]
   workflow_dispatch:
     inputs:
       version:
@@ -44,9 +42,9 @@ jobs:
       - name: Build native
         shell: pwsh
         run: .\build.ps1 -NativeOnly
-      # Registry/git sources and compiled dependencies. Exact key only: a new rustc or Cargo.lock
-      # builds cold rather than piling stale artifacts into the cache. GitHub drops an entry
-      # unused for 7 days, and caches saved by tag-push runs are not reused: release by dispatch.
+      # Registry/git sources and compiled dependencies. Reuse the last cache from this rustc
+      # across patch-version Cargo.lock changes; Cargo still checks fingerprints. Dispatch
+      # releases so the public default branch can restore its prior cache.
       - name: Cache Rust build
         uses: actions/cache@v4
         with:
@@ -56,6 +54,8 @@ jobs:
             .cache/cargo/git/db
             build/rust
           key: rust-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('ui/Cargo.lock') }}
+          restore-keys: |
+            rust-${{ steps.toolchain.outputs.cachekey }}-
       # Never trust a cached Mic Noize binary: the release exe is always compiled from this commit.
       - name: Drop cached Mic Noize artifacts
         shell: pwsh

@@ -227,6 +227,39 @@ fn copy_synced(from: &Path, to: &Path) -> Result<(), String> {
     fs::copy(from, to).map_err(|e| e.to_string())?;
     File::options().write(true).open(to).and_then(|f| f.sync_all()).map_err(|e| e.to_string())
 }
+fn retained_package(runtime:&Path,version:&str)->PathBuf {
+    runtime.join(".update").join(format!("previous-{version}.nupkg"))
+}
+fn current_package(packages:&Path,runtime:&Path,version:&str)->Result<PathBuf,String> {
+    use velopack::locator::find_local_full_packages;
+    find_local_full_packages(packages).into_iter()
+        .find(|(_,m)|m.id=="MicNoize" && m.version.to_string()==version).map(|(path,_)|path)
+        .or_else(||retained_package(runtime,version).is_file().then(||retained_package(runtime,version)))
+        .ok_or("Предыдущий полный пакет отсутствует: безопасный откат недоступен".into())
+}
+fn preserve_current_package(root:&Path,packages:&Path,runtime:&Path,version:&str)->Result<(),String> {
+    use velopack::locator::find_local_full_packages;
+    let retained=retained_package(runtime,version);
+    if retained.is_file() && package(&retained,version).and_then(|b|b.installed(root)).is_ok(){return Ok(());}
+    let source=find_local_full_packages(packages).into_iter()
+        .find(|(_,m)|m.id=="MicNoize" && m.version.to_string()==version)
+        .ok_or("Полный пакет текущей версии отсутствует; безопасный откат недоступен")?.0;
+    package(&source,version)?.installed(root)?;
+    fs::create_dir_all(retained.parent().unwrap()).map_err(|e|e.to_string())?;
+    let source_hash=hash(&mut File::open(&source).map_err(|e|e.to_string())?)?;
+    let pending=retained.with_extension("partial");copy_synced(&source,&pending)?;
+    check_hash(&pending,&source_hash)?;
+    package(&pending,version)?.installed(root)?;
+    if retained.exists(){fs::remove_file(&retained).map_err(|e|e.to_string())?;}
+    fs::rename(&pending,&retained).map_err(|e|e.to_string())
+}
+pub fn preserve_current_package_for_download()->Result<(),String> {
+    use velopack::locator::{auto_locate_app_manifest,LocationContext};
+    let _lock=Lock::acquire()?;
+    let location=auto_locate_app_manifest(LocationContext::FromCurrentExe).map_err(|e|e.to_string())?;
+    let runtime=crate::paths::Paths::resolve()?.runtime_root().to_path_buf();
+    preserve_current_package(&location.get_root_dir(),&location.get_packages_dir(),&runtime,&location.get_manifest_version().to_string())
+}
 fn native(call: impl FnOnce(*mut c_char, u32) -> i32, minimum: i32) -> Result<i32, String> {
     let mut error = [0u8; 4096]; let result = call(error.as_mut_ptr().cast(), error.len() as u32);
     if result < minimum { return Err(String::from_utf8_lossy(&error[..error.iter().position(|c| *c == 0).unwrap_or(error.len())]).into_owned()); }
@@ -519,7 +552,7 @@ fn apply(j: &mut Journal, previous: bool) -> Result<(), String> {
     Ok(())
 }
 pub fn prepare(candidate: &velopack::VelopackAsset) -> Result<(), String> {
-    use velopack::locator::{auto_locate_app_manifest, find_local_full_packages, LocationContext};
+    use velopack::locator::{auto_locate_app_manifest, LocationContext};
     let _lock = Lock::acquire()?;
     let location = auto_locate_app_manifest(LocationContext::FromCurrentExe).map_err(|e| e.to_string())?;
     let paths = crate::paths::Paths::resolve()?; let runtime = paths.runtime_root().to_path_buf();
@@ -531,8 +564,7 @@ pub fn prepare(candidate: &velopack::VelopackAsset) -> Result<(), String> {
     if Path::new(&candidate.FileName).file_name().and_then(|n|n.to_str()) != Some(candidate.FileName.as_str()) { return Err("Invalid package filename".into()); }
     let next = location.get_packages_dir().join(&candidate.FileName);
     let after = package(&next,&candidate.Version)?;
-    let previous = find_local_full_packages(&location.get_packages_dir()).into_iter()
-        .find(|(_,m)| m.version == location.get_manifest_version()).ok_or("Предыдущий полный пакет отсутствует: безопасный откат недоступен")?.0;
+    let previous = current_package(&location.get_packages_dir(),&runtime,&location.get_manifest_version().to_string())?;
     let before = package(&previous,&location.get_manifest_version().to_string())?;
     before.installed(&location.get_root_dir())?;
     let mut j = Journal { schema:1, transaction:uuid::Uuid::new_v4().to_string(), install:location.get_root_dir(), runtime, phase:Phase::Prepared,
@@ -701,6 +733,23 @@ pub fn startup() -> Result<bool,String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn update_download_retains_current_package_outside_velopack_cache() {
+        let t=temp();let root=&t.0;let runtime=root.join("runtime");let current=root.join("current");
+        let packages=root.join("packages");fs::create_dir_all(&current).unwrap();fs::create_dir(&packages).unwrap();
+        fs::write(root.join("Update.exe"),b"updater").unwrap();fs::write(root.join(".portable"),b"").unwrap();
+        fs::write(current.join("MicNoize.exe"),b"UI").unwrap();fs::write(current.join("mic_tag_host.exe"),b"host").unwrap();
+        fs::write(current.join("sq.version"),b"<package><metadata><id>MicNoize</id><version>0.2.7</version><mainExe>MicNoize.exe</mainExe></metadata></package>").unwrap();
+        let source=packages.join("MicNoize-0.2.7-win-x64-stable-v2-full.nupkg");
+        archive(&source,&bundle("0.2.7",b"UI",b"host"),b"UI",b"host");
+        preserve_current_package(root,&packages,&runtime,"0.2.7").unwrap();
+        fs::remove_file(&source).unwrap(); // Velopack removes old packages after download.
+        let retained=current_package(&packages,&runtime,"0.2.7").unwrap();
+        package(&retained,"0.2.7").unwrap().installed(root).unwrap();
+        preserve_current_package(root,&packages,&runtime,"0.2.7").unwrap();
+        fs::write(&retained,b"corrupt").unwrap();
+        assert!(preserve_current_package(root,&packages,&runtime,"0.2.7").is_err());
+    }
     #[test]
     fn migrated_package_is_cached_for_the_next_safe_update() {
         let t=temp();let runtime=t.0.join("runtime");

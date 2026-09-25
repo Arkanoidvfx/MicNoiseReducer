@@ -1,6 +1,6 @@
 [package]
 name = "micnoize"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 rust-version = "1.97"
 build = "build.rs"
@@ -12,6 +12,8 @@ base64 = "0.22"
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "978576aa8400552a4ce9730838c635aa30db5e61", default-features = false, features = ["tract", "default-model"] }
 ed25519-dalek = "2"
 iced = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "advanced"] }
+# Iced's own renderer; `geometry` draws the slanted slider shapes as anti-aliased paths.
+iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["geometry"] }
 png = "0.18"
 hex = "0.4"
 hmac = "0.12"
@@ -30,7 +32,6 @@ winresource = "0.1"
 
 [dev-dependencies]
 # Already used by Iced; reproduce its damage-based CPU rendering without a window.
-iced_tiny_skia = { version = "=0.14.1", default-features = false }
 tiny-skia = { version = "=0.11.4", default-features = false, features = ["std", "simd"] }
 
 [profile.release]

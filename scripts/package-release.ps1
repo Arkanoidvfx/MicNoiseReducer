@@ -1,11 +1,13 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Version, [switch]$Stage)
+param([Parameter(Mandatory)][string]$Version, [switch]$Stage, [string]$OutputDir)
 
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Version must be semver.' }
 $root = Split-Path -Parent $PSScriptRoot
 $publish = Join-Path $root 'publish'
-$releases = Join-Path $root 'Releases'
+$releases = if ($OutputDir) {
+    if ([IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $root $OutputDir }
+} else { Join-Path $root 'Releases' }
 if ($Stage) { & (Join-Path $PSScriptRoot 'stage-release.ps1') -Version $Version }
 if (-not (Test-Path (Join-Path $publish 'MicNoize.exe'))) { throw 'Release is not staged.' }
 $bundle = Get-Content (Join-Path $publish 'micnoize-bundle.json') -Raw | ConvertFrom-Json
@@ -17,7 +19,7 @@ if ($bundle.version -ne $Version -or
 New-Item -ItemType Directory -Force $releases | Out-Null
 # Old 0.2.5 applies before the new recovery code can run. Never serve a paired
 # package on its channel: the first transition requires the external upgrader.
-$legacyFeed = Join-Path $releases 'releases.win-x64-stable.json'
+$legacyFeed = Join-Path $root 'Releases\releases.win-x64-stable.json'
 if (Test-Path -LiteralPath $legacyFeed) {
     $legacy = Get-Content $legacyFeed -Raw | ConvertFrom-Json
     if (@($legacy.Assets | Where-Object { [version]$_.Version -gt [version]'0.2.5' }).Count) {
@@ -25,6 +27,7 @@ if (Test-Path -LiteralPath $legacyFeed) {
     }
 }
 dotnet tool restore
+if ($LASTEXITCODE -ne 0) { throw 'Velopack tool restore failed.' }
 dotnet tool run vpk -- pack `
     --packId MicNoize `
     --packVersion $Version `
@@ -59,6 +62,9 @@ $setup = Get-Item (Join-Path $releases 'MicNoize-win-x64-stable-v2-Setup.exe')
 if ($setup) {
     Copy-Item $setup.FullName (Join-Path $releases "Mic-Noize-Setup-$Version.exe") -Force
     Copy-Item $setup.FullName (Join-Path $releases 'Setup.exe') -Force
+}
+if ($Version -eq '0.2.9') {
+    Copy-Item (Join-Path $PSScriptRoot 'repair-028-update.ps1') (Join-Path $releases 'Repair-0.2.8-to-0.2.9.ps1')
 }
 Get-ChildItem $releases -File | Where-Object Name -ne 'checksums.sha256' | Get-FileHash -Algorithm SHA256 |
     ForEach-Object { "$($_.Hash)  $([IO.Path]::GetFileName($_.Path))" } |

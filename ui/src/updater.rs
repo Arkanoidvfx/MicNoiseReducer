@@ -23,6 +23,7 @@ pub fn check_and_download() -> Status {
     match manager.check_for_updates() {
         Ok(UpdateCheck::UpdateAvailable(update)) => {
             let version = update.TargetFullRelease.Version.to_string();
+            if let Err(error)=crate::maintenance::preserve_current_package_for_download(){return Status::Unavailable(error);}
             manager
                 .download_updates(&update, None)
                 .map(|_| Status::Ready(version))

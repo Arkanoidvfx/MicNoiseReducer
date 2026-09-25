@@ -340,6 +340,33 @@ fn meter<'a>(level: f32, color: Color) -> Element<'a, Msg> {
     .width(Length::Fill)
     .into()
 }
+/// The hero recording's bars, as in the mockup: a stable pseudo-waveform per clip (the real
+/// samples are not decoded for the UI), filled with the slider gradient as it plays.
+fn waveform<'a>(name: &str, progress: Option<f32>) -> Element<'a, Msg> {
+    const BARS: usize = 30;
+    let seed = name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) % 997;
+    let seed = seed as f32 / 97.0;
+    let done = progress.map_or(0, |p| (p * BARS as f32).round() as usize);
+    widget::Row::with_children((0..BARS).map(|i| {
+        let t = i as f32;
+        let h = 5.0 + 24.0 * ((t * 0.55 + seed).sin() * (t * 0.21 + seed * 1.7).cos()).abs();
+        let fill = if i < done {
+            tacho::lerp(t / BARS as f32)
+        } else if progress.is_some() {
+            Color::from_rgb8(0x5A, 0x5B, 0x61)
+        } else {
+            Color::from_rgb8(0x4A, 0x4B, 0x51)
+        };
+        container(Space::new().width(Length::Fill).height(h.round()))
+            .width(Length::Fill)
+            .style(move |_| container::Style { background: Some(fill.into()), border: Border { radius: 1.0.into(), ..Border::default() }, ..Default::default() })
+            .into()
+    }))
+    .spacing(3)
+    .align_y(iced::Center)
+    .width(Length::Fill)
+    .into()
+}
 fn panel_row<'a>(name: Element<'a, Msg>, control: Element<'a, Msg>) -> widget::Row<'a, Msg> {
     row![container(name).width(112), control].spacing(12).align_y(iced::Center).height(34)
 }
@@ -717,10 +744,10 @@ impl App {
         let level = |p: f32| ((db(p) + 60.0) / 60.0).clamp(0.0, 1.0);
         let meters = card(
             column![
-                row![label("До", 12, DIM).width(56), meter(level(before), Color::from_rgb8(0x6B, 0x6C, 0x73)), numbers(db_text(before), 12, DIM).width(64).align_x(iced::alignment::Horizontal::Right)]
+                row![label("До", 12, DIM).width(56), meter(level(before), Color::from_rgb8(0x6B, 0x6C, 0x73)), container(numbers(db_text(before), 12, DIM)).align_right(64)]
                     .spacing(12)
                     .align_y(iced::Center),
-                row![label("После", 12, INK).width(56), meter(level(after), if level(after) > 0.9 { ORANGE } else { GREEN }), numbers(db_text(after), 12, INK).width(64).align_x(iced::alignment::Horizontal::Right)]
+                row![label("После", 12, INK).width(56), meter(level(after), if level(after) > 0.9 { ORANGE } else { GREEN }), container(numbers(db_text(after), 12, INK)).align_right(64)]
                     .spacing(12)
                     .align_y(iced::Center),
             ]
@@ -1204,7 +1231,7 @@ impl App {
                 SoundState::Loaded(s) => format!("{s:.1} с").replace('.', ","),
                 _ => String::new(),
             };
-            let bar = meter(p.unwrap_or(0.0), ORANGE);
+            let bar = waveform(&clip.name, p);
             container(
                 row![
                     play,

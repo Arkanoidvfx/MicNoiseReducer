@@ -1,10 +1,16 @@
-//! "Тахометр": the segmented slider of the 0.2.8 design. Skewed segments are drawn as thin
-//! horizontal slices because the tiny-skia renderer only has axis-aligned quads; that keeps
-//! the widget free of the canvas feature. Every animation is time-based and self-scheduled
-//! through redraw requests, so a still, unfocused or hidden window draws nothing extra.
+//! "Тахометр": the segmented slider of the 0.2.8 design. Skewed shapes are anti-aliased
+//! tiny-skia paths (its `geometry` feature), so they look like the mockup at any scale. Every
+//! animation is time-based and self-scheduled through redraw requests, so a still, unfocused
+//! or hidden window draws nothing extra.
 use iced::advanced::layout::{self, Layout};
-use iced::advanced::renderer::{self, Quad};
-use iced::advanced::text::{self, Text};
+use iced::advanced::renderer::{self, Quad, Renderer as _};
+use iced::advanced::text::{self, Paragraph as _, Renderer as _, Text};
+use iced::Renderer;
+use iced_tiny_skia::Geometry;
+use iced_tiny_skia::geometry::{Cache, Frame};
+use iced_tiny_skia::graphics::cache::{Cached as _, Group};
+use iced_tiny_skia::graphics::geometry::{Path, Renderer as _, frame::Backend as _};
+use std::cell::RefCell;
 use iced::advanced::widget::{Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell};
 use iced::keyboard;
@@ -15,15 +21,16 @@ use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
 const SKEW: f32 = 0.364; // tan 20°
-const SLICE: f32 = 2.0;
 const WAVE_CYCLE: f32 = 8000.0;
 const WAVE_STEP: f32 = 64.0;
 const WAVE_LEN: f32 = 568.0;
 const STAGGER: f32 = 9.0;
 const IGNITE_STEP: f32 = 14.0;
 const IDLE_AFTER: Duration = Duration::from_millis(1500);
-pub const UNLIT: Color = Color::from_rgb8(0x24, 0x25, 0x29);
-const UNLIT_RED: Color = Color::from_rgb8(0x2C, 0x1A, 0x1A);
+const OFF: Color = Color::from_rgb8(0x1E, 0x1F, 0x22);
+const OFF_RED: Color = Color::from_rgb8(0x2C, 0x1A, 0x1A);
+const OFF_EDGE: Color = Color::from_rgb8(0x2A, 0x2B, 0x30);
+const GLOW: Color = Color::from_rgb8(0xFF, 0xBE, 0x8C);
 const LOW: [f32; 3] = [196.0, 108.0, 44.0];
 const HIGH: [f32; 3] = [255.0, 176.0, 112.0];
 const HEAD: Color = Color::from_rgb8(0xFF, 0xE3, 0xC7);
@@ -171,12 +178,10 @@ struct State {
     touched: Option<Instant>,
     frame: Option<Instant>,
     hover_since: Option<Instant>,
+    painted: Painted,
 }
 
-impl<'a, Message, Renderer> Widget<Message, Theme, Renderer> for Tacho<'a, Message>
-where
-    Renderer: renderer::Renderer + text::Renderer<Font = Font>,
-{
+impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
     fn tag(&self) -> tree::Tag { tree::Tag::of::<State>() }
     fn state(&self) -> tree::State { tree::State::new(State::default()) }
     fn size(&self) -> Size<Length> {
@@ -315,6 +320,7 @@ where
         });
         let press = if state.drag { 1.2 } else { 1.0 };
         let w = self.seg_width();
+        let mut shapes = Vec::with_capacity(n * 6);
         for i in 0..n {
             let ii = i as i32;
             let mut lit = ii >= lo && ii < hi;
@@ -335,14 +341,15 @@ where
                 }
             }
             let red = ii >= red_from;
+            let hot = lit && red && !is_head;
+            let ghost = !lit && state.peak.is_some_and(|(p, _)| p == ii);
             let mut color = if lit {
                 if is_head { HEAD } else if red { HOT } else { lerp(i as f32 / n as f32) }
-            } else if red { UNLIT_RED } else { UNLIT };
-            if lit && red && !is_head {
+            } else if ghost {
+                Color { a: 0.4, ..HEAD }
+            } else if red { OFF_RED } else { OFF };
+            if hot {
                 color = scale(color, pulse);
-            }
-            if !lit && state.peak.is_some_and(|(p, _)| p == ii) {
-                color = Color { a: 0.4, ..HEAD };
             }
             let x = self.seg_x(track, i);
             let mut height = track.height * press;
@@ -364,19 +371,19 @@ where
             if glow > 0.0 {
                 color = brighten(color, glow);
             }
-            if is_head && self.enabled {
-                renderer.fill_quad(
-                    Quad {
-                        bounds: Rectangle { x: x - 2.0, y: track.y + lift - 2.0, width: w + 4.0, height: track.height + 4.0 },
-                        border: Border { radius: 3.0.into(), ..Border::default() },
-                        shadow: iced::Shadow { color: Color { a: 0.55 * alpha, ..TAG }, offset: iced::Vector::ZERO, blur_radius: 12.0 },
-                        snap: false,
-                    },
-                    Color { a: 0.0, ..TAG },
-                );
+            let y = track.y + track.height + lift - height;
+            if self.enabled && is_head {
+                halo(&mut shapes, x, y, w, height, if self.compact { 9.0 } else { 14.0 }, Color { a: 0.9, ..GLOW });
+            } else if self.enabled && hot {
+                halo(&mut shapes, x, y, w, height, 8.0, Color { a: 0.5 * pulse, ..HOT });
             }
-            let bottom = track.y + track.height + lift;
-            skewed(renderer, x, bottom - height, w, height, Color { a: color.a * alpha, ..color });
+            if lit {
+                segment(&mut shapes, x, y, w, height, Color { a: color.a * alpha, ..color });
+            } else {
+                // Unlit segments are outlined, as in the mockup.
+                segment(&mut shapes, x, y, w, height, Color { a: alpha, ..OFF_EDGE });
+                segment(&mut shapes, x + 1.0, y + 1.0, w - 2.0, height - 2.0, Color { a: color.a * alpha, ..color });
+            }
         }
         let text_value = if matches!(ignition, Some(Sweep::Up(_))) {
             "MAX".to_owned()
@@ -386,26 +393,25 @@ where
         };
         let red_text = in_red && ignition.is_none();
         if self.compact {
-            let size = 15.0;
-            renderer.fill_text(
-                label(text_value, size, Size::new(58.0, bounds.height), text::Alignment::Right),
+            state.painted.draw(renderer, bounds.expand(24.0), shapes);
+            put(
+                renderer,
+                label(text_value, 15.0, Size::new(58.0, bounds.height), text::Alignment::Right),
                 Point::new(bounds.x + bounds.width, bounds.center_y()),
                 Color { a: alpha, ..if red_text { HOT } else { INK } },
                 bounds,
             );
         } else {
+            let text = label(text_value, 14.0, Size::new(120.0, 23.0), text::Alignment::Center);
+            let tw = measure(&text).width + 24.0;
             let at = if hi > lo { head as f32 + 0.5 } else { lo as f32 };
             let cx = track.x + w / 2.0 + (track.width - w) * (at - 0.5).max(0.0) / (n - 1) as f32;
-            let tw = 22.0 + 8.2 * text_value.chars().count() as f32;
             let tx = (cx - tw / 2.0).clamp(bounds.x, bounds.x + bounds.width - tw);
             let ty = bounds.y + if state.drag { -4.0 } else { 0.0 };
-            skewed(renderer, tx, ty, tw, 23.0, Color { a: alpha, ..if red_text { HOT } else { TAG } });
-            renderer.fill_text(
-                label(text_value, 14.0, Size::new(tw, 23.0), text::Alignment::Center),
-                Point::new(tx + tw / 2.0, ty + 11.5),
-                Color { a: alpha, ..DARK },
-                bounds,
-            );
+            // The tag's slant matches the mockup's clip-path: 7 px over its height.
+            slant(&mut shapes, tx, ty, tw - 7.0, 23.0, 7.0, Color { a: alpha, ..if red_text { HOT } else { TAG } });
+            state.painted.draw(renderer, bounds.expand(24.0), shapes);
+            put(renderer, text, Point::new(tx + tw / 2.0, ty + 11.5), Color { a: alpha, ..DARK }, bounds.expand(8.0));
         }
     }
 
@@ -510,7 +516,7 @@ fn wave(t: f32, compact: bool) -> (f32, f32) {
     (0.0, 0.0)
 }
 
-fn lerp(t: f32) -> Color {
+pub fn lerp(t: f32) -> Color {
     let c = |i: usize| (LOW[i] + (HIGH[i] - LOW[i]) * t) / 255.0;
     Color::from_rgb(c(0), c(1), c(2))
 }
@@ -522,22 +528,136 @@ fn scale(c: Color, k: f32) -> Color {
     Color { a: c.a * k, ..c }
 }
 
-/// A parallelogram leaning right at the top, built from horizontal slices.
-pub fn skewed<Renderer: renderer::Renderer>(renderer: &mut Renderer, x: f32, y: f32, w: f32, h: f32, color: Color) {
-    let slices = (h / SLICE).ceil().max(1.0) as usize;
-    let sh = h / slices as f32;
-    for s in 0..slices {
-        let mid = y + (s as f32 + 0.5) * sh;
-        let shift = (y + h / 2.0 - mid) * SKEW;
-        renderer.fill_quad(
-            Quad {
-                bounds: Rectangle { x: x + shift, y: y + s as f32 * sh, width: w, height: sh + 0.25 },
-                snap: false,
-                ..Quad::default()
-            },
-            color,
-        );
+/// A parallelogram whose top edge sits `lean` px right of its bottom edge.
+#[derive(Clone, Copy, PartialEq)]
+struct Shape {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    lean: f32,
+    /// Corner rounding, for glow rings.
+    round: f32,
+    color: Color,
+}
+
+fn slant(shapes: &mut Vec<Shape>, x: f32, y: f32, w: f32, h: f32, lean: f32, color: Color) {
+    if w > 0.0 && h > 0.0 && color.a > 0.0 {
+        shapes.push(Shape { x, y, w, h, lean, round: 0.0, color });
     }
+}
+
+fn geometry(clip: Rectangle, shapes: &[Shape]) -> Geometry {
+    let mut frame = Frame::new(clip);
+    for &Shape { x, y, w, h, lean, round, color } in shapes {
+        let corners = [Point::new(x + lean, y), Point::new(x + lean + w, y), Point::new(x + w, y + h), Point::new(x, y + h)];
+        let path = Path::new(|p| {
+            if round > 0.0 {
+                let [a, b, ..] = corners;
+                p.move_to(Point::new((a.x + b.x) / 2.0, y));
+                for i in 1..=4 {
+                    p.arc_to(corners[i % 4], corners[(i + 1) % 4], round);
+                }
+            } else {
+                p.move_to(corners[0]);
+                for &c in &corners[1..] {
+                    p.line_to(c);
+                }
+            }
+            p.close();
+        });
+        frame.fill(&path, color);
+    }
+    frame.into_geometry()
+}
+
+/// The last drawn shapes. tiny-skia treats uncached geometry as changed on every frame, which
+/// would repaint each slider whenever anything else in the window redraws; an unchanged frame
+/// reuses the cache instead and costs nothing.
+#[derive(Default)]
+struct Painted(RefCell<Option<(Rectangle, Vec<Shape>, Cache)>>);
+
+impl Painted {
+    fn draw(&self, renderer: &mut Renderer, clip: Rectangle, shapes: Vec<Shape>) {
+        let mut last = self.0.borrow_mut();
+        if !last.as_ref().is_some_and(|(c, s, _)| *c == clip && *s == shapes) {
+            let cache = geometry(clip, &shapes).cache(Group::unique(), None);
+            *last = Some((clip, shapes, cache));
+        }
+        if let Some((_, _, cache)) = last.as_ref() {
+            renderer.draw_geometry(Geometry::load(cache));
+        }
+    }
+}
+
+/// A box skewed by 20° around its centre, like the mockup's `skewX(-20deg)`.
+fn segment(shapes: &mut Vec<Shape>, x: f32, y: f32, w: f32, h: f32, color: Color) {
+    slant(shapes, x - h * SKEW / 2.0, y, w, h, h * SKEW, color);
+}
+
+/// A soft glow around a segment: stacked, growing translucent copies of its shape stand in
+/// for the mockup's blurred box-shadow, which tiny-skia cannot blur.
+/// Each ring is the segment grown by `e` with corners rounded by `e`, the outline a blur's
+/// level lines follow, so the glow has no spikes at the slanted corners.
+fn halo(shapes: &mut Vec<Shape>, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Color) {
+    const RINGS: usize = 8;
+    let cos = 1.0 / (1.0 + SKEW * SKEW).sqrt();
+    for k in 1..=RINGS {
+        let e = radius * k as f32 / RINGS as f32;
+        let (gh, side) = (h + 2.0 * e, e / cos);
+        shapes.push(Shape {
+            x: x - h * SKEW / 2.0 - side - e * SKEW,
+            y: y - e,
+            w: w + 2.0 * side,
+            h: gh,
+            lean: gh * SKEW,
+            round: e,
+            color: Color { a: color.a * 0.09, ..color },
+        });
+    }
+}
+
+fn measure(text: &Text<String, Font>) -> Size {
+    <Renderer as text::Renderer>::Paragraph::with_text(Text {
+        content: text.content.as_str(),
+        bounds: text.bounds,
+        size: text.size,
+        line_height: text.line_height,
+        font: text.font,
+        align_x: text::Alignment::Left,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: text.shaping,
+        wrapping: text.wrapping,
+    })
+    .min_bounds()
+}
+
+/// `fill_text` anchored by the text's own alignment. tiny-skia repaints only damaged regions and
+/// records a text as starting at its position, so centred or right-aligned text that moves or
+/// changes would leave stale pixels behind; drawing it from its measured top-left avoids that.
+fn put(renderer: &mut Renderer, text: Text<String, Font>, at: Point, color: Color, clip: Rectangle) {
+    let size = measure(&text);
+    let x = match text.align_x {
+        text::Alignment::Center => at.x - size.width / 2.0,
+        text::Alignment::Right => at.x - size.width,
+        _ => at.x,
+    };
+    let y = match text.align_y {
+        iced::alignment::Vertical::Center => at.y - size.height / 2.0,
+        iced::alignment::Vertical::Bottom => at.y - size.height,
+        iced::alignment::Vertical::Top => at.y,
+    };
+    renderer.fill_text(
+        Text {
+            bounds: Size::new(size.width + 2.0, size.height),
+            align_x: text::Alignment::Left,
+            align_y: iced::alignment::Vertical::Top,
+            ..text
+        },
+        Point::new(x, y),
+        color,
+        clip,
+    );
 }
 
 fn label(content: String, size: f32, bounds: Size, align: text::Alignment) -> Text<String, Font> {
@@ -564,10 +684,7 @@ struct Caution {
 }
 #[derive(Default)]
 struct Born(Option<Instant>);
-impl<Message, Renderer> Widget<Message, Theme, Renderer> for Caution
-where
-    Renderer: renderer::Renderer + text::Renderer<Font = Font>,
-{
+impl<Message> Widget<Message, Theme, Renderer> for Caution {
     fn tag(&self) -> tree::Tag { tree::Tag::of::<Born>() }
     fn state(&self) -> tree::State { tree::State::new(Born::default()) }
     fn size(&self) -> Size<Length> { Size { width: Length::Fill, height: Length::Fill } }
@@ -603,21 +720,27 @@ where
                 let y = b.y + b.height * top - h / 2.0;
                 let band = Rectangle { x: b.x, y, width: b.width * reveal, height: h };
                 renderer.with_layer(band, |renderer| {
-                    renderer.fill_quad(Quad { bounds: Rectangle { x: b.x, y, width: b.width, height: h }, ..Quad::default() }, Color { a: 0.08, ..HOT });
-                    let mut x = b.x - 28.0 + (t * 6.0) % 28.0;
-                    while x < b.x + b.width + 14.0 {
-                        skewed(renderer, x, y, 14.0, h, Color { a: 0.13, ..HOT });
-                        x += 28.0;
+                    // 45° hatching like the mockup's repeating gradient: 14 px stripes across.
+                    let mut shapes = Vec::new();
+                    slant(&mut shapes, b.x, y, b.width, h, 0.0, Color { a: 0.08, ..HOT });
+                    let (stripe, period) = (14.0 * std::f32::consts::SQRT_2, 28.0 * std::f32::consts::SQRT_2);
+                    let mut x = b.x - h - period + (t * 6.0) % period;
+                    while x < b.x + b.width {
+                        slant(&mut shapes, x, y, stripe, h, h, Color { a: 0.13, ..HOT });
+                        x += period;
                     }
                     for edge in [y, y + h - 1.0] {
-                        renderer.fill_quad(Quad { bounds: Rectangle { x: b.x, y: edge, width: b.width, height: 1.0 }, ..Quad::default() }, Color { a: 0.35, ..HOT });
+                        slant(&mut shapes, b.x, edge, b.width, 1.0, 0.0, Color { a: 0.35, ..HOT });
                     }
+                    // The stripes move every frame, so this band is not worth caching.
+                    renderer.draw_geometry(geometry(band, &shapes));
                     // The word crawls; the two bands move in opposite directions.
                     let run = 250.0;
                     let speed = if k == 0 { -11.0 } else { 9.0 };
                     let start = b.x - run + (t * speed).rem_euclid(run);
                     for j in 0..((b.width / run) as usize + 3) {
-                        renderer.fill_text(
+                        put(
+                            renderer,
                             Text {
                                 content: "ЭКСПЕРИМЕНТАЛЬНО   ///   ".to_owned(),
                                 bounds: Size::new(run, h),
@@ -682,10 +805,7 @@ impl Reverse {
         24.0 + CELL * self.word.len() as f32
     }
 }
-impl<Message, Renderer> Widget<Message, Theme, Renderer> for Reverse
-where
-    Renderer: renderer::Renderer + text::Renderer<Font = Font>,
-{
+impl<Message> Widget<Message, Theme, Renderer> for Reverse {
     fn tag(&self) -> tree::Tag { tree::Tag::of::<Hover>() }
     fn state(&self) -> tree::State { tree::State::new(Hover::default()) }
     fn size(&self) -> Size<Length> {
@@ -740,7 +860,8 @@ where
             wrapping: text::Wrapping::None,
         };
         let clip = Rectangle { y: b.y - 12.0, height: b.height + 24.0, ..b };
-        renderer.fill_text(
+        put(
+            renderer,
             glyph("\u{E7A7}".into(), 12.0, Font::with_name("Segoe MDL2 Assets")),
             Point::new(b.x + 8.0, b.center_y()),
             if p > 0.5 { TAG } else { Color::from_rgb8(0x85, 0x86, 0x8D) },
@@ -752,7 +873,7 @@ where
             let d = (n as f32 - 1.0 - 2.0 * i as f32) * CELL;
             let lift = if d == 0.0 { -4.0 } else { -d.signum() * (3.0 + d.abs() / 10.0) };
             let x = b.x + 24.0 + i as f32 * CELL + CELL / 2.0 + d * p;
-            renderer.fill_text(glyph(ch.to_string(), 15.0, numbers()), Point::new(x, b.center_y() + lift * arc), tint, clip);
+            put(renderer, glyph(ch.to_string(), 15.0, numbers()), Point::new(x, b.center_y() + lift * arc), tint, clip);
         }
     }
     fn mouse_interaction(&self, _: &Tree, layout: Layout<'_>, cursor: mouse::Cursor, _: &Rectangle, _: &Renderer) -> mouse::Interaction {
