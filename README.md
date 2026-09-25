@@ -45,7 +45,7 @@ UI использует Iced daemon и tiny-skia; wgpu / WebView не включ
 
 Версия 0.2.0 завершает внутренний rename в **Mic Noize**: пакет/EXE, репозиторий, Win32-объекты и TAG-линии получили новые имена. Цепочка обновления 0.1.x намеренно не продолжается. `MNR` означает **Mic Noize Runtime**; ABI `mnr_*`, переменные `MNR_*`, `/mnr/` и `mnr_vcclient_server.exe` остаются без изменений.
 
-Быстрый выпуск патча готовится локально командой `scripts\release-local.ps1 -Version X.Y.Z`; после проверки файлов та же команда с `-Publish` загружает их на GitHub, сверяет SHA-256 и публикует релиз без повторной сборки. Требуются чистый коммит, совпадение с публичной веткой и локально заданный `MNR_TELEMETRY_SECRET`; иначе используется ручной `release.yml` на GitHub-hosted Windows. Полный порядок — в [release checklist](.agents/skills/micnoize/references/workflow.md#release-checklist).
+Быстрый выпуск патча запускается командой `scripts\run-local-release.ps1 -Version X.Y.Z`. Она временно регистрирует локальный GitHub runner только для одного задания: проверки и сборка идут в этом прогретом проекте, секрет телеметрии поступает из GitHub Actions, готовые файлы проверяются и публикуются на GitHub. Ручной ввод секрета и постоянная работа runner не нужны. Требуются чистый коммит и совпадение исходников с публичной веткой; `release.yml` на GitHub-hosted Windows остаётся запасным путём. Полный порядок — в [release checklist](.agents/skills/micnoize/references/workflow.md#release-checklist).
 
 ## Сборка и запуск
 

@@ -21,6 +21,8 @@ try {
         if ($command -like '*ls-remote release refs/heads/main*') { return 'commit refs/heads/main' }
     }
     function gh { throw 'GitHub must not be called for a changed asset.' }
+    $preflight = & (Join-Path $tempRoot 'scripts\release-local.ps1') -Version 1.2.3 -CheckOnly
+    if ($preflight -ne 'Release source ready: v1.2.3') { throw 'Release source preflight failed.' }
     try {
         & (Join-Path $tempRoot 'scripts\release-local.ps1') -Version 1.2.3 -Publish
         throw 'Changed asset was accepted.'

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version, [switch]$Publish)
+param([Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version, [switch]$Publish, [switch]$CheckOnly)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -18,6 +18,7 @@ $remoteLine = & git -C $root ls-remote release refs/heads/main
 if ($LASTEXITCODE -ne 0 -or -not $remoteLine -or $remoteLine.Split()[0] -ne $publicCommit) { throw 'Fetch and publish the public release branch first.' }
 $existingTag = & git -C $root ls-remote release "refs/tags/$tag"
 if ($LASTEXITCODE -ne 0 -or $existingTag) { throw 'Release tag already exists or could not be checked.' }
+if ($CheckOnly) { Write-Output "Release source ready: $tag"; return }
 $recordPath = Join-Path $output '.release-source.json'
 if (-not $Publish) {
     if (-not $env:MNR_TELEMETRY_SECRET) { throw 'MNR_TELEMETRY_SECRET is required for the release UI; set it locally without putting it in Git or chat.' }

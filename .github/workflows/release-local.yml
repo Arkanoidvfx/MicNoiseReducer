@@ -1,0 +1,38 @@
+name: Release Mic Noize on local runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Patch version to release
+        required: false
+      smoke:
+        description: Check runner connectivity without publishing
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: micnoize-release
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: D:/Projects/Audio/MicNoiseReducer
+    steps:
+      - name: Check local runner
+        if: inputs.smoke
+        run: |
+          if (-not (Test-Path .\scripts\release-local.ps1)) { throw 'Local checkout missing.' }
+          "Local runner ready: $env:COMPUTERNAME"
+      - name: Build, verify and publish
+        if: '!inputs.smoke'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MNR_TELEMETRY_SECRET: ${{ secrets.MNR_TELEMETRY_SECRET }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          .\scripts\release-local.ps1 -Version $env:RELEASE_VERSION
+          .\scripts\release-local.ps1 -Version $env:RELEASE_VERSION -Publish
