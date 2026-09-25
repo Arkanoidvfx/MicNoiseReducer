@@ -10,6 +10,10 @@ on:
         description: Check runner connectivity without publishing
         type: boolean
         default: false
+      dry_run:
+        description: Build and package on the local runner without publishing
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -34,7 +38,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'GitHub release token unavailable.' }
           "Local runner ready: $env:COMPUTERNAME"
       - name: Build, verify and publish
-        if: '!inputs.smoke'
+        if: '!inputs.smoke && !inputs.dry_run'
         env:
           GH_TOKEN: ${{ github.token }}
           MNR_TELEMETRY_SECRET: ${{ secrets.MNR_TELEMETRY_SECRET }}
@@ -42,3 +46,12 @@ jobs:
         run: |
           .\scripts\release-local.ps1 -Version $env:RELEASE_VERSION
           .\scripts\release-local.ps1 -Version $env:RELEASE_VERSION -Publish
+      - name: Build and package without publishing
+        if: inputs.dry_run
+        env:
+          MNR_TELEMETRY_SECRET: ${{ secrets.MNR_TELEMETRY_SECRET }}
+        run: |
+          if (-not $env:MNR_TELEMETRY_SECRET) { throw 'Release secret missing.' }
+          $version = (Get-Content .\release\version.txt -Raw).Trim()
+          .\verify.ps1
+          .\scripts\package-release.ps1 -Version $version -Stage -OutputDir .tmp/local-runner-dry-run
