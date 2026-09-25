@@ -39,8 +39,20 @@ int32_t mnr_denoiser_state(Mnr*,char* text,uint32_t capacity);
 void mnr_phrase_cancel(Mnr*);
 void mnr_snapshot(Mnr*,MnrSnapshot*,char* error,uint32_t capacity,int32_t meters);
 int32_t mnr_devices(int32_t capture,char* result,uint32_t capacity);
+int32_t mnr_refresh_host(char* error,uint32_t capacity);
+int32_t mnr_tag_stop_host(char* error,uint32_t capacity);
+int32_t mnr_tag_repair_lines(char* error,uint32_t capacity);
+int32_t mnr_tag_device_state(char* detail,uint32_t capacity);
+int32_t mnr_tag_legacy_host(int32_t stop,char* error,uint32_t capacity);
+int32_t mnr_tag_remove_task(char* error,uint32_t capacity);
+int32_t mnr_tag_task_enabled(int32_t mode,char* error,uint32_t capacity);
 // NVIDIA model architecture of CUDA device 0 and its name as "arch<TAB>name"; 0 with the reason.
 int32_t mnr_gpu(char* text,uint32_t capacity);
+uint64_t mnr_begin_operation(Mnr*);
+int32_t mnr_start_generation(Mnr*,const char* input,uint32_t il,const char* output,uint32_t ol,int32_t version,uint32_t buffer,uint32_t period,int32_t graphs,float intensity,char* error,uint32_t capacity,uint64_t generation);
+// mode -1 reads login preference; 0/1 configure it. Returns -1 on failure.
+int32_t mnr_tag_autostart(int32_t mode,char* error,uint32_t capacity);
+void mnr_tag_task_warning(char* error,uint32_t capacity);
 void mnr_bindings(Mnr*,const uint32_t* keys,uint32_t count);
 void mnr_alternate_intensity(Mnr*,float intensity);
 void mnr_capture_key(Mnr*,int32_t enabled);

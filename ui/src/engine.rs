@@ -2,7 +2,7 @@ use std::{
     ffi::c_char,
     os::windows::process::CommandExt,
     process::{Child, Command as ProcessCommand, Stdio},
-    sync::mpsc,
+    sync::{mpsc, Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
     thread,
     time::{Duration, Instant},
 };
@@ -30,7 +30,8 @@ pub struct Snapshot {
 unsafe extern "C" {
     fn mnr_create(error: *mut c_char, capacity: u32) -> usize;
     fn mnr_destroy(p: usize);
-    fn mnr_start(
+    fn mnr_begin_operation(p: usize) -> u64;
+    fn mnr_start_generation(
         p: usize,
         input: *const u8,
         il: u32,
@@ -43,8 +44,10 @@ unsafe extern "C" {
         intensity: f32,
         error: *mut c_char,
         cap: u32,
+        generation: u64,
     ) -> i32;
     fn mnr_stop(p: usize);
+    fn mnr_refresh_host(error: *mut c_char, capacity: u32) -> i32;
     fn mnr_headphones(
         p: usize,
         enabled: i32,
@@ -81,6 +84,9 @@ unsafe extern "C" {
     fn mnr_snapshot(p: usize, s: *mut Snapshot, error: *mut c_char, cap: u32, meters: i32);
     fn mnr_devices(capture: i32, result: *mut c_char, capacity: u32) -> i32;
     fn mnr_gpu(text: *mut c_char, capacity: u32) -> i32;
+    fn mnr_tag_autostart(mode: i32, error: *mut c_char, capacity: u32) -> i32;
+    fn mnr_tag_task_warning(error: *mut c_char, capacity: u32);
+    fn mnr_tag_device_state(detail: *mut c_char, capacity: u32) -> i32;
     fn mnr_bindings(p: usize, keys: *const u32, count: u32);
     fn mnr_alternate_intensity(p: usize, intensity: f32);
     fn mnr_capture_key(p: usize, enabled: i32);
@@ -153,6 +159,18 @@ pub fn gpu() -> Result<(String, String), String> {
         _ => Err(text),
     }
 }
+pub fn tag_autostart(mode: i32) -> Result<bool, String> {
+    let mut b = [0u8; 1024];
+    match unsafe { mnr_tag_autostart(mode, b.as_mut_ptr().cast(), b.len() as u32) } {
+        -1 => Err(decoded(&b)),
+        enabled => Ok(enabled != 0),
+    }
+}
+pub fn tag_task_warning() -> String {
+    let mut b = [0u8; 1024];
+    unsafe { mnr_tag_task_warning(b.as_mut_ptr().cast(), b.len() as u32) };
+    decoded(&b)
+}
 pub fn devices(capture: bool) -> Result<Vec<Device>, String> {
     let mut b = vec![0u8; 65536];
     if unsafe { mnr_devices(capture as i32, b.as_mut_ptr().cast(), b.len() as u32) } == 0 {
@@ -193,10 +211,21 @@ pub struct Controls {
     pub rvc: bool,
     pub rvc_options: crate::rvc::Options,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
+pub enum DeviceState {#[default] Starting,WaitingDriver,WaitingEndpoint,Ready,Recovering,UserAction}
+impl DeviceState {
+    fn from_code(code:i32)->Self {match code {0=>Self::Starting,1=>Self::WaitingDriver,2=>Self::WaitingEndpoint,3=>Self::Ready,4=>Self::Recovering,_=>Self::UserAction}}
+    pub fn label(self)->&'static str {match self {
+        Self::Starting=>"Запуск",Self::WaitingDriver=>"Ожидание драйвера",Self::WaitingEndpoint=>"Ожидание устройства в Windows",
+        Self::Ready=>"Готово",Self::Recovering=>"Восстановление соединения",Self::UserAction=>"Требуется действие",
+    }}
+}
+#[derive(Clone,Debug)]
 pub enum Reply {
+    DeviceState(u64,DeviceState,String),
+    Host(Result<(), String>),
     Headphones(Result<(), String>),
-    Started(Result<(), String>),
+    Started(u64, Result<(), String>),
     Quit,
     Devices(Result<(Vec<Device>, Vec<Device>), String>),
     Saved(Result<(), String>),
@@ -204,9 +233,12 @@ pub enum Reply {
     Rvc(Result<(), String>),
 }
 enum Command {
+    DeviceState(u64),
     Headphones(bool, String, bool),
-    Start(Config),
+    Start(Config, u64),
+    Stop,
     Quit,
+    Shutdown,
     Devices,
     Monitor(i32),
     Rvc(bool, crate::rvc::Options),
@@ -316,6 +348,10 @@ pub struct Engine {
     tx: mpsc::Sender<Command>,
     rx: mpsc::Receiver<Reply>,
     worker: Option<thread::JoinHandle<()>>,
+    operation: Arc<AtomicU64>,
+    closing: Arc<AtomicBool>,
+    devices_pending: AtomicBool,
+    state_pending: AtomicBool,
 }
 impl Engine {
     pub fn new(controls: Controls) -> Result<Option<Self>, String> {
@@ -359,9 +395,13 @@ impl Engine {
             )
         };
         let initial_rvc = controls.rvc;
+        let operation = Arc::new(AtomicU64::new(0));
+        let closing = Arc::new(AtomicBool::new(false));
+        let live_operation = operation.clone();
+        let worker_closing = closing.clone();
         let worker = thread::spawn(move || {
             let mut rvc = None;
-            if initial_rvc {
+            if initial_rvc && !worker_closing.load(Ordering::Acquire) {
                 match start_rvc(controls.rvc_options) {
                     Ok(child) => rvc = Some(child),
                     Err(e) => {
@@ -385,7 +425,13 @@ impl Engine {
                         _ => {}
                     }
                 }
-                match requests.recv_timeout(Duration::from_millis(250)) {
+                let next = requests.recv_timeout(Duration::from_millis(250));
+                if worker_closing.load(Ordering::Acquire)
+                    && matches!(&next, Ok(Command::Start(..) | Command::Headphones(..) | Command::Monitor(..) | Command::Rvc(..))) {
+                    continue;
+                }
+                match next {
+                    Ok(Command::Stop) => unsafe { mnr_stop(p) },
                     Ok(Command::Headphones(enabled, output, denoise)) => {
                         let mut error = [0u8; 4096];
                         let ok = unsafe {
@@ -405,10 +451,11 @@ impl Engine {
                             Err(decoded(&error))
                         }));
                     }
-                    Ok(Command::Start(c)) => {
+                    Ok(Command::Start(c, generation)) => {
+                        if generation != live_operation.load(Ordering::Acquire) { continue; }
                         let mut error = [0u8; 4096];
                         let ok = unsafe {
-                            mnr_start(
+                            mnr_start_generation(
                                 p,
                                 c.input.as_ptr(),
                                 c.input.len() as u32,
@@ -421,15 +468,26 @@ impl Engine {
                                 c.intensity,
                                 error.as_mut_ptr().cast(),
                                 4096,
+                                generation,
                             )
                         };
-                        let _ = replies.send(Reply::Started(if ok != 0 {
+                        let _ = replies.send(Reply::Started(generation, if ok != 0 {
                             Ok(())
                         } else {
                             Err(decoded(&error))
                         }));
                     }
+                    Ok(Command::DeviceState(generation)) => {
+                        let mut detail=[0u8;4096];
+                        let code=if cfg!(test){3}else{unsafe{mnr_tag_device_state(detail.as_mut_ptr().cast(),detail.len() as u32)}};
+                        let _=replies.send(Reply::DeviceState(generation,DeviceState::from_code(code),decoded(&detail)));
+                    }
                     Ok(Command::Devices) => {
+                        if !cfg!(test) {
+                            let mut error = [0u8; 4096];
+                            let ok = unsafe { mnr_refresh_host(error.as_mut_ptr().cast(), 4096) };
+                            let _ = replies.send(Reply::Host(if ok != 0 { Ok(()) } else { Err(decoded(&error)) }));
+                        }
                         let result = devices(true).and_then(|i| devices(false).map(|o| (i, o)));
                         let _ = replies.send(Reply::Devices(result));
                     }
@@ -450,14 +508,15 @@ impl Engine {
                         let _ = replies.send(Reply::Saved(atomic_save(&path, &contents)));
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Ok(Command::Quit) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Ok(Command::Quit | Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        let shutdown = !matches!(next, Ok(Command::Quit));
                         unsafe {
                             mnr_headphones(p, 0, b"".as_ptr(), 0, 0, std::ptr::null_mut(), 0)
                         };
                         report_rvc_stop(&mut rvc, &replies);
                         unsafe { mnr_stop(p) };
                         let _ = replies.send(Reply::Quit);
-                        break;
+                        if shutdown { break; }
                     }
                 }
             }
@@ -467,10 +526,17 @@ impl Engine {
             tx,
             rx,
             worker: Some(worker),
+            operation,
+            closing,
+            devices_pending: AtomicBool::new(false),
+            state_pending: AtomicBool::new(false),
         }))
     }
     pub fn start(&self, c: Config) {
-        let _ = self.tx.send(Command::Start(c));
+        if self.closing.load(Ordering::Acquire) { return; }
+        let generation = unsafe { mnr_begin_operation(self.p) };
+        self.operation.store(generation, Ordering::Release);
+        let _ = self.tx.send(Command::Start(c, generation));
     }
     pub fn headphones(&self, enabled: bool, output: String, denoise: bool) {
         let _ = self.tx.send(Command::Headphones(enabled, output, denoise));
@@ -502,16 +568,41 @@ impl Engine {
         (state, decoded(&text))
     }
     pub fn quit(&self) {
+        self.closing.store(true, Ordering::Release);
+        let generation = unsafe { mnr_begin_operation(self.p) };
+        self.operation.store(generation, Ordering::Release);
         let _ = self.tx.send(Command::Quit);
     }
+    pub fn resume_after_failed_update(&self) {
+        self.closing.store(false, Ordering::Release);
+    }
+    pub fn cancel_start(&self) {
+        let generation = unsafe { mnr_begin_operation(self.p) };
+        self.operation.store(generation, Ordering::Release);
+        let _ = self.tx.send(Command::Stop);
+    }
     pub fn refresh(&self) {
-        let _ = self.tx.send(Command::Devices);
+        if !self.devices_pending.swap(true, Ordering::AcqRel)
+            && self.tx.send(Command::Devices).is_err() {
+            self.devices_pending.store(false, Ordering::Release);
+        }
+    }
+    pub fn request_device_state(&self) {
+        if !self.state_pending.swap(true,Ordering::AcqRel) && self.tx.send(Command::DeviceState(self.operation.load(Ordering::Acquire))).is_err() {
+            self.state_pending.store(false,Ordering::Release);
+        }
     }
     pub fn save(&self, p: std::path::PathBuf, s: String) {
         let _ = self.tx.send(Command::Save(p, s));
     }
     pub fn reply(&self) -> Option<Reply> {
-        self.rx.try_recv().ok()
+        loop {
+            let reply = self.rx.try_recv().ok()?;
+            if matches!(&reply, Reply::Devices(_)) { self.devices_pending.store(false, Ordering::Release); }
+            if matches!(&reply, Reply::DeviceState(..)) {self.state_pending.store(false,Ordering::Release);}
+            if matches!(&reply, Reply::Started(generation, _) | Reply::DeviceState(generation,..) if *generation != self.operation.load(Ordering::Acquire)) { continue; }
+            return Some(reply);
+        }
     }
     // Only atomic controls cross threads; lifecycle operations remain worker-owned.
     pub fn controls(&self, c: Controls) {
@@ -617,11 +708,17 @@ impl Engine {
 }
 impl Drop for Engine {
     fn drop(&mut self) {
-        let _ = self.tx.send(Command::Quit);
+        let root=std::env::var_os("MNR_RUNTIME_ROOT").map(std::path::PathBuf::from);
+        let note=|text| {if !cfg!(test) && let Some(root)=&root {crate::logs::note(root,text);}};
+        note("Выход: освобождение движка");
+        self.quit();
+        let _ = self.tx.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        note("Выход: управляющий поток завершён");
         unsafe { mnr_destroy(self.p) }
+        note("Выход: native-движок освобождён");
     }
 }
 
@@ -657,6 +754,34 @@ pub fn atomic_save(path: &std::path::Path, contents: &str) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_state_coalesces_and_rejects_cancelled_generation() {
+        let (app, _) = crate::App::from_settings(crate::settings::Settings::for_test("")).unwrap().unwrap();
+        let engine = &app.engine;
+        engine.request_device_state();
+        engine.request_device_state();
+        engine.operation.fetch_add(1, Ordering::AcqRel);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while engine.state_pending.load(Ordering::Acquire) {
+            assert!(!matches!(engine.reply(), Some(Reply::DeviceState(..))), "cancelled state reached UI");
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        engine.request_device_state();
+        loop {
+            if let Some(Reply::DeviceState(generation, state, detail)) = engine.reply() {
+                assert_eq!(generation, engine.operation.load(Ordering::Acquire));
+                assert_eq!(state, DeviceState::Ready);
+                assert!(detail.is_empty());
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(DeviceState::from_code(-1), DeviceState::UserAction);
+        assert_eq!(DeviceState::from_code(6), DeviceState::UserAction);
+    }
 
     #[test]
     fn bounded_wait_and_rvc_stop() {

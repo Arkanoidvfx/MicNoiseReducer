@@ -71,9 +71,12 @@ public:
     static constexpr unsigned recordable=HoldAllMask&~(HoldBoost|(HoldBoost<<DiscordShift));
     // A capture that just ended, for the shell to publish; reading it clears the flag.
     bool finished() {const bool was=finished_;finished_=false;return was;}
-    const float* audio() const {return audio_.data();}
     size_t count() const {return count_;}
     bool capturing() const {return capturing_;}
+    void copyRecording(std::vector<float>& out,float discordVolume) const {
+        out.assign(audio_.begin(),audio_.begin()+count_);
+        if(discord_)for(auto& sample:out)sample*=discordVolume;
+    }
     bool process(float* data,size_t n,uint8_t* modified,bool& discord,
                  unsigned allHeld,bool phraseActive,bool valid,unsigned epoch,unsigned cancel,unsigned request) {
         const unsigned held=allHeld&recordable;

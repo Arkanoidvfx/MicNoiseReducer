@@ -1,5 +1,6 @@
 #include "audio.hpp"
 #include "tag_link.hpp"
+#include "tag.hpp"
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -173,6 +174,114 @@ static void selfTest() {
     }
     std::cout<<"PASS: bounded queue, wrapping, concurrent ordering, +/-1000 ppm drift, TAG late-wake clock\n";
 }
+static void protocolTest() {
+    {
+        GUID generation{},old{};CoCreateGuid(&generation);CoCreateGuid(&old);
+        mic::TagRecoveryBudget budget{generation,1};
+        require(!budget.take(old) && budget.used==0,"Old generation cannot consume recovery");
+        require(budget.take(generation),"Recovery consumes durable budget");
+        mic::TagRecoveryBudget restored{};memcpy(&restored,&budget,sizeof(budget));
+        require(restored.take(generation) && restored.take(generation) && !restored.take(generation),"Deserialized budget retains exactly three retries");
+        restored.active=0;restored.used=0;
+        require(!restored.take(generation),"Stop cancels delayed recovery even with tickets left");
+    }
+    {
+        using ThinAudioGateway::VirtualLineDesc;
+        auto line=[](unsigned id,bool capture,const wchar_t* name){VirtualLineDesc l{};l.Id=id;l.Capture=capture;l.Type=capture?ThinAudioGateway::VLT_Microphone:ThinAudioGateway::VLT_Headphones;wcscpy_s(l.KsName,name);return l;};
+        std::vector<VirtualLineDesc> lines={line(1,true,L"TAG Microphone"),line(2,false,L"TAG Speakers"),line(9,true,L"Other")};
+        const auto repair=mic::tagLineRepair(lines,1,2);
+        require(repair.microphone==3 && repair.headphones==4 && repair.remove==std::vector<unsigned>{1},"Explicit repair removes only exact default input, migrates reserved IDs and preserves foreign lines");
+        auto legacy=std::vector<VirtualLineDesc>{line(1,true,L"MicNoize Microphone"),line(2,false,L"MicNoize Headphones")};
+        require(mic::tagLegacyRestartSafe(legacy),"Legacy rollback may restart over only its own lines");
+        require(!mic::tagLegacyRestartSafe(lines),"Legacy rollback refuses foreign/default devices");
+        const auto migrated=mic::tagLineRepair(legacy,1,2);
+        require(migrated.microphone==3 && migrated.headphones==4 && migrated.remove.size()==2,"Explicit repair migrates both legacy own lines");
+        auto stable=std::vector<VirtualLineDesc>{line(2,false,L"TAG Speakers"),line(3,true,L"MicNoize Microphone"),line(4,false,L"MicNoize Headphones")};
+        require(mic::tagLegacyRestartSafe(stable),"Hash-pinned published legacy core preserves TAG defaults with a unique own input");
+        auto unsafeLegacy=stable;unsafeLegacy.push_back(line(9,true,L"MicNoiseReducer Old"));
+        require(!mic::tagLegacyRestartSafe(unsafeLegacy),"Legacy rollback refuses obsolete lines it would delete");
+        const auto repeated=mic::tagLineRepair(stable,3,4);
+        require(repeated.remove.empty() && repeated.microphone==3 && repeated.headphones==4,"Repeated line repair preserves stable microphone and headphones");
+        legacy.push_back(line(3,true,L"MicNoize Microphone"));bool ambiguous=false;
+        require(!mic::tagLegacyRestartSafe(legacy),"Legacy rollback refuses ambiguous capture identity");
+        try{mic::tagLineRepair(legacy,1,2);}catch(const std::exception&){ambiguous=true;}
+        require(ambiguous,"Line repair refuses ambiguous own identity before deletion");
+        require(mic::tagLineIdentity(lines,true,3)==3,"Reboot restores saved line, not max ID plus one");
+        std::reverse(lines.begin(),lines.end());
+        require(mic::tagLineIdentity(lines,true,3)==3,"Driver enumeration order does not change identity");
+        require(mic::tagLineIdentity({},true,0)==3,"Fresh allocation avoids driver startup IDs");
+        require(mic::tagLineIdentity(lines,false,0,3)==4,"Headphone reservation avoids microphone and defaults");
+        lines.push_back(line(3,true,L"MicNoize Microphone"));
+        wcscpy_s(lines.back().EpName,L"User renamed it");
+        require(mic::tagLineIdentity(lines,true,3)==3,"Reuse healthy renamed endpoint line");
+        auto rejected=[&](unsigned saved){try{mic::tagLineIdentity(lines,true,saved);return false;}catch(const std::exception&){return true;}};
+        require(rejected(7),"Saved and existing identity disagreement rejected");
+        lines.back()=line(3,true,L"Other microphone");
+        require(rejected(3),"Occupied saved ID rejected instead of migrating endpoint");
+        lines.back()=line(3,true,L"MicNoize Microphone");lines.push_back(line(4,true,L"MicNoize Microphone"));
+        require(rejected(3),"Duplicate own topology rejected");
+    }
+    {
+        const auto* saved=_wgetenv(L"MNR_TAG_HOST_PATH");const std::wstring previous=saved?saved:L"";
+        _wputenv_s(L"MNR_TAG_HOST_PATH",L"C:/Mic Noize/current/../current/mic_tag_host.exe");
+        const auto path=mic::tagHostPath();_wputenv_s(L"MNR_TAG_HOST_PATH",previous.c_str());
+        require(path.native()==L"C:\\Mic Noize\\current\\mic_tag_host.exe","Host ownership normalizes Windows separators and lexical components");
+    }
+    require(mic::tagHostMode(L" --stop \t")==L"--stop","Host tolerates PowerShell trailing whitespace");
+    require(mic::tagHostMode(L"\"--task-start\" ")==L"--task-start","Host accepts quoted command");
+    require(mic::tagHostMode(L"  ").empty(),"Host default command");
+    bool invalidArgs=false;try{mic::tagHostMode(L"--stop extra");}catch(const std::exception&){invalidArgs=true;}
+    require(invalidArgs,"Host rejects extra command arguments");
+    require(mic::tagTransientStartup("driver HRESULT 0x80070490"),"late driver retries");
+    require(!mic::tagTransientStartup("access HRESULT 0x80070005"),"access denied does not retry as missing driver");
+    require(!mic::tagTransientStartup("API DLL HRESULT 0x8007007E"),"Missing runtime files require repair, not endless driver polling");
+    GUID host{},first{},second{};require(SUCCEEDED(CoCreateGuid(&host)) && SUCCEEDED(CoCreateGuid(&first)) && SUCCEEDED(CoCreateGuid(&second)),"IPC test GUIDs");
+    mic::TagSession session{host};mic::TagPacketV2 packet;packet.host=host;packet.connection=first;packet.request=1;packet.deadline=1500;
+    require(session.accept(packet,1,1000),"IPC connect");
+    require(!session.accept(packet,1,1000),"IPC duplicate connect rejected");
+    packet.request=2;packet.frames=1;packet.samples[0]=0.25f;
+    require(session.accept(packet,2,1100),"IPC valid audio");
+    require(!session.accept(packet,2,1100),"IPC duplicate audio rejected");
+    packet.request=3;packet.deadline=1099;
+    require(!session.accept(packet,2,1100),"IPC expired request rejected");
+    packet.deadline=1500;packet.bytes=0;
+    require(!session.accept(packet,2,1100),"IPC size rejected");packet.bytes=sizeof(packet);
+    packet.version=1;require(!session.accept(packet,2,1100),"IPC old version rejected");packet.version=2;
+    packet.host=second;require(!session.accept(packet,2,1100),"IPC old host rejected");packet.host=host;
+    packet.frames=16385;require(!session.accept(packet,2,1100),"IPC oversized block rejected before samples");packet.frames=1;
+    packet.samples[0]=std::numeric_limits<float>::quiet_NaN();require(!session.accept(packet,2,1100),"IPC NaN rejected");packet.samples[0]=0;
+    packet.connection=second;packet.request=1;packet.frames=0;
+    require(session.accept(packet,1,1100),"IPC new connection");
+    packet.connection=first;packet.request=4;
+    require(!session.accept(packet,3,1100) && session.connection==second,"IPC old Stop cannot close new connection");
+    packet.connection=second;packet.request=2;packet.frames=8193;
+    require(!session.accept(packet,2,1100,true),"IPC headphone frame bound");
+    packet.frames=0;require(session.accept(packet,4,1100,true),"IPC headphone status");
+    session.reply(packet);require(packet.ack==2 && packet.ackConnection==second && packet.ackHost==host,"IPC response identity");
+
+    const auto name=L"Local\\MicNoize.ProtocolCheck."+std::to_wstring(GetCurrentProcessId());
+    mic::TagLink server(true,false,name.c_str());
+    {mic::TagLink::Lock lock(server,100);*server.packet={};server.packet->host=host;}
+    mic::TagLink client(false,false,name.c_str());
+    std::string serverError;
+    std::jthread responder([&] {
+        try {
+            require(WaitForSingleObject(server.request,1000)==WAIT_OBJECT_0,"IPC test request");
+            {mic::TagLink::Lock lock(server,100);server.packet->ackHost=host;server.packet->ackConnection=server.packet->connection;server.packet->ack=0;}
+            SetEvent(server.response);Sleep(30);
+            {mic::TagLink::Lock lock(server,100);server.packet->result=0;mic::TagSession{host}.reply(*server.packet);}
+            SetEvent(server.response);
+        }catch(const std::exception& error){serverError=error.what();}
+    });
+    const auto started=GetTickCount64();const auto result=client.command(1);responder.join();
+    require(serverError.empty() && result==0 && GetTickCount64()-started>=25,"IPC ignores stale response event");
+    bool expired=false;try{client.command(4);}catch(...){expired=true;}
+    require(expired && !client.usable(),"IPC timeout poisons old connection");
+    {mic::TagLink::Lock lock(server,100);require(!mic::TagSession{host}.accept(*server.packet,4,GetTickCount64()),"IPC timed-out queued command rejected");}
+    std::thread abandoned([&]{if(server.lock(100)){server.packet->frames=0xffffffff;server.packet->command=2;}});abandoned.join();
+    {mic::TagLink::Lock lock(server,100);require(!mic::TagSession{host}.accept(*server.packet,2,GetTickCount64()),"IPC abandoned partial command rejected");}
+    std::cout<<"PASS: IPC v2 bounds, NaN, old host/connection/Stop, duplicate and expired requests, stale responses, abandoned mutex\n";
+}
 int main(int argc,char** argv) {
     try {
         if(argc==4 && std::string(argv[1])=="--headphones-check") {
@@ -181,7 +290,7 @@ int main(int argc,char** argv) {
             mic::checkHeadphones(outputs[index].id,std::stoi(argv[3])!=0);return 0;
         }
         if(argc==2 && std::string(argv[1])=="--discord-capture") { mic::checkDiscordCapture(5); return 0; }
-        if(argc==2 && std::string(argv[1])=="--self-test") { selfTest(); return 0; }
+        if(argc==2 && std::string(argv[1])=="--self-test") { selfTest(); protocolTest(); return 0; }
         if(argc==2 && std::string(argv[1])=="--tag-level-check") { mic::checkTagLevel(); return 0; }
         if(argc==2 && std::string(argv[1])=="--tag-level-watch-check") { mic::checkTagLevelWatch(); return 0; }
         if(argc==2 && std::string(argv[1])=="--rvc-check") { mic::checkRvc(); return 0; }

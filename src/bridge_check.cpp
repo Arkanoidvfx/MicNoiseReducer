@@ -55,6 +55,10 @@ int main(){try{
     require(!mnr_start(p,"",0,"TAG",3,2,40,5,-1,1,error,sizeof(error)),"Invalid input accepted");
     mnr_snapshot(p,&s,error,sizeof(error),1);require(s.state==5&&strstr(error,"Invalid audio settings"),"Error lost at ABI boundary");
     mnr_stop(p);mnr_snapshot(p,&s,error,sizeof(error),1);require(s.state==0&&s.muted==1,"Stop lost mute");
+    const auto stale=mnr_begin_operation(p);const auto current=mnr_begin_operation(p);
+    require(stale && current>stale,"Operation generation must advance");
+    require(!mnr_start_generation(p,"",0,"TAG",3,2,40,5,-1,1,error,sizeof(error),stale),"Cancelled start accepted");
+    mnr_snapshot(p,&s,error,sizeof(error),1);require(s.state==0 && s.muted==1,"Cancelled start changed state or Mute");
     require(mnr_start(p,"abc",40000,"TAG",3,2,40,5,-1,1,error,sizeof(error))==0,"Invalid length accepted");
     std::cout<<"BRIDGE CHECK PASSED: ABI, errors, controls, mute, epochs\n";
     return 0;

@@ -64,7 +64,6 @@ pub fn core_installed(root: &Path) -> bool {
         && root
             .join("vendor/tag-2.0.0.1903-demo/apidll/x64/tagapi.dll")
             .is_file()
-        && root.join("bin/mic_tag_host.exe").is_file()
 }
 
 /// Both model versions the engine can load for `arch` (the engine's own folder names), current.
@@ -163,7 +162,6 @@ pub fn install_core(components: &Path, arch: Option<&str>) -> Result<String, Str
             &[
                 "vendor/nvidia-afx-3.0.0",
                 "vendor/tag-2.0.0.1903-demo",
-                "bin/mic_tag_host.exe",
             ],
         )?;
     }

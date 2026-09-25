@@ -1,6 +1,7 @@
 #include "bridge.h"
 #include "audio.hpp"
 #include "tag_link.hpp"
+#include "tag.hpp"
 #include <shellapi.h>
 #include <shobjidl.h>
 #include <wtsapi32.h>
@@ -44,15 +45,39 @@ extern "C" Mnr* mnr_create(char* error,uint32_t capacity) {
     try {return new Mnr;} catch(const std::exception& e) {copy(e.what(),error,capacity);return nullptr;} catch(...) {copy("Engine creation failed",error,capacity);return nullptr;}
 }
 extern "C" void mnr_destroy(Mnr* p) {try {delete p;} catch(...) {}}
-extern "C" int32_t mnr_start(Mnr* p,const char* input,uint32_t il,const char* output,uint32_t ol,int32_t version,uint32_t buffer,uint32_t period,int32_t graphs,float intensity,char* error,uint32_t cap) {
+extern "C" int32_t mnr_tag_autostart(int32_t mode,char* error,uint32_t cap) {
+    try {return mode==-1?mic::tagTaskAutostart():mic::configureTagTask(mode);}
+    catch(const std::exception& e){copy(e.what(),error,cap);return -1;}
+    catch(...){copy("Host task configuration failed",error,cap);return -1;}
+}
+extern "C" void mnr_tag_task_warning(char* error,uint32_t cap) {
+    try{copy(mic::tagTaskWarning(),error,cap);}catch(...){copy("Host task status unavailable",error,cap);}
+}
+extern "C" int32_t mnr_tag_device_state(char* detail,uint32_t capacity) {
+    try{std::string note;const auto state=mic::tagDeviceState(note);copy(note,detail,capacity);return static_cast<int32_t>(state);}
+    catch(const std::exception& error){copy(error.what(),detail,capacity);return 5;}catch(...){copy("Не удалось проверить фоновый хост",detail,capacity);return 5;}
+}
+extern "C" int32_t mnr_tag_legacy_host(int32_t stop,char* error,uint32_t capacity) {
+    try {mic::legacyTagHost(stop);return 1;}
+    catch(const std::exception& e){copy(e.what(),error,capacity);return 0;}catch(...){copy("Legacy host operation failed",error,capacity);return 0;}
+}
+extern "C" int32_t mnr_tag_remove_task(char* error,uint32_t capacity) {
+    try {mic::removeTagTask();return 1;}catch(const std::exception& e){copy(e.what(),error,capacity);return 0;}catch(...){copy("Host task removal failed",error,capacity);return 0;}
+}
+extern "C" uint64_t mnr_begin_operation(Mnr* p){return p->engine.beginOperation();}
+extern "C" int32_t mnr_start_generation(Mnr* p,const char* input,uint32_t il,const char* output,uint32_t ol,int32_t version,uint32_t buffer,uint32_t period,int32_t graphs,float intensity,char* error,uint32_t cap,uint64_t generation) {
     try {
+        if(generation && p->engine.operation!=generation){copy("Audio operation cancelled",error,cap);return 0;}
         mic::Config c; c.input=string(input,il); c.output=string(output,ol); c.version=version;
         c.bufferMs=buffer; c.periodMs=period; c.cudaGraphs=graphs; c.intensity=intensity;
         c.tag=c.output==L"TAG"; c.sdk=mic::projectRoot()/L"vendor/nvidia-afx-3.0.0";
         c.tagSdk=mic::projectRoot()/L"vendor/tag-2.0.0.1903-demo";
-        p->monitor.stop();p->engine.start(c);p->outputRoute=c.output;return 1;
-    } catch(const std::exception& e) {copy(e.what(),error,cap);p->engine.reportError(e.what());return 0;}
+        p->monitor.stop();p->engine.start(c,generation);p->outputRoute=c.output;return 1;
+    } catch(const std::exception& e) {copy(e.what(),error,cap);if(generation && p->engine.operation!=generation)p->engine.stop();else p->engine.reportError(e.what());return 0;}
     catch(...) {copy("Start failed",error,cap);p->engine.state=5;return 0;}
+}
+extern "C" int32_t mnr_start(Mnr* p,const char* input,uint32_t il,const char* output,uint32_t ol,int32_t version,uint32_t buffer,uint32_t period,int32_t graphs,float intensity,char* error,uint32_t cap) {
+    return mnr_start_generation(p,input,il,output,ol,version,buffer,period,graphs,intensity,error,cap,0);
 }
 extern "C" void mnr_stop(Mnr* p) {try {p->monitor.stop();p->engine.stop();} catch(...) {p->engine.state=5;}}
 extern "C" int32_t mnr_headphones(Mnr* p,int32_t enabled,const char* output,uint32_t length,int32_t denoise,char* error,uint32_t cap) {
@@ -129,7 +154,7 @@ extern "C" int32_t mnr_gpu(char* text,uint32_t capacity) {
 extern "C" int32_t mnr_devices(int32_t capture,char* result,uint32_t capacity) {
     try {
         std::string all;
-        if(!capture) all="TAG\tThin Audio Gateway\n";
+        if(!capture) all="TAG\tMic Noize (Thin Audio Gateway)\n";
         for(auto& d:mic::devices(capture!=0)) {
             for(auto& ch:d.name) if(ch==L'\t'||ch==L'\r'||ch==L'\n') ch=L' ';
             all+=mic::utf8(d.id)+"\t"+mic::utf8(d.name)+"\n";
@@ -137,6 +162,31 @@ extern "C" int32_t mnr_devices(int32_t capture,char* result,uint32_t capacity) {
         if(all.size()>=capacity) return 0;
         copy(all,result,capacity); return 1;
     } catch(const std::exception& e) {copy(e.what(),result,capacity);return 0;} catch(...) {return 0;}
+}
+extern "C" int32_t mnr_refresh_host(char* error,uint32_t capacity) {
+    try {
+        try{mic::configureTagTask();mic::runTagTask();mic::setTagTaskWarning({});}
+        catch(const std::exception& e){mic::setTagTaskWarning(std::string("Фоновое восстановление недоступно: ")+e.what());}
+        mic::ensureTagHost();return 1;
+    }
+    catch(const std::exception& e){copy(e.what(),error,capacity);return 0;}
+    catch(...){copy("TAG host recovery failed",error,capacity);return 0;}
+}
+extern "C" int32_t mnr_tag_stop_host(char* error,uint32_t capacity) {
+    try {mic::stopTagHost();return 1;}catch(const std::exception& e){copy(e.what(),error,capacity);return 0;}catch(...){copy("Host stop failed",error,capacity);return 0;}
+}
+extern "C" int32_t mnr_tag_repair_lines(char* error,uint32_t capacity) {
+    try {
+        if(!mic::tagMaintenancePending())throw std::runtime_error("Line repair requires a stopped maintenance operation");
+        struct Close {HANDLE h;~Close(){if(h)CloseHandle(h);}} owner{CreateMutexW(nullptr,FALSE,L"Global\\MicNoize.TAG.Driver")};
+        if(!owner.h || GetLastError()==ERROR_ALREADY_EXISTS)throw std::runtime_error("TAG driver is still owned by a host/session; line repair cancelled");
+        Close event{CreateEventW(nullptr,FALSE,FALSE,nullptr)};if(!event.h)throw std::runtime_error("Line repair event unavailable");
+        mic::TagOutput repaired(mic::projectRoot()/L"vendor/tag-2.0.0.1903-demo",event.h,true,nullptr,true);
+        repaired.handleEvent();return 1;
+    }catch(const std::exception& e){copy(e.what(),error,capacity);return 0;}catch(...){copy("TAG line repair failed",error,capacity);return 0;}
+}
+extern "C" int32_t mnr_tag_task_enabled(int32_t mode,char* error,uint32_t capacity) {
+    try {return mic::tagTaskEnabled(mode)?1:0;}catch(const std::exception& e){copy(e.what(),error,capacity);return -1;}catch(...){copy("Host task maintenance failed",error,capacity);return -1;}
 }
 extern "C" void mnr_bindings(Mnr* p,const uint32_t* keys,uint32_t count) {
     if(!keys || (count!=12 && count!=13))return;
@@ -266,8 +316,9 @@ static LRESULT CALLBACK shellProc(HWND w,UINT message,WPARAM wp,LPARAM lp) {
         p->engine.releaseEffects();return 0;
     case WM_POWERBROADCAST:
         if(wp==PBT_APMSUSPEND) p->suspended=true;
-        if(wp==PBT_APMRESUMEAUTOMATIC || wp==PBT_APMRESUMESUSPEND) p->suspended=false;
+        if(wp==PBT_APMRESUMEAUTOMATIC || wp==PBT_APMRESUMESUSPEND) {p->suspended=false;p->events.fetch_or(32);}
         p->engine.releaseEffects();return TRUE;
+    case WM_DEVICECHANGE: p->events.fetch_or(32);return TRUE;
     case WM_QUERYENDSESSION: p->engine.releaseEffects();p->events.fetch_or(2);return TRUE;
     }
     return DefWindowProcW(w,message,wp,lp);
@@ -295,7 +346,7 @@ extern "C" int32_t mnr_shell_start(Mnr* p,char* error,uint32_t cap) {
         }
         p->shell=std::jthread([p](std::stop_token stop) {
             // Skip silently while the core component is still downloading; the UI reports that.
-            if(mic::tagHostInstalled())
+            if(mic::tagHostInstalled() && std::filesystem::is_regular_file(mic::projectRoot()/L"vendor/tag-2.0.0.1903-demo/apidll/x64/tagapi.dll"))
                 try {mic::ensureTagHost();} catch(const std::exception& e) {p->engine.reportError(e.what());}
             WNDCLASSW cls{};cls.lpfnWndProc=shellProc;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"MicNoize.Shell";
             RegisterClassW(&cls);

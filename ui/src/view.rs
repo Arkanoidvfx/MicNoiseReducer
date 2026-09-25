@@ -445,7 +445,8 @@ impl App {
             );
         }
         if !self.message.is_empty() {
-            body = body.push(container(label(&self.message, 13, RED)).padding([4, 0]));
+            let color=match self.message.as_str(){DEVICE_REPAIRED=>GREEN,DEVICE_REPAIRING=>DIM,_=>RED};
+            body = body.push(container(label(&self.message, 13, color)).padding([4, 0]));
         }
         // The soundpad owns its own scrollable list (and the "body" id) so its toolbar and
         // sidebar stay put while hundreds of clips scroll.
@@ -1788,6 +1789,25 @@ impl App {
             .spacing(6)
             .into()
         };
+        let repair_row: Element<'_,Msg> = if self.repair_confirm {
+            column![
+                bold("Восстановление устройства",16,INK),
+                label("Обработка микрофона и наушников будет остановлена на время проверки. Текущая линия сохранится, если перенос не требуется.",12,DIM),
+                frame(widget::checkbox(self.repair_lines)
+                    .label("Освободить место для наушников и перенести старые линии Mic Noize")
+                    .text_size(13).size(16).on_toggle(Msg::RepairLines).style(check_style),self.focus==focus::settings::REPAIR_LINES),
+                label("Стандартный вход TAG Microphone будет освобождён, в том числе после перезагрузок. При переносе старой линии Mic Noize её потребуется снова выбрать в Discord и других программах. Физический микрофон не меняется.",12,DIM),
+                frame(widget::checkbox(self.repair_reinstall)
+                    .label("Разрешить переустановку драйвера, если проверка и перезапуск не помогут")
+                    .text_size(13).size(16).on_toggle(Msg::RepairReinstall).style(check_style),self.focus==focus::settings::REPAIR_REINSTALL),
+                label("При переустановке Windows запросит права администратора. Устройство может получить новый идентификатор — тогда его нужно снова выбрать в Discord и других программах.",12,DIM),
+                row![action(label("Восстановить",13,BG),Msg::RepairConfirm,self.focus==focus::settings::REPAIR_CONFIRM,true),
+                    action(label("Отмена",13,INK),Msg::RepairCancel,self.focus==focus::settings::REPAIR_CANCEL,false)].spacing(8)
+            ].spacing(8).into()
+        } else {
+            action(label(if self.repair_resume.is_some(){"Восстанавливаем…"}else{"Восстановить устройство"},13,INK),Msg::Repair,self.focus==focus::settings::REPAIR,false)
+                .on_press_maybe((!self.driver_installing && !self.core_installing && !self.quitting && !self.apply_pending).then_some(Msg::Repair)).into()
+        };
         column![bold("Настройки",24,INK),route,model,
 
             line(),label(format!("NVIDIA {:.2} мс  ·  очередь {:.1} мс  ·  пропуски {} / {}",self.snapshot.process_ms,self.snapshot.queue_ms,self.snapshot.underruns,self.snapshot.drops),12,DIM),
@@ -1806,6 +1826,11 @@ impl App {
                 .on_toggle(Msg::Autostart)
                 .style(check_style), self.focus == focus::settings::AUTOSTART),
             driver_row,
+            label(format!("Устройство Mic Noize: {}",self.device_state.label()),13,match self.device_state {
+                engine::DeviceState::Ready=>GREEN,engine::DeviceState::UserAction=>RED,_=>DIM,
+            }),
+            label(&self.device_detail,12,DIM),
+            repair_row,
             widget::rule::horizontal(1),
             label(format!("Mic Noize {}", env!("CARGO_PKG_VERSION")), 13, INK),
             label(&self.update_status, 12, if self.update_ready { GREEN } else { DIM }),

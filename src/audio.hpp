@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <mmdeviceapi.h>
 #include <array>
 #include <atomic>
 #include <algorithm>
@@ -27,7 +28,8 @@ inline int preferredDevice(const std::vector<Device>& list,const std::wstring& s
         if(saved.empty()?list[i].name.find(hint)!=std::wstring::npos:list[i].id==saved) return static_cast<int>(i);
     return -1; // A missing saved device must never silently select a different microphone.
 }
-std::vector<Device> devices(bool capture);
+std::vector<Device> devices(bool capture,DWORD states=DEVICE_STATE_ACTIVE);
+Device tagMicrophone();
 std::filesystem::path projectRoot();
 std::string utf8(const std::wstring& s);
 std::wstring wide(const std::string& s);
@@ -130,9 +132,10 @@ struct Stats {
     std::atomic<unsigned> tagLateTicks{0}, tagReconnects{0};
     std::atomic<float> tagMaxWakeMs{0};
 };
-struct RoutedSample {float value=0;uint8_t discord=0,modified=0;unsigned epoch=0;float microphone=0;float sound=0;};
+struct RoutedSample {float value=0;uint8_t discord=0,modified=0;unsigned epoch=0;float microphone=0;float sound=0;uint8_t recording=0;};
 // Soundpad clip: decoded by the UI to 48 kHz mono, owned here so playback never touches files.
 struct SoundClip {std::vector<float> samples;std::atomic<float> gain{1};};
+constexpr unsigned recordingClipIdBase=900000;
 constexpr uint64_t soundDoublePressMs=170;
 // One clip at a time in the DSP thread: a request replaces, restarts (quick double press) or
 // stops (same clip pressed again). Stop and replace ramp over 5 ms so Discord hears no click.
@@ -163,12 +166,15 @@ public:
         if(clip_&&fade_>0){next_=std::move(clip);nextId_=id;fadeStep_=-1.0f/240;return;}
         clip_=std::move(clip);id_=id;position_=0;fade_=1;fadeStep_=0;
     }
-    void render(float* out,unsigned count,float volume) {
+    void render(float* out,unsigned count,float volume,bool muted=false,uint8_t* recording=nullptr) {
         for(unsigned i=0;i<count;++i){
             out[i]=0;
+            if(recording)recording[i]=0;
             if(!clip_)continue;
             if(position_>=clip_->samples.size()){clip_.reset();if(next_){start(nextId_,std::move(next_));next_.reset();}continue;}
-            out[i]=std::clamp(clip_->samples[position_++]*clip_->gain.load(std::memory_order_relaxed)*volume*fade_,-1.0f,1.0f);
+            if(recording)recording[i]=id_>=recordingClipIdBase;
+            const float playbackVolume=muted?0.0f:(id_>=recordingClipIdBase?1.0f:volume);
+            out[i]=std::clamp(clip_->samples[position_++]*clip_->gain.load(std::memory_order_relaxed)*playbackVolume*fade_,-1.0f,1.0f);
             if(fadeStep_){fade_+=fadeStep_;if(fade_<=0){fade_=0;fadeStep_=0;clip_.reset();if(next_){start(nextId_,std::move(next_));next_.reset();}}}
         }
     }
@@ -208,12 +214,12 @@ inline float previewSample(const RoutedSample& sample,uint8_t mask,unsigned epoc
     return audible && (sample.modified&mask) && sample.epoch==epoch?sample.value:0;
 }
 // Producer side of the effects-only monitor: what goes into the preview queue for one output
-// sample. The consumer applies previewSample again, so a soundpad clip sample must carry
-// ModifiedSound here (preview queue only; routed samples never do).
-inline RoutedSample previewQueued(float effectOnly,uint8_t modified,unsigned sampleEpoch,float sound,uint8_t mask,unsigned epoch,bool audible) {
-    const bool clip=(mask&ModifiedSound) && sound!=0;
+// sample. The consumer applies previewSample again, so a clip sample must carry its
+// monitor category here (preview queue only; routed samples never do).
+inline RoutedSample previewQueued(float effectOnly,uint8_t modified,unsigned sampleEpoch,float sound,bool recording,uint8_t mask,unsigned epoch,bool audible) {
+    const bool clip=((mask&ModifiedSound) || (recording && (mask&ModifiedEffects))) && sound!=0;
     const RoutedSample sample{effectOnly,0,modified,sampleEpoch};
-    return {previewSample(sample,mask,epoch,audible)+(clip&&audible?sound:0),0,static_cast<uint8_t>(modified|(clip?ModifiedSound:0)),epoch};
+    return {previewSample(sample,mask,epoch,audible)+(clip&&audible?sound:0),0,static_cast<uint8_t>(modified|(clip?ModifiedSound|(recording?ModifiedEffects:0):0)),epoch};
 }
 class Engine {
     friend void checkDiscordCapture(unsigned seconds);
@@ -249,6 +255,8 @@ class Engine {
     void status(std::wstring text);
 public:
     Stats stats;
+    std::atomic<uint64_t> operation{0};
+    uint64_t beginOperation(){const auto value=++operation;SetEvent(stop_);releaseEffects();return value;}
     // One atomic message: timestamp (37 bits), epoch (16), eligibility + ten holds (11).
     std::atomic<uint64_t> heldSample{0};
     std::atomic<uint64_t> noiseHeldSample{0};
@@ -295,7 +303,7 @@ public:
     ~Engine();
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
-    void start(const Config& config);
+    void start(const Config& config,uint64_t expectedOperation=0);
     void stop();
     bool running() const { return running_; }
     std::wstring status() const;

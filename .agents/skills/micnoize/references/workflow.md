@@ -75,7 +75,7 @@ $capture.WaitForExit()
 if ($capture.ExitCode -ne 0) { throw 'UI snapshot failed' }
 ```
 
-Inspect the PNG with an image tool before calling visual QA complete. Optional flags: `--ui-small`, `--ui-scale 2`, `--ui-settings`, `--ui-rvc`. Include `--ui-benchmark` with snapshots to suppress automatic microphone startup; without a snapshot it runs the show/hide/reopen check. Run the installed executable in `bin` so settings and model paths resolve correctly. Wait for the QA process to exit before reopening the normal UI. If the user is playing or requests background-only work, do not activate windows, inject input, or launch visible UI checks.
+Inspect the PNG with an image tool before calling visual QA complete. Optional flags: `--ui-small`, `--ui-scale 2`, `--ui-settings`, `--ui-rvc`, `--ui-repair` (confirmation). With `--ui-benchmark --ui-repair`, `--ui-repair-run` also exercises safe repair without reinstall/UAC; use only for an authorized device-maintenance check. Include `--ui-benchmark` with snapshots to suppress automatic microphone startup; without a snapshot it runs the show/hide/reopen check. Run the installed executable in `bin` so settings and model paths resolve correctly. Wait for the QA process to exit before reopening the normal UI. If the user is playing or requests background-only work, do not activate windows, inject input, or launch visible UI checks.
 
 For hardware tasks build `mic_check`, then use `--list` to get **current** device indices. Relevant commands: `--discord-capture` (Discord process capture only, no saved audio/NVIDIA/output), `--monitor-check INPUT_INDEX TAG`, `--smoke-phrases INPUT_INDEX TAG 14 2 40`, `--persistent-tag INPUT_INDEX`, `--tag-reconnect INPUT_INDEX` (stalls the output thread for 120/400 ms against the live host; the session must survive). For supported WASAPI tests replace TAG with the current output index. Consult the relevant README section and `src/check.cpp` arguments before running a hardware test.
 
@@ -95,6 +95,8 @@ git worktree remove "$project\.tmp\public"
 ```
 
 ### Release checklist
+
+The first transition from the published 0.2.5 uses `MicNoize-Upgrade-<version>.zip` and explicit device-repair consent. Paired packages use `win-x64-stable-v2`; never add them to the old channel, whose updater runs before durable recovery is registered. `Setup.exe` is for a fresh installation. Local packaging does not establish release acceptance. `Update.exe apply` must include `--norestart`; only our recovery launches a restored UI after verifying its host. A restored legacy host is allowed only at the exact hash recorded in `maintenance.rs`; do not infer its implementation from a later source revision.
 
 "Выпусти обнову" means all of this, without asking again:
 
@@ -116,3 +118,13 @@ Telemetry backend: Mic Noize posts to its own Cloudflare Worker `micnoize-teleme
 Velopack puts program files in `%LOCALAPPDATA%\MicNoize\current`; `settings.ini`, `install-id.txt` and downloaded `Components\` live in `%APPDATA%\Mic Noize`, so uninstalling the app does not remove user data. A dev executable in `bin` always uses the repository root when `vendor\nvidia-afx-3.0.0` is present; installed builds use the persistent Components directory.
 
 Claude Desktop and Codex run their terminals inside MSIX packages with AppData/HKCU write virtualization. Launch `Setup.exe`, `Run.bat` and anything that must persist `%APPDATA%\Mic Noize` data or HKCU state from Explorer (or ask the user), and verify results by reading paths, not by launching.
+
+### Local paired-update acceptance
+
+Reboot acceptance: save host status, endpoint/line, installed hashes, task/Run settings and saved TAG IDs before reboot. Read status before Refresh or any restart after boot. The first 2026-09-24 reboot passed startup/name/shared policy but changed line 1 to 3; build 06 pins the ID. The second reboot passed: compare `results/tag-before-reboot-identity-20260924.json` with `results/tag-after-reboot-identity-20260924.json`; line 3 and endpoint match. A same-session host restart is not a substitute.
+
+The developer flag "--ui-benchmark --check-update-package <full.nupkg>" uses the real prepare/apply/recovery path with processing disabled. It requires a Velopack installation and a package inside that installation's packages directory. Use an isolated app copy with preserved task/settings and an explicitly coordinated host stop: it operates the real current-user host. Recovery and updater processes must use a working directory outside replaceable current, even when their executables are already outside it. Windows PowerShell appends trailing command-line whitespace; host CLI parsing is covered by native checks.
+
+Shared-only acceptance: "bin/mic_tag_probe.exe --check-shared-only" requires explicit AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED plus two simultaneous shared captures. "--check-shared-guard" temporarily enables exclusive access on the live host-confirmed virtual endpoint, checks automatic restoration within 1500 ms and repeats the functional check; on error it restores the deny setting. "--shared-only" explicitly sets that endpoint's policy and verifies readback. These checks never select by display name or change other endpoints. Run signal probes with the UI processing stopped.
+
+Explicit recovery acceptance: `scripts/check-tag-recovery.ps1` requires the UI closed and deliberately crashes only verified installed host processes. It tests parent/worker/parent recovery, durable exhaustion after total process loss, recovery with no surviving worker, and stale-command/Stop cancellation; allow about 14 minutes. `-SupervisorOnly` tests parent and combined process suspensions with verified handles and cleanup; allow about eight minutes. `scripts/check-tag-tray-exit.ps1` starts only a tray benchmark UI and requires normal exit within eight seconds; it never forces termination or stops the host.

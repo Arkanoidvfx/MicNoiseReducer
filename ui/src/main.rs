@@ -10,6 +10,7 @@ mod smooth;
 mod soundpad;
 mod telemetry;
 mod updater;
+mod maintenance;
 mod view;
 use engine::{Config, Controls, Device, Engine, Reply, Snapshot};
 use iced::{Element, Font, Size, Subscription, Task, Theme, keyboard, window};
@@ -27,10 +28,10 @@ use std::{
 };
 
 const TAG_HOST_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-const TAG_HOST_RUN_NAME: &str = "MicNoize.TagHost";
-const LEGACY_TAG_HOST_RUN_NAME: &str = "MicNoiseReducer.TagHost"; // Legacy name, migration only.
 const DRIVER_INSTALL_MESSAGE: &str =
     "Устанавливаем виртуальный микрофон: подтвердите запрос Windows…";
+const DEVICE_REPAIRED: &str = "Устройство восстановлено";
+const DEVICE_REPAIRING: &str = "Проверяем и восстанавливаем виртуальное устройство…";
 const EXIT_EVENT: u32 = 2;
 const RESTART_EVENT: u32 = 4;
 /// Mirrors `mic::rvcSlack` (src/audio.hpp): RVC output is a fixed delay line of chunk + slack.
@@ -68,7 +69,7 @@ fn clip_name() -> String {
     let mut t = LocalTime::default();
     unsafe { GetLocalTime(&mut t) };
     format!(
-        "Запись {:04}-{:02}-{:02} {:02}-{:02}-{:02}.wav",
+        "Запись {:04}-{:02}-{:02} {:02}-{:02}-{:02} (mix).wav",
         t.year, t.month, t.day, t.hour, t.minute, t.second
     )
 }
@@ -81,6 +82,7 @@ fn clip_label(name: &str) -> String {
     else {
         return stem.to_owned();
     };
+    let time = time.split_whitespace().next().unwrap_or(time);
     match (date.split('-').count(), time.split('-').count()) {
         (3, 3) => time.replace('-', ":"),
         _ => stem.to_owned(),
@@ -217,6 +219,11 @@ mod focus {
         pub const UPDATE: usize = 57;
         pub const APPLY_UPDATE: usize = 58;
         pub const DRIVER: usize = 72;
+        pub const REPAIR: usize = 90;
+        pub const REPAIR_REINSTALL: usize = 91;
+        pub const REPAIR_CONFIRM: usize = 92;
+        pub const REPAIR_CANCEL: usize = 93;
+        pub const REPAIR_LINES: usize = 94;
     }
     pub mod effects {
         pub const INPUT: usize = 35;
@@ -279,8 +286,29 @@ fn restart_requested(events: u32) -> bool {
     events & (EXIT_EVENT | RESTART_EVENT) == RESTART_EVENT
 }
 
-/// Pauses before each automatic restart; after the last one the error stays on screen.
+/// Device loss keeps waiting at the last delay; other failures retain the attempt limit.
 const RECOVERY_DELAYS: [u64; 5] = [2, 5, 15, 30, 60];
+fn transient_device_failure(error: &str) -> bool {
+    [
+        "Waiting for the TAG microphone endpoint in Windows",
+        "TAG microphone endpoint is not active",
+        "Bound Mic Noize TAG microphone endpoint is not active",
+        "TAG endpoint controller unavailable",
+        "TAG background host unavailable",
+        "TAG host stopped responding",
+        "TAG host response timeout",
+        "TAG endpoint changed; reconnect processing",
+        "TAG host restarted or protocol changed; reconnect processing",
+        "TAG connection expired; reconnect processing",
+        "TAG response expired; reconnect processing",
+        "TAG host initializing or waiting for driver",
+        "0x88890004", // AUDCLNT_E_DEVICE_INVALIDATED
+        "0x88890010", // AUDCLNT_E_SERVICE_NOT_RUNNING
+        "0x80070490", // Selected endpoint temporarily absent (ERROR_NOT_FOUND).
+    ]
+    .iter()
+    .any(|reason| error.contains(reason))
+}
 /// Restarts processing after any failure: TAG host gone, microphone lost across sleep, a start
 /// that hit a device not ready yet after login. There is no Start button, so without this a
 /// failure lasted until the user pressed Refresh. A settings error just spends the attempts;
@@ -290,6 +318,7 @@ struct Recovery {
     attempts: usize,
     since: Option<Instant>,
     due: Option<Instant>,
+    wait_for_device: bool,
 }
 impl Recovery {
     /// Feed every engine state; returns the pause when a restart gets scheduled.
@@ -307,8 +336,11 @@ impl Recovery {
             5 if self.due.is_none() => {
                 // A flapping session must not count its old healthy stretch as forgiveness.
                 self.since = None;
-                let delay = Duration::from_secs(*RECOVERY_DELAYS.get(self.attempts)?);
-                self.attempts += 1;
+                let seconds = RECOVERY_DELAYS.get(self.attempts).copied().or_else(|| {
+                    self.wait_for_device.then_some(60)
+                })?;
+                let delay = Duration::from_secs(seconds);
+                self.attempts = self.attempts.saturating_add(1);
                 self.due = Some(now + delay);
                 Some(delay)
             }
@@ -323,67 +355,7 @@ impl Recovery {
         due
     }
     fn exhausted(&self) -> bool {
-        self.due.is_none() && self.attempts >= RECOVERY_DELAYS.len()
-    }
-}
-
-fn tag_host_autostart() -> bool {
-    [TAG_HOST_RUN_NAME, LEGACY_TAG_HOST_RUN_NAME]
-        .iter()
-        .any(|name| {
-            Command::new("reg")
-                .args(["query", TAG_HOST_RUN_KEY, "/v", name])
-                .creation_flags(0x08000000) // CREATE_NO_WINDOW: a GUI parent would otherwise flash a console.
-                .output()
-                .is_ok_and(|output| output.status.success())
-        })
-}
-
-fn set_tag_host_autostart(enabled: bool) -> Result<(), String> {
-    Command::new("reg")
-        .args([
-            "delete",
-            TAG_HOST_RUN_KEY,
-            "/v",
-            LEGACY_TAG_HOST_RUN_NAME,
-            "/f",
-        ])
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|e| e.to_string())?;
-    // A missing legacy value is expected; it exists only during migration.
-    let mut command = Command::new("reg");
-    command.creation_flags(0x08000000);
-    if enabled {
-        let paths = paths::Paths::resolve()?;
-        let component_host = paths.components.join("bin/mic_tag_host.exe");
-        let exe = if component_host.is_file() {
-            component_host
-        } else {
-            paths.app.join("mic_tag_host.exe")
-        };
-        if !exe.exists() {
-            return Err("mic_tag_host.exe не найден; запустите build.ps1".into());
-        }
-        command.args([
-            "add",
-            TAG_HOST_RUN_KEY,
-            "/v",
-            TAG_HOST_RUN_NAME,
-            "/t",
-            "REG_SZ",
-            "/d",
-            &format!(r#""{}""#, exe.display()),
-            "/f",
-        ]);
-    } else {
-        command.args(["delete", TAG_HOST_RUN_KEY, "/v", TAG_HOST_RUN_NAME, "/f"]);
-    }
-    let output = command.output().map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        !self.wait_for_device && self.due.is_none() && self.attempts >= RECOVERY_DELAYS.len()
     }
 }
 
@@ -424,6 +396,7 @@ enum Msg {
     WindowFocus(window::Id, bool),
     /// Windows minimized the window (0×0 resize), e.g. a taskbar click on the active window.
     Minimized(window::Id),
+    MinimizedState(window::Id, Option<bool>),
     Hide,
     Show,
     Minimize,
@@ -436,6 +409,7 @@ enum Msg {
     Page(u8),
     Refresh,
     Autostart(bool),
+    AutostartUpdated(Result<bool, String>),
     AppAutostart(bool),
     Input(Device),
     Output(Device),
@@ -466,6 +440,12 @@ enum Msg {
     RvcInstalled(Result<String, String>),
     CoreInstalled(Result<String, String>),
     InstallDriver,
+    Repair,
+    RepairReinstall(bool),
+    RepairLines(bool),
+    RepairConfirm,
+    RepairCancel,
+    Repaired(Result<(), String>),
     DriverInstalled(Result<(), String>),
     SendReport,
     ReportSent(Result<String, String>),
@@ -475,6 +455,8 @@ enum Msg {
     LogsFolder,
     UpdateCheck,
     UpdateChecked(updater::Status),
+    UpdatePrepared(Result<(),String>),
+    UpdateApplied(Result<(),String>),
     ApplyUpdate,
     CancelPhrase,
     Bind(usize),
@@ -539,6 +521,9 @@ struct SectionItem {
     count: usize,
     selection: Selection,
 }
+#[derive(Clone,Copy,serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeIntent {microphone:bool,headphones:bool,monitor:i32,full_monitor:bool}
 struct App {
     soundpad_page: bool,
     sound_folder: Option<PathBuf>,
@@ -611,6 +596,15 @@ struct App {
     core_installing: bool,
     driver_installing: bool,
     driver_ready: bool,
+    device_state: engine::DeviceState,
+    device_detail: String,
+    repair_confirm: bool,
+    repair_reinstall: bool,
+    repair_lines: bool,
+    repair_resume: Option<ResumeIntent>,
+    repair_started: bool,
+    quit_after_repair: bool,
+    resume_monitor: Option<(i32,bool)>,
     report_sending: bool,
     logs_page: bool,
     /// Engine denoiser: 1 NVIDIA, 2 none, 3 DeepFilterNet on the CPU, 4 input already denoised
@@ -652,6 +646,7 @@ struct App {
     update_ready: bool,
     update_status: String,
     apply_after_quit: bool,
+    update_resume: Option<ResumeIntent>,
     /// "Update" was pressed: apply as soon as the re-check before it finishes.
     apply_pending: bool,
     busy: bool,
@@ -667,6 +662,8 @@ struct App {
     dirty: Option<Instant>,
     hint_shown: bool,
     autostart: bool,
+    autostart_busy: bool,
+    task_warning: String,
     app_autostart: bool,
     tray_ok: bool,
     peak: f32,
@@ -696,6 +693,15 @@ fn timer(visible: bool) -> Task<Msg> {
         },
         |_| Msg::Tick,
     )
+}
+fn exit_ui() -> Task<Msg> {
+    // Winit 0.30.13 can enter MsgWaitForMultipleObjectsEx after AboutToWait
+    // already requested exit. A tray-only daemon has no window destruction to wake it.
+    // Queue the native quit message as well; iced::exit still drops the app normally.
+    #[link(name = "user32")]
+    unsafe extern "system" { fn PostQuitMessage(code: i32); }
+    if !cfg!(test) { unsafe { PostQuitMessage(0); } }
+    iced::exit()
 }
 fn window_icon() -> window::Icon {
     let decoder = png::Decoder::new(std::io::Cursor::new(include_bytes!("../assets/app-64.png")));
@@ -780,6 +786,7 @@ impl App {
         let Some(engine) = Engine::new(controls)? else {
             return Ok(None);
         };
+        if !cfg!(test){engine.request_device_state();}
         let mut keys = [
             settings.number("effects", "boost_key", 0, 0, 2046) as u32,
             settings.number("effects", "pitch_key", 0, 0, 2046) as u32,
@@ -881,8 +888,7 @@ impl App {
         // The TAG driver is machine-wide and absent on a fresh install; the core component
         // carries its files, so this can only run once they are on disk.
         let driver_ready = cfg!(test) || components::driver_installed();
-        let driver_installing = !core_installing && !driver_ready;
-        let driver_root = runtime_root.clone();
+        let driver_installing = false;
         let rvc_runtime_installed = cfg!(test) || components::rvc_installed(&runtime_root);
         let rvc_models = if cfg!(test) {
             vec![]
@@ -955,6 +961,15 @@ impl App {
                 core_installing,
                 driver_installing,
                 driver_ready,
+                device_state:if driver_ready{engine::DeviceState::Starting}else{engine::DeviceState::WaitingDriver},
+                device_detail:String::new(),
+                repair_confirm:args.iter().any(|s|s=="--ui-repair"),
+                repair_reinstall:false,
+                repair_lines:false,
+                repair_resume:None,
+                repair_started:false,
+                quit_after_repair:false,
+                resume_monitor:None,
                 report_sending: false,
                 logs_page: args.iter().any(|s| s == "--ui-logs"),
                 denoiser: (0, String::new()),
@@ -987,7 +1002,7 @@ impl App {
                 } else {
                     String::new()
                 },
-                details: args.iter().any(|s| s == "--ui-settings"),
+                details: args.iter().any(|s| s == "--ui-settings" || s=="--ui-repair"),
                 rvc_page: args.iter().any(|s| s == "--ui-rvc"),
                 rvc_advanced: false,
                 rvc_importing: false,
@@ -1002,6 +1017,7 @@ impl App {
                     "Проверяем обновления…".into()
                 },
                 apply_after_quit: false,
+                update_resume: maintenance::take_resume(),
                 apply_pending: false,
                 busy: false,
                 quitting: false,
@@ -1013,7 +1029,9 @@ impl App {
                 focus: focus::NONE,
                 dirty: None,
                 hint_shown,
-                autostart: !cfg!(test) && tag_host_autostart(),
+                autostart: !cfg!(test) && engine::tag_autostart(-1).unwrap_or(false),
+                autostart_busy: false,
+                task_warning: String::new(),
                 app_autostart,
                 tray_ok: true,
                 peak: 0.0,
@@ -1044,14 +1062,6 @@ impl App {
                     Task::perform(
                         async move { components::install_core(&component_root, arch.as_deref()) },
                         Msg::CoreInstalled,
-                    )
-                } else {
-                    Task::none()
-                },
-                if driver_installing {
-                    Task::perform(
-                        async move { components::install_driver(&driver_root) },
-                        Msg::DriverInstalled,
                     )
                 } else {
                     Task::none()
@@ -1303,7 +1313,7 @@ impl App {
         self.clips = newest_clips(&self.clips_folder);
     }
     fn load_clip(&mut self, index: usize) -> Task<Msg> {
-        let (window, live) = (self.sound_window(), self.clip_live.clone());
+        let live = self.clip_live.clone();
         let Some(clip) = self.clips.get_mut(index) else {
             return Task::none();
         };
@@ -1312,6 +1322,7 @@ impl App {
         }
         clip.state = SoundState::Loading;
         let path = clip.path.clone();
+        let rendered = clip.name.contains(" (mix)");
         let (loader, id, generation) = (
             self.engine.sound_loader(),
             Self::clip_id(index),
@@ -1319,7 +1330,13 @@ impl App {
         );
         Task::perform(
             async move {
-                let pcm = decode_for(&path, window)?;
+                let mut pcm = soundpad::decode(&path)?;
+                // Old files have no source metadata; use the former Discord 100% gain.
+                if !rendered {
+                    for sample in &mut pcm {
+                        *sample *= DISCORD_VOLUME_AT_100;
+                    }
+                }
                 load_if_live(&loader, &live, generation, id, &pcm, 1.0)?;
                 Ok(pcm.len() as f32 / soundpad::RATE as f32)
             },
@@ -1517,13 +1534,28 @@ impl App {
             move |text| Msg::Logs(text, copy),
         )
     }
+    fn processing_intent(&self)->ResumeIntent {
+        ResumeIntent{microphone:self.running()||self.busy,headphones:matches!(self.headphone_state,1|2)||self.headphone_busy,
+            monitor:if matches!(self.monitor,1|2){self.monitor_mode()}else{0},full_monitor:self.monitor_all}
+    }
+    fn resume_processing(&mut self,intent:ResumeIntent) {
+        if self.controls.rvc {self.engine.rvc(true,self.controls.rvc_options);}
+        self.auto_started = !intent.microphone;
+        self.resume_monitor=(intent.monitor!=0).then_some((intent.monitor,intent.full_monitor));
+        if intent.microphone {self.auto_start();}
+        if intent.headphones && let Some(output)=&self.headphone_output {
+            self.headphone_busy=true;self.engine.headphones(true,output.id.clone(),self.headphone_denoise);
+        }
+    }
     fn auto_start(&mut self) {
         if self.auto_started
+            || self.quitting
             || self.benchmark
             || self.busy
             || self.running()
             || self.core_installing
             || self.driver_installing
+            || !self.driver_ready
         {
             return;
         }
@@ -1553,6 +1585,18 @@ impl App {
         match msg {
             Msg::Tick => {
                 self.ticks += 1;
+                if !cfg!(test) && self.ticks.is_multiple_of(20) {
+                    self.engine.request_device_state();
+                    let warning = engine::tag_task_warning();
+                    if warning != self.task_warning {
+                        if self.message == self.task_warning { self.message.clear(); }
+                        if !warning.is_empty() {
+                            logs::note(&self.runtime_root, &warning);
+                            if self.message.is_empty() { self.message = warning.clone(); }
+                        }
+                        self.task_warning = warning;
+                    }
+                }
                 self.log_message();
                 if self.rvc_runtime_installing
                     && let Some(progress) = components::progress()
@@ -1565,8 +1609,16 @@ impl App {
                     self.message = format!("Загрузка компонентов NVIDIA/TAG: {progress}%");
                 }
                 if self.benchmark {
+                    if self.ticks==4 && self.repair_confirm {
+                        if std::env::args().any(|arg|arg=="--ui-repair-lines") {self.repair_lines=true;}
+                        self.focus=focus::settings::REPAIR_CONFIRM;
+                        return Task::batch([view::reveal_focus(),timer(false)]);
+                    }
                     if self.ticks == 8 {
                         self.usage = (Instant::now(), engine::usage().0);
+                        if self.repair_confirm && std::env::args().any(|arg|arg=="--ui-repair-run") {
+                            return Task::batch([self.update(Msg::RepairConfirm),timer(false)]);
+                        }
                     }
                     if [24, 44, 60].contains(&self.ticks) {
                         let (cpu, memory) = engine::usage();
@@ -1605,18 +1657,27 @@ impl App {
                 }
                 while let Some(reply) = self.engine.reply() {
                     match reply {
-                        Reply::Started(result) => {
+                        Reply::Host(result) => { if let Err(error) = result { self.message = error; } }
+                        Reply::Started(_, result) => {
                             self.busy = false;
                             self.monitor_all = false;
                             self.engine.controls(self.controls);
                             if let Err(e) = result {
                                 self.message = e;
                                 self.snapshot.state = 5;
-                            } else if self.effect_monitoring() {
-                                self.engine.monitor(self.monitor_mode());
+                            } else {
+                                self.message.clear();
+                                if let Some((mode,full))=self.resume_monitor.take() {
+                                    self.monitor_all=full;self.engine.monitor(mode);
+                                } else if self.effect_monitoring() { self.engine.monitor(self.monitor_mode()); }
                             }
                         }
                         Reply::Quit => {
+                            if self.repair_resume.is_some() && !self.repair_started {
+                                self.repair_started=true;
+                                let root=self.runtime_root.clone();let reinstall=self.repair_reinstall;let lines=self.repair_lines;
+                                return Task::batch([Task::perform(async move {maintenance::repair(&root,reinstall,lines)},Msg::Repaired),timer(false)]);
+                            }
                             telemetry::record_blocking(
                                 self.settings.path.parent().unwrap(),
                                 "session-end",
@@ -1629,16 +1690,12 @@ impl App {
                                     "rvc_latency_ms": self.snapshot.rvc_latency_ms,
                                 }),
                             );
-                            if self.apply_after_quit
-                                && let Err(error) = updater::apply_and_restart()
-                            {
-                                self.quitting = false;
-                                self.busy = false;
-                                self.apply_after_quit = false;
-                                self.message = format!("Обновление: {error}");
-                            } else {
-                                return iced::exit();
+                            if self.apply_after_quit {
+                                let intent=self.update_resume;
+                                return Task::batch([Task::perform(async move{updater::apply_and_restart(intent)},Msg::UpdateApplied),timer(false)]);
                             }
+                            if !cfg!(test) { logs::note(&self.runtime_root,"Выход: движок остановлен, завершение UI"); }
+                            return exit_ui();
                         }
                         Reply::Saved(result) => {
                             if let Err(e) = result {
@@ -1665,6 +1722,10 @@ impl App {
                                 self.message = format!("Ошибка RVC: {e}");
                                 self.dirty = Some(Instant::now());
                             }
+                        }
+                        Reply::DeviceState(_,state,detail) => {
+                            self.device_state=if self.driver_ready{state}else{engine::DeviceState::WaitingDriver};
+                            self.device_detail=detail;
                         }
                         Reply::Devices(result) => match result {
                             Ok((i, o)) => {
@@ -1701,7 +1762,12 @@ impl App {
                                         .cloned();
                                 }
                                 self.outputs = o;
-                                self.auto_start();
+                                if self.recovery.wait_for_device && self.input.is_some() {
+                                    self.recovery.due = Some(Instant::now());
+                                }
+                                if !self.quitting && !self.driver_installing {
+                                    if let Some(intent)=self.update_resume.take(){self.resume_processing(intent);}else{self.auto_start();}
+                                }
                             }
                             Err(e) => self.message = e,
                         },
@@ -1760,6 +1826,7 @@ impl App {
                     && !self.driver_installing
                 {
                     let now = Instant::now();
+                    self.recovery.wait_for_device = transient_device_failure(&error);
                     self.recovery.observe(snapshot.state, now);
                     if snapshot.state == 5
                         && self.recovery.take_due(now)
@@ -1801,6 +1868,7 @@ impl App {
                     return Task::batch([self.update(Msg::AcceptBind), timer(self.ui_active())]);
                 }
                 let events = self.engine.events();
+                if events & 32 != 0 && !self.quitting { self.engine.refresh(); }
                 if events & 16 != 0 {
                     self.tray_ok = false;
                     self.message =
@@ -1813,9 +1881,8 @@ impl App {
                     RESTART.store(true, Ordering::Relaxed);
                 }
                 if events & (EXIT_EVENT | RESTART_EVENT) != 0 && !self.quitting {
-                    self.quitting = true;
-                    self.save();
-                    self.engine.quit();
+                    if self.repair_resume.is_some() {self.quit_after_repair=true;}
+                    else {self.quitting = true;self.save();self.engine.quit();}
                 }
                 if self
                     .dirty
@@ -1847,6 +1914,15 @@ impl App {
                         return Task::batch([next, window::screenshot(id).map(Msg::Screenshot)]);
                     }
                 }
+                if let Some(id) = self
+                    .window
+                    .filter(|_| !self.window_focused && !self.own_minimize && self.tray_ok)
+                {
+                    return Task::batch([
+                        next,
+                        window::is_minimized(id).map(move |state| Msg::MinimizedState(id, state)),
+                    ]);
+                }
                 return next;
             }
             Msg::Opened(id) => {
@@ -1860,10 +1936,16 @@ impl App {
             }
             Msg::Minimized(id) => {
                 // Like OBS: clicking the taskbar icon of the active window hides it to tray.
-                if self.window == Some(id) && !std::mem::take(&mut self.own_minimize) {
+                if self.window == Some(id) && !self.own_minimize {
                     return self.update(Msg::Hide);
                 }
             }
+            Msg::MinimizedState(id, Some(true)) => {
+                if self.window == Some(id) && !self.own_minimize {
+                    return self.update(Msg::Hide);
+                }
+            }
+            Msg::MinimizedState(_, _) => {}
             Msg::Hide => {
                 if !self.tray_ok {
                     return Task::none();
@@ -1909,7 +1991,13 @@ impl App {
                 }
             }
             Msg::Quit => {
+                if self.repair_resume.is_some() {
+                    self.quit_after_repair=true;
+                    self.message="Выход после завершения восстановления. Запрос Windows можно отменить.".into();
+                    return Task::none();
+                }
                 if !self.quitting {
+                    if self.apply_after_quit {self.update_resume=Some(self.processing_intent());}
                     self.quitting = true;
                     self.busy = true;
                     self.save();
@@ -1951,15 +2039,35 @@ impl App {
                             };
                     }
                 }
-                if apply && !self.quitting {
-                    self.apply_after_quit = true;
-                    return self.update(Msg::Quit);
+                if apply && !self.quitting && !self.driver_installing && !self.core_installing {
+                    self.apply_pending=true;self.update_checking=true;
+                    self.update_status="Проверяем и сохраняем комплект для отката…".into();
+                    return Task::perform(async{updater::prepare()},Msg::UpdatePrepared);
                 }
+            }
+            Msg::UpdatePrepared(result) => {
+                self.apply_pending=false;self.update_checking=false;
+                match result {
+                    Ok(()) if !self.quitting && !self.driver_installing && !self.core_installing => {
+                        self.apply_after_quit=true;return self.update(Msg::Quit);
+                    }
+                    Err(error)=>{self.update_status=format!("Подготовка обновления: {error}");}
+                    _=>{}
+                }
+            }
+            Msg::UpdateApplied(result) => {
+                if let Err(error)=result {
+                    self.quitting=false;self.busy=false;self.apply_after_quit=false;
+                    self.engine.resume_after_failed_update();
+                    self.snapshot.state=0;self.headphone_state=0;self.headphone_busy=false;
+                    self.update_status=format!("Обновление не применено: {error}");self.message=self.update_status.clone();
+                    if let Some(intent)=self.update_resume.take(){self.resume_processing(intent);}
+                } else {return exit_ui();}
             }
             Msg::ApplyUpdate => {
                 // The download may be days old in a tray app: fetch the newest release first,
                 // so one click lands on the latest version instead of the next one.
-                if self.update_ready && !self.quitting && !self.update_checking {
+                if self.update_ready && !self.quitting && !self.update_checking && !self.driver_installing && !self.core_installing {
                     self.update_checking = true;
                     self.apply_pending = true;
                     self.update_status = "Проверяем последнюю версию…".into();
@@ -2093,8 +2201,15 @@ impl App {
                 self.focus = focus::headphones::PITCH;
             }
             Msg::Refresh => {
-                if !self.running() && !self.busy {
-                    self.auto_started = false;
+                if !self.quitting && !self.driver_installing && !self.core_installing {
+                    if self.busy || !matches!(self.snapshot.state, 2 | 3) {
+                        self.engine.cancel_start();
+                        self.busy = false;
+                        self.snapshot.state = 0;
+                        self.recovery = Recovery::default();
+                        self.message.clear();
+                        self.auto_started = false;
+                    }
                     self.engine.refresh();
                 }
                 self.focus = focus::settings::REFRESH;
@@ -2111,8 +2226,15 @@ impl App {
             }
             Msg::Autostart(enabled) => {
                 self.focus = focus::settings::AUTOSTART;
-                match set_tag_host_autostart(enabled) {
-                    Ok(()) => self.autostart = enabled,
+                if !self.autostart_busy {
+                    self.autostart_busy = true;
+                    return Task::perform(async move { if cfg!(test) { Ok(enabled) } else { engine::tag_autostart(i32::from(enabled)) } }, Msg::AutostartUpdated);
+                }
+            }
+            Msg::AutostartUpdated(result) => {
+                self.autostart_busy = false;
+                match result {
+                    Ok(enabled) => self.autostart = enabled,
                     Err(e) => self.message = format!("Автозапуск не изменён: {e}"),
                 }
             }
@@ -2261,13 +2383,8 @@ impl App {
                     if !components::driver_installed() {
                         // The driver prompt replaces the status line; keep the result in app.log.
                         self.log_message();
-                        self.driver_installing = true;
-                        self.message = DRIVER_INSTALL_MESSAGE.into();
-                        let root = self.runtime_root.clone();
-                        return Task::perform(
-                            async move { components::install_driver(&root) },
-                            Msg::DriverInstalled,
-                        );
+                        self.driver_ready=false;
+                        self.message="Установите виртуальный микрофон кнопкой в настройках; Windows запросит права администратора.".into();
                     }
                 }
             }
@@ -2282,6 +2399,32 @@ impl App {
                         Msg::DriverInstalled,
                     );
                 }
+            }
+            Msg::Repair => {
+                if !self.driver_installing && !self.core_installing && !self.quitting && !self.apply_pending {
+                    self.repair_confirm=true;self.repair_reinstall=false;self.repair_lines=false;self.focus=focus::settings::REPAIR_CONFIRM;
+                }
+            }
+            Msg::RepairReinstall(value) => {self.repair_reinstall=value;self.focus=focus::settings::REPAIR_REINSTALL;}
+            Msg::RepairLines(value) => {self.repair_lines=value;self.focus=focus::settings::REPAIR_LINES;}
+            Msg::RepairCancel => {self.repair_confirm=false;self.focus=focus::settings::REPAIR;}
+            Msg::RepairConfirm => {
+                if self.repair_confirm && !self.driver_installing && !self.quitting && !self.apply_pending {
+                    self.repair_resume=Some(self.processing_intent());
+                    self.repair_confirm=false;self.repair_started=false;self.driver_installing=true;self.busy=true;
+                    self.recovery=Recovery::default();self.message=DEVICE_REPAIRING.into();
+                    self.engine.quit();
+                }
+            }
+            Msg::Repaired(result) => {
+                let intent=self.repair_resume.take();self.driver_installing=false;self.repair_started=false;self.busy=false;
+                self.snapshot.state=0;self.headphone_state=0;self.headphone_busy=false;
+                self.driver_ready=cfg!(test)||components::driver_installed();
+                self.engine.resume_after_failed_update();
+                self.message=match result {Ok(())=>DEVICE_REPAIRED.into(),Err(error)=>format!("Восстановление: {error}")};
+                if self.quit_after_repair {self.quit_after_repair=false;return self.update(Msg::Quit);}
+                if let Some(intent)=intent {self.resume_processing(intent);}
+                self.engine.refresh();
             }
             Msg::LogsCopy => {
                 self.focus = focus::logs::COPY;
@@ -3055,7 +3198,7 @@ impl App {
             } else if self.details {
                 use focus::settings::*;
                 let mut items = if self.running() || self.busy {
-                    vec![APP_AUTOSTART, AUTOSTART, UPDATE, QUIT, DONE]
+                    vec![APP_AUTOSTART, AUTOSTART, REFRESH, UPDATE, QUIT, DONE]
                 } else {
                     vec![
                         INPUT, OUTPUT, VERSION, BUFFER, APP_AUTOSTART, AUTOSTART, REFRESH, UPDATE, QUIT, DONE,
@@ -3064,6 +3207,8 @@ impl App {
                 if !self.driver_ready {
                     items.insert(items.len() - 3, DRIVER);
                 }
+                items.insert(items.len()-3,REPAIR);
+                if self.repair_confirm {items.extend([REPAIR_LINES,REPAIR_REINSTALL,REPAIR_CONFIRM,REPAIR_CANCEL]);}
                 if self.update_ready {
                     items.insert(items.len() - 2, APPLY_UPDATE);
                 }
@@ -3162,6 +3307,7 @@ impl App {
                 }),
             ]);
         }
+        if key == Key::Named(Named::Escape) && self.repair_confirm {return self.update(Msg::RepairCancel);}
         if key == Key::Named(Named::Escape)
             && (self.details || self.rvc_page || self.soundpad_page || self.logs_page)
         {
@@ -3316,6 +3462,11 @@ impl App {
                 UPDATE if activate => Msg::UpdateCheck,
                 APPLY_UPDATE if activate => Msg::ApplyUpdate,
                 DRIVER if activate => Msg::InstallDriver,
+                REPAIR if activate => Msg::Repair,
+                REPAIR_REINSTALL if activate => Msg::RepairReinstall(!self.repair_reinstall),
+                REPAIR_LINES if activate => Msg::RepairLines(!self.repair_lines),
+                REPAIR_CONFIRM if activate => Msg::RepairConfirm,
+                REPAIR_CANCEL if activate => Msg::RepairCancel,
                 DONE if activate => Msg::Settings,
                 QUIT if activate => Msg::Quit,
                 AUTOSTART if activate => Msg::Autostart(!self.autostart),
@@ -3475,10 +3626,42 @@ impl App {
     }
 }
 fn main() {
-    velopack::VelopackApp::build().run();
+    // Host maintenance must run before every update; implicit startup apply bypasses it.
+    let args:Vec<_>=std::env::args_os().collect();
+    let upgrade=args.iter().position(|arg|arg=="--upgrade-legacy");
+    let upgrade_launcher=std::env::current_exe().ok().and_then(|p|p.file_stem().map(|s|s.to_string_lossy().eq_ignore_ascii_case("MicNoizeUpgrade"))).unwrap_or(false);
+    let legacy=if upgrade.is_some() || upgrade_launcher{Ok(())}else{maintenance::preserve_legacy()};
+    if legacy.is_ok() && upgrade.is_none() && !upgrade_launcher{velopack::VelopackApp::build().set_auto_apply_on_startup(false).run();}
     cpu_denoise::register();
     let root = paths::Paths::resolve().ok().map(|p| p.data);
     let mut result = (|| -> Result<(), String> {
+        legacy?;
+        if let Some(at)=upgrade {
+            if !args.iter().any(|arg|arg=="--repair-lines"){return Err("Переход требует явного разрешения на перенос старых виртуальных линий (--repair-lines)".into());}
+            let install=args.get(at+1).ok_or("Путь установленной программы не указан")?;
+            let package=args.get(at+2).ok_or("Полный пакет обновления не указан")?;
+            return maintenance::upgrade_legacy(Path::new(install),Path::new(package));
+        }
+        if upgrade_launcher {
+            let exe=std::env::current_exe().map_err(|e|e.to_string())?;
+            let directory=exe.parent().ok_or("Папка установщика не найдена")?;
+            let packages:Vec<_>=std::fs::read_dir(directory).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?
+                .into_iter().map(|entry|entry.path()).filter(|path|path.extension().is_some_and(|ext|ext=="nupkg")).collect();
+            if packages.len()!=1{return Err("Рядом с установщиком должен находиться один полный пакет обновления .nupkg".into());}
+            maintenance::package(&packages[0],env!("CARGO_PKG_VERSION"))?;
+            let install=std::env::var_os("LOCALAPPDATA").map(PathBuf::from).ok_or("LOCALAPPDATA не задан")?.join("MicNoize");
+            #[link(name="user32")]
+            unsafe extern "system" {fn MessageBoxW(window:isize,text:*const u16,title:*const u16,flags:u32)->i32;}
+            let text:Vec<u16>=format!("Закройте Mic Noize перед продолжением.\n\nУстановить обновление {} и восстановить виртуальное устройство? Перед заменой будет сохранён предыдущий комплект.\n\nСтарые виртуальные линии могут быть перенесены. После этого может потребоваться заново выбрать Mic Noize в Discord.\0",env!("CARGO_PKG_VERSION")).encode_utf16().collect();
+            let title:Vec<u16>="Восстановить устройство и обновить Mic Noize\0".encode_utf16().collect();
+            if unsafe{MessageBoxW(0,text.as_ptr(),title.as_ptr(),0x24)}!=6{return Ok(());}
+            return maintenance::upgrade_legacy(&install,&packages[0]);
+        }
+        if !maintenance::startup()? { return Ok(()); }
+        if args.iter().any(|arg|arg=="--ui-benchmark") && let Some(at)=args.iter().position(|arg|arg=="--check-update-package") {
+            let package=args.get(at+1).ok_or("Check package path missing")?;
+            return updater::check_local_package(std::path::Path::new(package));
+        }
         let Some((app, task)) = App::new()? else {
             return Ok(());
         };
@@ -3520,12 +3703,85 @@ fn main() {
             let _ = std::fs::write(root.join("Logs/rust-ui-error.log"), &e);
         }
         eprintln!("{e}");
+        // Startup recovery failures must remain visible even in the GUI subsystem build.
+        unsafe extern "system" {fn MessageBoxW(window:isize,text:*const u16,title:*const u16,flags:u32)->i32;}
+        let text:Vec<u16>=format!("Mic Noize не удалось запустить:\n\n{e}\0").encode_utf16().collect();
+        let title:Vec<u16>="Mic Noize\0".encode_utf16().collect();
+        unsafe{MessageBoxW(0,text.as_ptr(),title.as_ptr(),0x10);}
     }
 }
 
 #[cfg(test)]
 mod controller_tests {
     use super::*;
+    #[test]
+    fn repair_requires_confirmation_and_exit_prevents_resume() {
+        use keyboard::{Key,Modifiers,key::Named};
+        let (mut app,_) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.window=Some(App::open(1.0).0);app.details=true;app.snapshot.state=2;app.focus=focus::NONE;
+        let (mut refresh,mut repair)=(false,false);
+        for _ in 0..40 {let _=app.key(Key::Named(Named::Tab),Modifiers::empty(),false);refresh|=app.focus==focus::settings::REFRESH;repair|=app.focus==focus::settings::REPAIR;}
+        assert!(refresh && repair,"Running routes need keyboard access to both device actions");
+        let _=app.update(Msg::Repair);assert!(app.repair_confirm && !app.repair_reinstall && !app.repair_lines && !app.driver_installing);
+        app.focus=focus::settings::REPAIR_LINES;
+        let _=app.key(Key::Named(Named::Space),Modifiers::empty(),false);assert!(app.repair_lines);
+        let _=app.key(Key::Named(Named::Escape),Modifiers::empty(),false);assert!(!app.repair_confirm);
+        let _=app.update(Msg::Repair);assert!(!app.repair_lines);let _=app.update(Msg::RepairConfirm);
+        assert!(app.driver_installing && app.repair_resume.is_some());
+        let _=app.update(Msg::Quit);assert!(app.quit_after_repair && !app.quitting);
+        let _=app.update(Msg::Repaired(Err("UAC cancelled".into())));
+        assert!(app.quitting && app.repair_resume.is_none() && !app.driver_installing);
+    }
+    #[test]
+    fn failed_update_can_resume_the_control_worker() {
+        let (app,_) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.engine.quit();let deadline=Instant::now()+Duration::from_secs(3);
+        while !matches!(app.engine.reply(),Some(Reply::Quit)) {assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
+        app.engine.resume_after_failed_update();
+        app.engine.start(Config{input:String::new(),output:"TAG".into(),version:2,buffer:40,period:5,graphs:-1,intensity:1.0});
+        loop {if let Some(Reply::Started(_,result))=app.engine.reply(){assert!(result.is_err());break;}assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
+    }
+    #[test]
+    fn refresh_keeps_running_route_and_cancels_pending_start() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.snapshot.state = 2;
+        app.auto_started = true;
+        let _ = app.update(Msg::Refresh);
+        assert!(app.auto_started && app.running());
+        app.snapshot.state = 1;
+        app.busy = true;
+        let _ = app.update(Msg::Refresh);
+        assert!(!app.busy && !app.auto_started);
+        app.engine.quit();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut devices = 0;
+        loop {
+            match app.engine.reply() {
+                Some(Reply::Devices(_)) => devices += 1,
+                Some(Reply::Quit) => break,
+                _ => assert!(Instant::now() < deadline),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(devices, 1, "Repeated Refresh requests must coalesce");
+    }
+    #[test]
+    fn quit_cancels_queued_starts_and_discards_late_replies() {
+        let (app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let invalid = Config { input: String::new(), output: "TAG".into(), version: 2, buffer: 40, period: 5, graphs: -1, intensity: 1.0 };
+        for _ in 0..32 { app.engine.start(invalid.clone()); }
+        app.engine.quit();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match app.engine.reply() {
+                Some(Reply::Started(..)) => panic!("A cancelled start reached the controller"),
+                Some(Reply::Quit) => break,
+                _ => assert!(Instant::now() < deadline, "Quit did not finish"),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.engine.snapshot(false).0.state, 0);
+    }
     #[test]
     fn scrolling_advances_on_frames_and_cancels_on_navigation() {
         let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
@@ -3664,8 +3920,17 @@ mod controller_tests {
         app.hint_shown = true;
         let _ = app.update(Msg::Minimized(id));
         assert_eq!(app.window, Some(id), "the title-bar minimize stays in the taskbar");
+        let _ = app.update(Msg::Minimized(id));
+        assert_eq!(app.window, Some(id), "repeat resize cannot hide the title-bar minimize");
         let _ = app.update(Msg::WindowFocus(id, true));
         assert!(app.ui_active());
+        let _ = app.update(Msg::WindowFocus(id, false));
+        let _ = app.update(Msg::MinimizedState(id, Some(false)));
+        assert_eq!(app.window, Some(id), "losing focus alone does not hide the window");
+        let _ = app.update(Msg::MinimizedState(id, Some(true)));
+        assert_eq!(app.hidden_window, Some(id), "a missed resize still hides to tray");
+        let _ = app.update(Msg::Show);
+        let _ = app.update(Msg::WindowFocus(id, true));
         let _ = app.update(Msg::Minimized(id));
         assert_eq!(app.hidden_window, Some(id), "a taskbar-click minimize hides to tray");
         let _ = app.update(Msg::Show);
@@ -3719,6 +3984,8 @@ mod controller_tests {
         let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
         assert!(!app.apply_after_quit, "the stale download must not be applied before the re-check");
         let _ = app.update(Msg::UpdateChecked(updater::Status::Ready("0.2.4".into())));
+        assert!(!app.quitting && app.apply_pending,"preparation must finish before stopping audio");
+        let _ = app.update(Msg::UpdatePrepared(Ok(())));
         assert!(app.apply_after_quit, "Enter on the banner must apply the newest update");
     }
     #[test]
@@ -3727,7 +3994,19 @@ mod controller_tests {
         app.update_ready = true;
         let _ = app.update(Msg::ApplyUpdate);
         let _ = app.update(Msg::UpdateChecked(updater::Status::Unavailable("offline".into())));
+        assert!(!app.quitting && app.apply_pending);
+        let _ = app.update(Msg::UpdatePrepared(Ok(())));
         assert!(app.apply_after_quit);
+    }
+    #[test]
+    fn failed_update_preparation_keeps_processing_intent() {
+        let (mut app,_) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.snapshot.state=2;app.update_ready=true;
+        let _=app.update(Msg::ApplyUpdate);
+        let _=app.update(Msg::UpdateChecked(updater::Status::Ready("0.2.4".into())));
+        let _=app.update(Msg::UpdatePrepared(Err("invalid bundle".into())));
+        assert_eq!(app.snapshot.state,2);assert!(!app.quitting && !app.apply_pending && !app.apply_after_quit);
+        assert!(app.update_status.contains("invalid bundle"));
     }
     #[test]
     fn boost_monitor_is_independent_and_defaults_off() {
@@ -3860,6 +4139,9 @@ mod controller_tests {
             clip_label("Запись 2026-09-22 14-05-12.wav"),
             "14:05:12"
         );
+        assert!(clip_name().ends_with(" (mix).wav"));
+        assert_eq!(clip_label("Запись 2026-09-22 14-05-12 (mix).wav"), "14:05:12");
+        assert_eq!(clip_label("Запись 2026-09-22 14-05-12 (mix) (2).wav"), "14:05:12");
         assert_eq!(clip_label("airhorn.mp3"), "airhorn");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -4139,6 +4421,26 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         assert!(r.take_due(at(3602)));
         assert_eq!(r.observe(3, at(3603)), None);
         assert_eq!(r.observe(5, at(3604)), Some(Duration::from_secs(5)));
+    }
+    #[test]
+    fn device_wait_outlives_initial_retries_but_access_and_settings_errors_do_not() {
+        assert!(transient_device_failure("Capture buffer: HRESULT 0x88890004"));
+        assert!(transient_device_failure("Waiting for the TAG microphone endpoint in Windows"));
+        assert!(!transient_device_failure("TAG open driver: HRESULT 0x80070005"));
+        assert!(!transient_device_failure("Invalid audio settings"));
+        assert!(!transient_device_failure("TAG host protocol mismatch"));
+        let start = Instant::now();
+        let mut recovery = Recovery { wait_for_device: true, ..Recovery::default() };
+        for attempt in 0..20 {
+            let now = start + Duration::from_secs(attempt * 100);
+            let expected = RECOVERY_DELAYS.get(attempt as usize).copied().unwrap_or(60);
+            assert_eq!(recovery.observe(5, now), Some(Duration::from_secs(expected)));
+            assert!(recovery.take_due(now + Duration::from_secs(expected)));
+            assert!(!recovery.exhausted());
+        }
+        recovery.wait_for_device = false;
+        assert_eq!(recovery.observe(5, start + Duration::from_secs(3000)), None);
+        assert!(recovery.exhausted());
     }
 
     #[test]

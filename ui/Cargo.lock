@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "micnoize"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "base64 0.22.1",
  "deep_filter",
@@ -1659,6 +1659,7 @@ dependencies = [
  "uuid",
  "velopack",
  "winresource",
+ "zip",
 ]
 
 [[package]]

@@ -7,10 +7,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const FILES: [(&str, usize); 5] = [
+const FILES: [(&str, usize); 6] = [
     ("app.log", 40),
     ("sessions.log", 15),
     ("tag-host.log", 15),
+    ("tag-endpoint.log", 15),
     ("tag-headphones.log", 10),
     ("nvafx.log", 20),
 ];

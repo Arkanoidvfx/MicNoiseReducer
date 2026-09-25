@@ -208,7 +208,7 @@ mod tests {
         });
         let started = (0..200).find_map(|_| {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            match engine.reply() { Some(Reply::Started(r)) => Some(r), _ => None }
+            match engine.reply() { Some(Reply::Started(_, r)) => Some(r), _ => None }
         });
         assert!(matches!(started, Some(Ok(()))), "{started:?}");
         std::thread::sleep(std::time::Duration::from_secs(8));

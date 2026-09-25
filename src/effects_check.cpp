@@ -38,12 +38,21 @@ int main() {try {
         run(0.3f,2,2);run(0,0,2);
         require(replay.finished() && replay.count()==480,"Finished recording was not published");
         require(!replay.finished(),"Reading a finished recording must clear it");
+        std::vector<float> saved;replay.copyRecording(saved,0.08f);
+        require(saved.size()==480 && saved[100]==0.3f,"Microphone recording was attenuated");
         require(run(0.1f,0,3) && data[100]==0.3f && !discord,"Microphone effect replay failed");
         require(modified[100]==1,"Replay lost its monitor category");
         require(run(0,0,4) && data[100]==0.3f,"Replay overwrote the saved clip");
         discord=true;run(0.6f,64,4);run(0,0,4);discord=false;
+        replay.copyRecording(saved,0.08f);
+        require(saved.size()==480 && std::abs(saved[100]-0.6f*0.08f)<1e-6,"Discord recording lost its output gain");
         require(run(0.1f,0,5) && data[100]==0.6f && discord,"Latest Discord effect did not replace microphone clip");
         require(modified[100]==1,"Discord replay leaked into another category");
+        float replayOutput=data[100],replayOnly=0;uint8_t replaySource=1,replayCategory=modified[100];
+        mic::OutputEffects replayMix;
+        replayMix.process(&replayOutput,1,1,1,false,false,&replaySource,0.08f,&replayCategory,nullptr,&replayOnly);
+        const auto replayPreview=mic::previewQueued(replayOnly,replayCategory,1,0,false,1,1,true);
+        require(std::abs(mic::previewSample(replayPreview,1,1,true)-0.048f)<1e-6,"Discord hotkey replay missing from effects monitor");
         run(0.2f,2,5);run(0,0,5,false);
         require(!run(0,0,6),"Interrupted recording survived reset");
         run(0.2f,2,6);run(0.2f,2,6);run(0,0,6);
@@ -74,7 +83,8 @@ int main() {try {
         player.render(sound.data(),480,1);require(sound[0]==0 && player.playing()==0,"Idle player produced audio");
         require(request(3,1,false)==3,"First press must look up the clip");
         require(request(3,1,false)==0,"Repeated serial must be ignored");
-        player.render(sound.data(),480,1.0f);require(sound[100]==0.5f && player.playing()==3 && player.length()==0.1f,"Clip did not play");
+        std::array<uint8_t,480> soundFlags{};
+        player.render(sound.data(),480,1.0f,false,soundFlags.data());require(sound[100]==0.5f && soundFlags[100]==0 && player.playing()==3 && player.length()==0.1f,"Clip did not play");
         player.render(sound.data(),480,0.5f);require(std::abs(sound[100]-0.25f)<1e-6,"Volume ignored");
         require(request(3,2,true)==3,"Quick double press must restart");
         player.render(sound.data(),480,1);
@@ -86,18 +96,34 @@ int main() {try {
         mic::OutputEffects output;std::array<uint8_t,480> sources{};sources.fill(1);std::array<float,480> only{},mixed{};mixed.fill(0.25f);
         for(int i=0;i<2;++i){data.fill(0.5f);output.process(data.data(),480,1,1,false,false,sources.data(),0.08f,nullptr,nullptr,only.data(),mixed.data());}
         require(std::abs(data[479]-0.29f)<1e-6 && std::abs(only[479]-0.04f)<1e-6,"Soundpad must bypass Discord gain and stay out of the effect preview");
+        mic::SoundPlayer recordingPlayer;auto recording=std::make_shared<mic::SoundClip>();
+        recording->samples.assign(960,0.08f);
+        const auto recordingRequest=mic::SoundPlayer::pack(mic::recordingClipIdBase,1,false);
+        require(recordingPlayer.request(recordingRequest)==mic::recordingClipIdBase,"Recording request lost");
+        recordingPlayer.commit(recordingRequest);recordingPlayer.start(mic::recordingClipIdBase,recording);
+        std::array<uint8_t,480> recordingFlags{};
+        recordingPlayer.render(sound.data(),480,0.04f,false,recordingFlags.data());
+        require(sound[100]==0.08f,"Recording was reduced by soundpad volume");
+        require(recordingFlags[100]==1,"Recording identity was lost during playback");
+        const auto recordingPreview=mic::previewQueued(0,0,7,sound[100],recordingFlags[100],1,7,true);
+        require(std::abs(mic::previewSample(recordingPreview,1,7,true)-0.08f)<1e-6,"Recent recording missing from effects monitor");
+        require(std::abs(mic::previewSample(mic::previewQueued(0,0,7,sound[100],true,4,7,true),4,7,true)-0.08f)<1e-6,"Recent recording missing from sound monitor");
+        require(std::abs(mic::previewSample(mic::previewQueued(0,0,7,sound[100],true,5,7,true),5,7,true)-0.08f)<1e-6,"Recent recording doubled with both monitor boxes");
+        recordingPlayer.render(sound.data(),480,0.04f,true,recordingFlags.data());
+        require(sound[100]==0,"Muted recording was audible");
+        require(mic::previewSample(mic::previewQueued(0,0,7,sound[100],recordingFlags[100],1,7,false),1,7,true)==0,"Muted recording leaked into effects monitor");
         mic::RoutedSample routed{0.1f,0,0,7,0,0.3f};
         require(mic::previewSample(routed,mic::ModifiedSound,7,true)==0,"ModifiedSound is a monitor mask bit, never a sample category");
         // Producer + consumer of the effects-only monitor: "hear sounds" must survive the second filter.
         for(uint8_t mask:{4,5,6,7}){
-            const auto queued=mic::previewQueued(0.1f,0,7,0.3f,mask,7,true);
+            const auto queued=mic::previewQueued(0.1f,0,7,0.3f,false,mask,7,true);
             require(mic::previewSample(queued,mask,7,true)==0.3f,"Clip sample dropped by the monitor consumer");
             require(mic::previewSample(queued,static_cast<uint8_t>(mask&3),7,true)==0,"Clip audible without the sound mask");
         }
-        const auto effect=mic::previewQueued(0.1f,1,7,0.3f,5,7,true);
+        const auto effect=mic::previewQueued(0.1f,1,7,0.3f,false,5,7,true);
         require(std::abs(mic::previewSample(effect,5,7,true)-0.4f)<1e-6,"Effect + clip preview mix");
-        require(mic::previewSample(mic::previewQueued(0.1f,0,7,0.3f,4,7,false),4,7,true)==0,"Muted clip leaked into preview");
-        require(mic::previewSample(mic::previewQueued(0.1f,0,7,0.3f,1,7,true),1,7,true)==0,"Clip leaked into effects-only preview");
+        require(mic::previewSample(mic::previewQueued(0.1f,0,7,0.3f,false,4,7,false),4,7,true)==0,"Muted clip leaked into preview");
+        require(mic::previewSample(mic::previewQueued(0.1f,0,7,0.3f,false,1,7,true),1,7,true)==0,"Clip leaked into effects-only preview");
         std::cout<<"soundpad=passed double_press_restart=passed fade_samples=240\n";
     }
     for(unsigned i=0;i<480;++i) original[i]=std::sin(i*0.17f)*0.9f;

@@ -20,6 +20,7 @@
 #include <future>
 #include <xmmintrin.h>
 #include "tag_link.hpp"
+#include "tag_endpoint.hpp"
 #include "tag.hpp"
 #include "effects.hpp"
 
@@ -223,10 +224,10 @@ std::filesystem::path projectRoot() {
     }
     return project;
 }
-std::vector<Device> devices(bool capture) {
+std::vector<Device> devices(bool capture,DWORD states) {
     Com com; ComPtr<IMMDeviceEnumerator> e; ComPtr<IMMDeviceCollection> list;
     check(CoCreateInstance(__uuidof(MMDeviceEnumerator),nullptr,CLSCTX_ALL,IID_PPV_ARGS(&e)),"Enumerate audio devices");
-    check(e->EnumAudioEndpoints(capture ? eCapture:eRender, DEVICE_STATE_ACTIVE,&list),"Audio endpoints");
+    check(e->EnumAudioEndpoints(capture ? eCapture:eRender,states,&list),"Audio endpoints");
     UINT count=0; check(list->GetCount(&count),"Endpoint count");
     std::vector<Device> out;
     for(UINT i=0;i<count;++i) {
@@ -242,7 +243,7 @@ std::vector<Device> devices(bool capture) {
     }
     // The default communications microphone goes first: a fresh install on another PC must be
     // able to select some microphone, not only a HyperX.
-    if(capture) {
+    if(capture && states==DEVICE_STATE_ACTIVE) {
         ComPtr<IMMDevice> preferred; LPWSTR id=nullptr;
         if(SUCCEEDED(e->GetDefaultAudioEndpoint(eCapture,eCommunications,&preferred))
            && SUCCEEDED(preferred->GetId(&id))) {
@@ -254,32 +255,46 @@ std::vector<Device> devices(bool capture) {
     return out;
 }
 
-static ComPtr<IAudioEndpointVolume> tagEndpointLevel() {
-    for(const auto& device:devices(true)) {
-        if(device.name.find(L"Mic Noize")==std::wstring::npos || device.name.find(L"Thin Audio Gateway")==std::wstring::npos) continue;
-        ComPtr<IMMDeviceEnumerator> enumerator; ComPtr<IMMDevice> endpoint; ComPtr<IAudioEndpointVolume> level;
-        check(CoCreateInstance(__uuidof(MMDeviceEnumerator),nullptr,CLSCTX_ALL,IID_PPV_ARGS(&enumerator)),"TAG level enumerator");
-        check(enumerator->GetDevice(device.id.c_str(),&endpoint),"TAG level endpoint");
-        check(endpoint->Activate(__uuidof(IAudioEndpointVolume),CLSCTX_ALL,nullptr,reinterpret_cast<void**>(level.GetAddressOf())),"TAG level control");
-        return level;
-    }
-    throw std::runtime_error("Mic Noize TAG microphone endpoint not found");
+Device tagMicrophone() {
+    TagEndpointStatus status;
+    if(!readTagEndpointStatus(status))throw std::runtime_error("Обновите фоновый хост Mic Noize: отсутствует статус устройства");
+    if(!status.ready)throw std::runtime_error(status.error[0]?status.error:"TAG endpoint controller unavailable");
+    for(const auto& device:devices(true))if(device.id==status.endpoint)return device;
+    throw std::runtime_error("Bound Mic Noize TAG microphone endpoint is not active");
 }
 
-static float holdTagEndpointLevel(IAudioEndpointVolume* level,bool unmute=true) {
+static ComPtr<IAudioEndpointVolume> tagEndpointLevel() {
+    const auto device=tagMicrophone();
+    ComPtr<IMMDeviceEnumerator> enumerator; ComPtr<IMMDevice> endpoint; ComPtr<IAudioEndpointVolume> level;
+    check(CoCreateInstance(__uuidof(MMDeviceEnumerator),nullptr,CLSCTX_ALL,IID_PPV_ARGS(&enumerator)),"TAG level enumerator");
+    check(enumerator->GetDevice(device.id.c_str(),&endpoint),"TAG level endpoint");
+    check(endpoint->Activate(__uuidof(IAudioEndpointVolume),CLSCTX_ALL,nullptr,reinterpret_cast<void**>(level.GetAddressOf())),"TAG level control");
+    return level;
+}
+
+float holdTagEndpointLevel(IAudioEndpointVolume* level,bool unmute,const GUID* context) {
     float minimum=0,maximum=0,step=0;
     check(level->GetVolumeRange(&minimum,&maximum,&step),"TAG level range");
-    if(!std::isfinite(maximum) || minimum>0 || maximum<0) throw std::runtime_error("TAG level range excludes 0 dB");
+    if(!std::isfinite(minimum) || !std::isfinite(maximum) || !std::isfinite(step) || minimum>0 || maximum<0 || maximum>120 || step<=0)
+        throw std::runtime_error("Invalid TAG level range");
     UINT channels=0; check(level->GetChannelCount(&channels),"TAG level channels");
     if(!channels || channels>32) throw std::runtime_error("Invalid TAG level channel count");
     for(UINT channel=0;channel<channels;++channel) {
         float current=0;check(level->GetChannelVolumeLevel(channel,&current),"TAG channel level");
-        if(std::abs(current-maximum)>0.1f) check(level->SetChannelVolumeLevel(channel,maximum,nullptr),"TAG lock channel level");
+        if(!std::isfinite(current) || std::abs(current-maximum)>0.1f) check(level->SetChannelVolumeLevel(channel,maximum,context),"TAG lock channel level");
     }
     float current=0;check(level->GetMasterVolumeLevel(&current),"TAG current level");
-    if(std::abs(current-maximum)>0.1f) check(level->SetMasterVolumeLevel(maximum,nullptr),"TAG lock master level");
+    if(!std::isfinite(current) || std::abs(current-maximum)>0.1f) check(level->SetMasterVolumeLevel(maximum,context),"TAG lock master level");
     BOOL mute=FALSE;check(level->GetMute(&mute),"TAG current mute");
-    if(mute && unmute) check(level->SetMute(FALSE,nullptr),"TAG unmute virtual microphone");
+    if(mute && unmute) check(level->SetMute(FALSE,context),"TAG unmute virtual microphone");
+    float scalar=0;check(level->GetMasterVolumeLevelScalar(&scalar),"TAG verify master level");
+    if(!std::isfinite(scalar) || scalar<0.9999f)throw std::runtime_error("TAG master level did not reach 100%");
+    for(UINT channel=0;channel<channels;++channel) {
+        check(level->GetChannelVolumeLevelScalar(channel,&scalar),"TAG verify channel level");
+        if(!std::isfinite(scalar) || scalar<0.9999f)throw std::runtime_error("TAG channel level did not reach 100%");
+    }
+    check(level->GetMute(&mute),"TAG verify mute");
+    if(unmute && mute)throw std::runtime_error("TAG endpoint remained muted");
     return std::pow(10.0f,-maximum/20.0f);
 }
 
@@ -329,12 +344,26 @@ void checkTagLevelWatch() {
     try {
         check(level->SetMute(TRUE,nullptr),"TAG watch test mute");
         check(level->SetMasterVolumeLevel(0,nullptr),"TAG watch test level");
-        Sleep(250);
         float current=0;BOOL mute=TRUE;
-        check(level->GetMasterVolumeLevel(&current),"TAG watch test current level");
-        check(level->GetMute(&mute),"TAG watch test current mute");
+        for(unsigned attempt=0;attempt<20;++attempt) {
+            Sleep(50);
+            check(level->GetMasterVolumeLevel(&current),"TAG watch test current level");
+            check(level->GetMute(&mute),"TAG watch test current mute");
+            if(std::abs(current-maximum)<=0.1f && !mute)break;
+        }
         if(std::abs(current-maximum)>0.1f || mute) throw std::runtime_error("TAG level guard did not restore 100% and unmute");
-        std::cout<<"PASS: TAG guard restored "<<current<<" dB and unmuted after external change\n";
+        UINT channels=0;check(level->GetChannelCount(&channels),"TAG watch channel count");
+        if(!channels || channels>32)throw std::runtime_error("Invalid TAG watch channel count");
+        for(UINT channel=0;channel<channels;++channel) {
+            check(level->SetChannelVolumeLevelScalar(channel,0.25f,nullptr),"TAG watch change channel");
+            float scalar=0;
+            for(unsigned attempt=0;attempt<20;++attempt) {
+                Sleep(50);check(level->GetChannelVolumeLevelScalar(channel,&scalar),"TAG watch verify channel");
+                if(std::isfinite(scalar) && scalar>=0.9999f)break;
+            }
+            if(!std::isfinite(scalar) || scalar<0.9999f)throw std::runtime_error("TAG guard did not restore channel to 100%");
+        }
+        std::cout<<"PASS: TAG guard restored master, "<<channels<<" channels and unmuted after external changes\n";
     } catch(...) {level->SetMute(FALSE,nullptr);throw;}
 }
 
@@ -674,7 +703,7 @@ void Monitor::start(const std::wstring& route,uint8_t effectsMask) {
             for(unsigned lost=0;;) try {
             std::wstring inputId;
             if(route==L"TAG") {
-                for(const auto& d:devices(true)) if(d.name.find(L"Thin Audio Gateway")!=std::wstring::npos) inputId=d.id;
+                inputId=tagMicrophone().id;
             }
             if(inputId.empty() && (!effectsOnly || route==L"TAG")) throw std::runtime_error("Прослушивание доступно для TAG. Проверьте подключение виртуального микрофона.");
             ComPtr<IMMDeviceEnumerator> enumerator;ComPtr<IMMDevice> device;LPWSTR rawId=nullptr;
@@ -685,8 +714,8 @@ void Monitor::start(const std::wstring& route,uint8_t effectsMask) {
             std::wstring outputName;
             for(const auto& d:devices(false)) if(d.id==outputId)outputName=d.name;
             auto lower=outputName;std::transform(lower.begin(),lower.end(),lower.begin(),[](wchar_t ch){return static_cast<wchar_t>(towlower(ch));});
-            if(outputId==route || lower.find(L"cable")!=std::wstring::npos || lower.find(L"voicemeeter")!=std::wstring::npos ||
-               lower.find(L"thin audio")!=std::wstring::npos || lower.find(L"nvidia broadcast")!=std::wstring::npos)
+            if(outputId==route || tagDriverEndpoint(outputId) || lower.find(L"cable")!=std::wstring::npos || lower.find(L"voicemeeter")!=std::wstring::npos ||
+               lower.find(L"nvidia broadcast")!=std::wstring::npos)
                 throw std::runtime_error("Для прослушивания выберите наушники выходом Windows, а не виртуальный кабель.");
             Event captureEvent,renderEvent;Stream input,output;
             // TAG needs a capture client to keep its output clock active, even for effects-only preview.
@@ -788,7 +817,8 @@ void Engine::fail(const std::exception& error) {
     stats.inputPeak=0;stats.outputPeak=0;SetEvent(stop_);
 }
 void Engine::reportError(const std::string& message) {status(wide(message)); state=5;releaseEffects();}
-void Engine::start(const Config& c) {
+void Engine::start(const Config& c,uint64_t expectedOperation) {
+    if(expectedOperation && operation!=expectedOperation)throw std::runtime_error("Audio operation cancelled");
     stop();
     if(c.input.empty() || c.output.empty() || (c.version!=1 && c.version!=2) || !std::isfinite(c.intensity) || c.intensity<0 || c.intensity>2 || c.bufferMs<10 || c.bufferMs>80 || c.periodMs<2 || c.periodMs>20 || c.cudaGraphs < -1 || c.cudaGraphs>1)
         throw std::runtime_error("Invalid audio settings");
@@ -800,13 +830,14 @@ void Engine::start(const Config& c) {
             throw std::runtime_error("Cannot route CABLE Output back to CABLE Input");
     }
     if(c.tag) {
-        for(const auto& device:devices(true)) if(device.id==c.input && device.name.find(L"Thin Audio Gateway")!=std::wstring::npos)
-            throw std::runtime_error("Select the physical microphone, not TAG's own output");
         HANDLE owner=CreateMutexW(nullptr,FALSE,L"Local\\MicNoize.TAG");
         if(!owner) throw std::runtime_error("Cannot create TAG ownership mutex");
         if(GetLastError()==ERROR_ALREADY_EXISTS) {CloseHandle(owner);throw std::runtime_error("TAG is already running in another Mic Noize instance");}
         tagOwner_=owner;
-        try {ensureTagHost();} catch(...) {CloseHandle(tagOwner_);tagOwner_=nullptr;throw;}
+        try {
+            ensureTagHost();
+            if(c.input==tagMicrophone().id)throw std::runtime_error("Select the physical microphone, not TAG's own output");
+        } catch(...) {CloseHandle(tagOwner_);tagOwner_=nullptr;throw;}
     }
     captured_.reset(); cleaned_.reset(); desktop_.reset();resetEffect_=false;
     config_=c;
@@ -823,16 +854,24 @@ void Engine::start(const Config& c) {
     stats.rvcState=rvcEnabled?1:0;stats.rvcLatencyMs=0;stats.denoiser=0;
     intensity=c.intensity; releaseEffects(); running_=true; state=1; status(L"Loading NVIDIA model...");
     try {
+        if(expectedOperation && operation!=expectedOperation)throw std::runtime_error("Audio operation cancelled");
         if(c.tag) {
             std::promise<float> ready;auto result=ready.get_future();
             tagLevelThread_=std::thread([this,ready=std::move(ready)]() mutable {
                 bool initialized=false;
                 try {
-                    Com com;
-                    auto level=tagEndpointLevel();
-                    const float compensation=holdTagEndpointLevel(level.Get());
-                    ready.set_value(compensation);initialized=true;
-                    while(WaitForSingleObject(stop_,50)==WAIT_TIMEOUT) tagLevelCompensation_=holdTagEndpointLevel(level.Get());
+                    TagEndpointStatus endpoint;
+                    auto read=[&] {
+                        if(!readTagEndpointStatus(endpoint) || !endpoint.ready || !std::isfinite(endpoint.compensation) || endpoint.compensation<=0 || endpoint.compensation>1)
+                            throw std::runtime_error(endpoint.error[0]?endpoint.error:"TAG endpoint controller unavailable");
+                    };
+                    read();const std::wstring identity=endpoint.endpoint;
+                    ready.set_value(endpoint.compensation);initialized=true;
+                    while(WaitForSingleObject(stop_,100)==WAIT_TIMEOUT) {
+                        read();
+                        if(identity!=endpoint.endpoint)throw std::runtime_error("TAG endpoint changed; reconnect processing");
+                        tagLevelCompensation_=endpoint.compensation;
+                    }
                 } catch(const std::exception& error) {
                     if(initialized) fail(error);
                     else ready.set_exception(std::current_exception());
@@ -844,6 +883,7 @@ void Engine::start(const Config& c) {
         dsp_=std::thread([this,c]{dspLoop(c);});
         io_=std::thread([this,c]{ioLoop(c);});
         desktopThread_=std::thread([this]{desktopLoop();});
+        if(expectedOperation && operation!=expectedOperation)throw std::runtime_error("Audio operation cancelled");
     } catch(...) { stop(); throw; }
 }
 void Engine::stop() {
@@ -924,7 +964,7 @@ void Engine::dspLoop(Config c) {
         {std::lock_guard lock(clipMutex_);clip_.clear();clip_.reserve(48000*20);} // publishing never allocates
         std::array<float,block> sound{};
         std::array<RoutedSample,block> routed{};
-        std::array<uint8_t,block> modified{};
+        std::array<uint8_t,block> modified{},recording{};
         std::array<float,block+1> discord{};SourceRouting routing;Drift discordDrift;
         bool discordPrimed=false,wasDiscord=false;Ramp sourceFade{1};
         float applied=c.intensity;
@@ -1010,7 +1050,7 @@ void Engine::dspLoop(Config c) {
                 if(lastEffect.capturing())clipPending=false;
                 if(clipPending && lastEffect.count()){
                     if(std::unique_lock lock(clipMutex_,std::try_to_lock);lock.owns_lock()){
-                        clip_.assign(lastEffect.audio(),lastEffect.audio()+lastEffect.count());
+                        lastEffect.copyRecording(clip_,discordVolume.load());
                         ++clipGeneration;clipPending=false;
                     }
                 }
@@ -1023,9 +1063,9 @@ void Engine::dspLoop(Config c) {
                         }
                     }
                 }
-                sounds.render(sound.data(),block,muted?0.0f:soundVolume.load());
+                sounds.render(sound.data(),block,soundVolume.load(),muted,recording.data());
                 soundPlaying=sounds.playing();soundPosition=sounds.position();soundLength=sounds.length();
-                for(unsigned i=0;i<block;++i)routed[i]={out[i],static_cast<uint8_t>(fromDiscord),modified[i],epoch,(fromDiscord || replay)?microphone[i]:0,sound[i]};
+                for(unsigned i=0;i<block;++i)routed[i]={out[i],static_cast<uint8_t>(fromDiscord),modified[i],epoch,(fromDiscord || replay)?microphone[i]:0,sound[i],recording[i]};
                 if(!cleaned_.push(routed.data(),block)) ++stats.drops;
                 ++stats.processed;
                 stats.inputQueue=static_cast<unsigned>(captured_.size());
@@ -1043,7 +1083,7 @@ void Engine::preview(const float* audio,const RoutedSample* routed,const uint8_t
         const auto n=std::min(block,count-offset);
         for(unsigned i=0;i<n;++i){
             const auto at=offset+i;
-            samples[i]=previewQueued(audio[at],modified[at],routed[at].epoch,routed[at].sound,mask,epoch,audible);
+            samples[i]=previewQueued(audio[at],modified[at],routed[at].epoch,routed[at].sound,routed[at].recording,mask,epoch,audible);
         }
         // Preview must never block or trim from the producer side.
         if(!preview_.push(samples.data(),n))break;
@@ -1129,7 +1169,7 @@ void Engine::tagLoop(Config c) {
         const auto now=std::chrono::steady_clock::now();
         if(now-lastCapture>std::chrono::seconds(2)) throw std::runtime_error("Microphone stopped delivering audio");
         const bool running=tag.running();
-        if(running!=wasRunning) {releaseEffects(); state=running?3:2;}
+        if(running!=wasRunning) {releaseEffects();cleaned_.trim(0);state=running?3:2;}
         stats.outputActive=running;
         if(!running || !wasRunning) {
             stats.outputPeak=0;
@@ -1171,7 +1211,7 @@ void Engine::tagLoop(Config c) {
                     // The host dropped us during a stall and filled it with silence: discard the
                     // clock debt and re-prime exactly as on a client transition.
                     ++stats.tagReconnects;
-                    cleaned_.trim(target); primed=false; fade=0; clock={}; drift={}; correction=0;
+                    releaseEffects();cleaned_.trim(0);primed=false;fade=0;clock={};drift={};correction=0;
                     lastAdjustment=now;
                 }
             }
@@ -1316,9 +1356,10 @@ void Headphones::start(const std::wstring& output,bool denoise) {
     auto list=devices(false);
     auto found=std::find_if(list.begin(),list.end(),[&](const Device& d){return d.id==output;});
     if(found==list.end())throw std::runtime_error("Выберите подключённые физические наушники.");
+    if(tagDriverEndpoint(output))throw std::runtime_error("Выберите физические наушники: вывод обратно в TAG создаёт петлю звука.");
     auto name=found->name;
     std::transform(name.begin(),name.end(),name.begin(),[](wchar_t c){return static_cast<wchar_t>(towlower(c));});
-    for(auto forbidden:{L"thin audio",L"mic noize",L"cable",L"voicemeeter",L"broadcast"})
+    for(auto forbidden:{L"cable",L"voicemeeter",L"broadcast"})
         if(name.find(forbidden)!=std::wstring::npos)throw std::runtime_error("Выберите физические наушники, не виртуальное устройство.");
     owner_=CreateMutexW(nullptr,FALSE,L"Local\\MicNoize.HeadphoneOwner");
     if(!owner_)throw std::runtime_error("Headphone ownership lock failed");
@@ -1448,10 +1489,15 @@ void checkHeadphones(const std::wstring& output,bool denoise) {
     if(h.state!=2)throw std::runtime_error("Headphone start: "+utf8(h.message()));
     std::wstring endpoint;
     for(unsigned i=0;i<100 && endpoint.empty();++i){
-        for(const auto& d:devices(false))if(d.name.find(L"Thin Audio Gateway")!=std::wstring::npos)endpoint=d.id;
+            for(const auto& d:devices(false))if(tagDriverEndpoint(d.id,L"MicNoize Headphones.Render.Topology")) {
+            if(!endpoint.empty())throw std::runtime_error("Ambiguous TAG headphone endpoint");endpoint=d.id;
+        }
         if(endpoint.empty())Sleep(50);
     }
     if(endpoint.empty())throw std::runtime_error("TAG headphones did not appear");
+    bool feedbackRejected=false;
+    try{Headphones feedback;feedback.start(endpoint,false);}catch(const std::exception& error){feedbackRejected=std::string(error.what()).find("TAG")!=std::string::npos;}
+    if(!feedbackRejected)throw std::runtime_error("TAG headphone feedback route was not rejected by driver identity");
     Event event;Stream source;source.open(endpoint,false,event.h,5);
     if(source.channels!=2)throw std::runtime_error("TAG headphones not stereo");
     ComPtr<IAudioRenderClient> render;check(source.client->GetService(IID_PPV_ARGS(&render)),"Test render");
@@ -1470,6 +1516,6 @@ void checkHeadphones(const std::wstring& output,bool denoise) {
     const unsigned blocks=h.processed;const unsigned dropped=h.drops;
     h.stop();if(h.state!=0 || blocks<100)throw std::runtime_error("Headphone pipeline did not process enough blocks");
     const unsigned stopped=h.processed;Sleep(100);if(h.processed!=stopped)throw std::runtime_error("Headphone DSP still running after stop");
-    std::cout<<"HEADPHONES CHECK PASSED: stereo synthetic input, physical output muted; denoise="<<denoise<<", blocks="<<blocks<<", drops="<<dropped<<"; stopped\n";
+    std::cout<<"HEADPHONES CHECK PASSED: stereo synthetic input, physical output muted, TAG feedback rejected by identity; denoise="<<denoise<<", blocks="<<blocks<<", drops="<<dropped<<"; stopped\n";
 }
 }

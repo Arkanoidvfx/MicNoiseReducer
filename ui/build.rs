@@ -16,7 +16,7 @@ fn main() {
     println!("cargo:rustc-link-lib=static=mic_engine");
     println!("cargo:rustc-link-lib=static=rubberband");
     for lib in [
-        "ole32", "uuid", "avrt", "user32", "shell32", "wtsapi32", "gdi32", "mmdevapi",
+        "ole32", "oleaut32", "taskschd", "advapi32", "uuid", "avrt", "user32", "shell32", "wtsapi32", "gdi32", "mmdevapi", "setupapi",
     ] {
         println!("cargo:rustc-link-lib={lib}");
     }

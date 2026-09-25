@@ -2,6 +2,7 @@ vendor/
 build/
 results/
 .tmp/
+.update/
 bin/
 settings.ini
 .cache/

@@ -1,0 +1,5 @@
+#include "tag_version.h"
+101 10
+BEGIN
+    MNR_TAG_PROTOCOL, MNR_TAG_BUILD
+END
