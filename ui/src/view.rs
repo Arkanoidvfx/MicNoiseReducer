@@ -758,13 +758,14 @@ impl App {
 
         let before = self.in_peak;
         let after = self.peak;
-        let level = |p: f32| ((db(p) + 60.0) / 60.0).clamp(0.0, 1.0);
+        // From −90 dB: a quiet microphone's own hiss (about −70…−80 dB) already shows.
+        let level = |p: f32| ((db(p) + 90.0) / 90.0).clamp(0.0, 1.0);
         let meters = card(
             column![
-                row![label("До", 12, DIM).width(56), meter(level(before), Color::from_rgb8(0x6B, 0x6C, 0x73)), container(numbers(db_text(before), 12, DIM)).align_right(64)]
+                row![label("До", 12, DIM).width(56), tacho::level_meter(level(before), true, Color::from_rgb8(0x8A, 0x8B, 0x92)), container(numbers(db_text(before), 12, DIM)).align_right(64)]
                     .spacing(12)
                     .align_y(iced::Center),
-                row![label("После", 12, INK).width(56), meter(level(after), if level(after) > 0.9 { ORANGE } else { GREEN }), container(numbers(db_text(after), 12, INK)).align_right(64)]
+                row![label("После", 12, INK).width(56), tacho::level_meter(level(after), false, if level(after) > 0.93 { ORANGE } else { GREEN }), container(numbers(db_text(after), 12, INK)).align_right(64)]
                     .spacing(12)
                     .align_y(iced::Center),
             ]

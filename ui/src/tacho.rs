@@ -1033,6 +1033,127 @@ impl<Message> Widget<Message, Theme, Renderer> for Keycap {
     }
 }
 
+/// The До / После level bars. The raw microphone is drawn as ragged, flickering bars with
+/// static over the empty part; the denoised output as crisp slanted segments in the sliders'
+/// style, with a glowing head and a peak mark that holds, then sinks. `level` is 0..1.
+pub fn level_meter<'a, Message: 'a>(level: f32, noisy: bool, color: Color) -> Element<'a, Message> {
+    Element::new(LevelMeter { level: level.clamp(0.0, 1.0), noisy, color })
+}
+struct LevelMeter {
+    level: f32,
+    noisy: bool,
+    color: Color,
+}
+const METER_H: f32 = 14.0;
+const CLEAN_SEGMENTS: usize = 40;
+const PEAK_HOLD: Duration = Duration::from_millis(900);
+#[derive(Default)]
+struct MeterState {
+    peak: f32,
+    peak_at: Option<Instant>,
+    frame: Option<Instant>,
+    painted: Painted,
+}
+/// Stable pseudo-random 0..1 for bar `i` in flicker frame `t`.
+fn grain(i: u32, t: u32) -> f32 {
+    let mut x = i.wrapping_mul(0x9E37_79B1) ^ t.wrapping_mul(0x85EB_CA77);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x2C1B_3C6D);
+    x ^= x >> 12;
+    (x & 0xFFFF) as f32 / 65535.0
+}
+impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<MeterState>() }
+    fn state(&self) -> tree::State { tree::State::new(MeterState::default()) }
+    fn update(&mut self, tree: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        let Event::Window(window::Event::RedrawRequested(now)) = event else { return };
+        if self.noisy {
+            return;
+        }
+        let m = tree.state.downcast_mut::<MeterState>();
+        let dt = m.frame.map_or(0.0, |f| now.saturating_duration_since(f).as_secs_f32());
+        m.frame = Some(*now);
+        if self.level >= m.peak {
+            m.peak = self.level;
+            m.peak_at = Some(*now);
+        } else if m.peak_at.is_none_or(|at| now.saturating_duration_since(at) >= PEAK_HOLD) {
+            m.peak = (m.peak - dt * 0.6).max(self.level);
+        }
+        if m.peak > self.level {
+            let wake = m.peak_at.map_or(*now, |at| at + PEAK_HOLD);
+            shell.request_redraw_at(if wake > *now { RedrawRequest::At(wake) } else { RedrawRequest::NextFrame });
+        }
+    }
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fill, height: Length::Fixed(METER_H) }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fill, Length::Fixed(METER_H))
+    }
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let b = layout.bounds();
+        let track = Color::from_rgb8(0x26, 0x27, 0x2B);
+        if !self.noisy {
+            let m = tree.state.downcast_ref::<MeterState>();
+            let n = CLEAN_SEGMENTS;
+            let (gap, h) = (3.0, METER_H - 2.0);
+            let w = (b.width - 8.0 - gap * (n - 1) as f32) / n as f32;
+            let lit = (self.level * n as f32).round() as usize;
+            let peak = ((m.peak.max(self.level) * n as f32).round() as usize).min(n);
+            let dim = Color { r: self.color.r * 0.38, g: self.color.g * 0.38, b: self.color.b * 0.38, a: 1.0 };
+            let mut shapes = Vec::with_capacity(n * 2 + 8);
+            for i in 0..n {
+                let x = b.x + 4.0 + i as f32 * (w + gap);
+                let y = b.y + 1.0;
+                if i < lit {
+                    // A calm gradient from deep to full colour; the newest segment glows.
+                    let t = i as f32 / n as f32;
+                    let c = Color { r: dim.r + (self.color.r - dim.r) * t, g: dim.g + (self.color.g - dim.g) * t, b: dim.b + (self.color.b - dim.b) * t, a: 1.0 };
+                    if i + 1 == lit {
+                        halo(&mut shapes, x, y, w, h, 6.0, Color { a: 0.55, ..self.color });
+                        segment(&mut shapes, x, y, w, h, brighten(self.color, 0.9));
+                    } else {
+                        segment(&mut shapes, x, y, w, h, c);
+                    }
+                } else if i + 1 == peak && peak > lit {
+                    // The held peak: an outlined segment in the bar's colour.
+                    segment(&mut shapes, x, y, w, h, Color { a: 0.9, ..self.color });
+                    segment(&mut shapes, x + 1.5, y + 1.5, w - 3.0, h - 3.0, OFF);
+                } else {
+                    segment(&mut shapes, x, y, w, h, OFF_EDGE);
+                    segment(&mut shapes, x + 1.0, y + 1.0, w - 2.0, h - 2.0, OFF);
+                }
+            }
+            m.painted.draw(renderer, b.expand(10.0), shapes);
+            return;
+        }
+        // The meter redraws with every level update; the flicker frame follows real time.
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| (d.as_millis() / 70) as u32);
+        const BARS: u32 = 60;
+        let gap = 2.0;
+        let w = (b.width - gap * (BARS - 1) as f32) / BARS as f32;
+        let lit = (self.level * BARS as f32).round() as u32;
+        for i in 0..BARS {
+            let x = b.x + i as f32 * (w + gap);
+            let r = grain(i, t);
+            if i < lit {
+                // Ragged heights and uneven brightness: hiss, not a clean signal.
+                let h = METER_H * (0.35 + 0.65 * r);
+                let k = 0.75 + 0.5 * grain(i + 97, t);
+                let c = Color { r: (self.color.r * k).min(1.0), g: (self.color.g * k).min(1.0), b: (self.color.b * k).min(1.0), a: 1.0 };
+                renderer.fill_quad(Quad { bounds: Rectangle { x, y: b.y + (METER_H - h) / 2.0, width: w, height: h }, ..Quad::default() }, c);
+            } else {
+                renderer.fill_quad(Quad { bounds: Rectangle { x, y: b.y + METER_H / 2.0 - 1.0, width: w, height: 2.0 }, ..Quad::default() }, track);
+                // Static over the empty part.
+                if r > 0.62 {
+                    let y = b.y + 1.0 + (METER_H - 4.0) * grain(i + 211, t);
+                    renderer.fill_quad(Quad { bounds: Rectangle { x, y, width: w, height: 2.0 }, ..Quad::default() }, Color { a: 0.35, ..self.color });
+                }
+            }
+        }
+    }
+}
+
 impl<'a, Message: 'a> From<Tacho<'a, Message>> for Element<'a, Message> {
     fn from(t: Tacho<'a, Message>) -> Self {
         Element::new(t)
