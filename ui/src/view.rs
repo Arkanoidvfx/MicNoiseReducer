@@ -1,10 +1,11 @@
 use super::*;
+use crate::tacho::{self, Clock, tacho};
 use iced::advanced::widget::{Id, Operation, operation};
 use iced::widget::{
-    self, Space, button, column, container, mouse_area, pick_list, row, scrollable, slider, text,
+    self, Space, button, column, container, mouse_area, pick_list, row, scrollable, text,
     text_input,
 };
-use iced::{Border, Color, Length};
+use iced::{Border, Color, Length, Shadow, Vector};
 
 // Keep an off-screen keyboard target mounted without mounting every row on the way to it.
 fn sound_rows(count: usize, scroll: f32, viewport: f32, pitch: f32, focus: Option<usize>) -> Vec<usize> {
@@ -77,14 +78,59 @@ fn focus_scroll_delta(top: f32, height: f32, viewport_top: f32, viewport_height:
         (top + height + 8.0 - viewport_top - viewport_height).max(0.0)
     }
 }
-pub const BG: Color = Color::from_rgb8(23, 24, 26);
-const PANEL: Color = Color::from_rgb8(34, 35, 38);
+
+// 0.2.8 palette: graphite surfaces, one warm accent, red only for the risky zone.
+pub const BG: Color = Color::from_rgb8(0x15, 0x16, 0x19);
+const RAIL: Color = Color::from_rgb8(0x11, 0x12, 0x14);
+const CARD: Color = Color::from_rgb8(0x1B, 0x1C, 0x1F);
+const CARD2: Color = Color::from_rgb8(0x22, 0x23, 0x27);
+const HOVER: Color = Color::from_rgb8(0x2A, 0x2B, 0x30);
+const LINE: Color = Color::from_rgb8(0x26, 0x27, 0x2B);
+const EDGE: Color = Color::from_rgb8(0x3A, 0x3B, 0x41);
 pub const INK: Color = Color::from_rgb8(242, 237, 227);
-const DIM: Color = Color::from_rgb8(159, 159, 164);
-const LINE: Color = Color::from_rgb8(60, 61, 65);
+const DIM: Color = Color::from_rgb8(0xA3, 0xA3, 0xA9);
+const FAINT: Color = Color::from_rgb8(0x85, 0x86, 0x8D);
 pub const ORANGE: Color = Color::from_rgb8(255, 159, 86);
+const ORANGE_DARK: Color = Color::from_rgb8(0x1A, 0x12, 0x06);
 pub const GREEN: Color = Color::from_rgb8(111, 225, 139);
 pub const RED: Color = Color::from_rgb8(255, 119, 118);
+const LIVE_BG: Color = Color::from_rgb8(0x1F, 0x1B, 0x18);
+
+/// Segoe MDL2 Assets ships with Windows 10 and 11; its glyphs replace hand-drawn icons.
+mod glyph {
+    pub const MIC: &str = "\u{E720}";
+    pub const HEADPHONES: &str = "\u{E7F6}";
+    pub const SETTINGS: &str = "\u{E713}";
+    pub const EFFECTS: &str = "\u{E945}";
+    pub const SOUNDPAD: &str = "\u{E8A9}";
+    pub const VOICE: &str = "\u{E77B}";
+    pub const CHIP: &str = "\u{E9F5}";
+    pub const OUTPUT: &str = "\u{E8BD}";
+    pub const LOCK: &str = "\u{E72E}";
+    pub const RIGHT: &str = "\u{E76C}";
+    pub const DOWN: &str = "\u{E70D}";
+    pub const PLAY: &str = "\u{E768}";
+    pub const STOP: &str = "\u{E71A}";
+    pub const SAVE: &str = "\u{E896}";
+    pub const VOLUME: &str = "\u{E767}";
+    pub const BOOST: &str = "\u{E995}";
+    pub const NOTE: &str = "\u{E8D6}";
+    pub const SLOW: &str = "\u{EC49}";
+    pub const FAST: &str = "\u{EC4A}";
+    pub const REVERSE: &str = "\u{E7A7}";
+    pub const REPEAT: &str = "\u{E8EE}";
+    pub const CLOSE: &str = "\u{E8BB}";
+    pub const MINIMIZE: &str = "\u{E921}";
+    pub const WARNING: &str = "\u{E7BA}";
+    pub const FOLDER: &str = "\u{E838}";
+    pub const REFRESH: &str = "\u{E72C}";
+    pub const CHECK: &str = "\u{E73E}";
+    pub const LOGS: &str = "\u{E9D9}";
+    pub const BACK: &str = "\u{E72B}";
+}
+fn icon<'a>(glyph: &'a str, size: u32, color: Color) -> widget::Text<'a> {
+    text(glyph).size(size).color(color).font(Font::with_name("Segoe MDL2 Assets"))
+}
 fn label<'a>(s: impl Into<String>, size: u32, color: Color) -> widget::Text<'a> {
     text(s.into()).size(size).color(color)
 }
@@ -94,26 +140,20 @@ fn bold<'a>(s: impl Into<String>, size: u32, color: Color) -> widget::Text<'a> {
         ..Font::with_name("Segoe UI")
     })
 }
-/// Parameter heading used across pages: bold name left, value right.
-fn heading<'a>(name: &'a str, value: String) -> Element<'a, Msg> {
-    row![bold(name, 14, INK), Space::new().width(Length::Fill), label(value, 13, INK)].into()
+fn title<'a>(s: &'a str) -> widget::Text<'a> {
+    bold(s, 22, INK)
 }
-fn line<'a>() -> Element<'a, Msg> {
-    container(Space::new().height(1))
-        .width(Length::Fill)
-        .style(|_| container::Style {
-            background: Some(LINE.into()),
-            ..Default::default()
-        })
-        .into()
+fn numbers<'a>(s: impl Into<String>, size: u32, color: Color) -> widget::Text<'a> {
+    label(s, size, color).font(tacho::numbers())
 }
 fn outline(focused: bool) -> Border {
     Border {
-        color: if focused { ORANGE } else { LINE },
+        color: if focused { ORANGE } else { EDGE },
         width: if focused { 2.0 } else { 1.0 },
         radius: 8.0.into(),
     }
 }
+/// A button: accent is the page's single primary action, the rest are quiet.
 fn action<'a>(
     content: impl Into<Element<'a, Msg>>,
     message: Msg,
@@ -121,50 +161,66 @@ fn action<'a>(
     accent: bool,
 ) -> widget::Button<'a, Msg> {
     button(focus_target(content, focused))
-        .padding([6, 10])
+        .padding([7, 12])
         .on_press(message)
         .style(move |_, status| {
             let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
-            // A button that can't be pressed must not look like the page's main action:
-            // accent fades, plain buttons lose their fill and read as outlines.
             let disabled = matches!(status, button::Status::Disabled);
             button::Style {
                 background: Some(
                     (if accent && disabled {
                         Color { a: 0.35, ..ORANGE }
+                    } else if accent && hover {
+                        Color::from_rgb8(0xFF, 0xB0, 0x70)
                     } else if accent {
                         ORANGE
                     } else if disabled {
                         BG
                     } else if hover {
-                        Color::from_rgb8(49, 50, 54)
+                        HOVER
                     } else {
-                        PANEL
+                        CARD2
                     })
                     .into(),
                 ),
-                text_color: if accent { BG } else { INK },
-                border: outline(focused),
+                text_color: if accent { ORANGE_DARK } else { INK },
+                border: if accent && !focused {
+                    Border { radius: 8.0.into(), ..Border::default() }
+                } else {
+                    outline(focused)
+                },
                 ..Default::default()
             }
         })
 }
-fn window_action<'a>(s: &'a str, message: Msg) -> widget::Button<'a, Msg> {
-    button(label(s, 16, DIM))
-        .width(32)
-        .height(32)
+fn icon_button<'a>(glyph: &'a str, message: Msg, focused: bool) -> widget::Button<'a, Msg> {
+    button(focus_target(container(icon(glyph, 14, DIM)).center(Length::Fill), focused))
+        .width(34)
+        .height(34)
         .padding(0)
         .on_press(message)
-        .style(|_, status| button::Style {
-            background: matches!(status, button::Status::Hovered | button::Status::Pressed)
-                .then(|| PANEL.into()),
+        .style(move |_, status| button::Style {
+            background: Some(
+                (if matches!(status, button::Status::Hovered | button::Status::Pressed) { HOVER } else { CARD2 }).into(),
+            ),
             text_color: INK,
-            border: Border {
-                color: LINE,
-                width: 1.0,
-                radius: 7.0.into(),
-            },
+            border: outline(focused),
             ..Default::default()
+        })
+}
+fn caption_button<'a>(glyph: &'a str, message: Msg, danger: bool) -> widget::Button<'a, Msg> {
+    button(container(icon(glyph, 10, DIM)).center(Length::Fill))
+        .width(46)
+        .height(46)
+        .padding(0)
+        .on_press(message)
+        .style(move |_, status| {
+            let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            button::Style {
+                background: hover.then(|| (if danger { Color::from_rgb8(0xC4, 0x2B, 0x1C) } else { HOVER }).into()),
+                text_color: INK,
+                ..Default::default()
+            }
         })
 }
 fn focus_target<'a>(
@@ -180,722 +236,759 @@ fn focus_target<'a>(
 }
 fn frame<'a>(content: impl Into<Element<'a, Msg>>, focused: bool) -> Element<'a, Msg> {
     focus_target(content, focused)
-        .padding(4)
+        .padding(3)
         .style(move |_| container::Style {
             border: Border {
                 color: if focused { ORANGE } else { Color::TRANSPARENT },
-                width: 1.0,
-                radius: 5.0.into(),
+                width: if focused { 2.0 } else { 1.0 },
+                radius: 6.0.into(),
             },
             ..Default::default()
         })
         .into()
 }
-fn panel<'a>(content: impl Into<Element<'a, Msg>>) -> widget::Container<'a, Msg> {
-    container(content).padding(10).style(|_| container::Style {
-        background: Some(PANEL.into()),
-        border: Border {
-            color: LINE,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
+fn card<'a>(content: impl Into<Element<'a, Msg>>) -> widget::Container<'a, Msg> {
+    container(content).padding([14, 16]).width(Length::Fill).style(|_| container::Style {
+        background: Some(CARD.into()),
+        border: Border { color: LINE, width: 1.0, radius: 10.0.into() },
         ..Default::default()
     })
 }
+fn tile<'a>(glyph: &'a str, size: f32, accent: bool) -> Element<'a, Msg> {
+    container(icon(glyph, (size * 0.45) as u32, if accent { ORANGE } else { FAINT }))
+        .width(size)
+        .height(size)
+        .center(size)
+        .style(move |_| container::Style {
+            background: Some(
+                (if accent { Color { a: 0.13, ..ORANGE } } else { Color::from_rgb8(0x25, 0x26, 0x2A) }).into(),
+            ),
+            border: Border { radius: 9.0.into(), ..Border::default() },
+            ..Default::default()
+        })
+        .into()
+}
+fn heading_row<'a>(glyph: &'a str, name: &'a str, right: Element<'a, Msg>) -> Element<'a, Msg> {
+    row![icon(glyph, 14, DIM), bold(name, 13, INK), Space::new().width(Length::Fill), right]
+        .spacing(8)
+        .height(24)
+        .align_y(iced::Center)
+        .into()
+}
 fn device_style(_: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let open = matches!(status, pick_list::Status::Hovered | pick_list::Status::Opened { .. });
     pick_list::Style {
         text_color: INK,
-        placeholder_color: DIM,
-        handle_color: ORANGE,
-        background: if matches!(
-            status,
-            pick_list::Status::Hovered | pick_list::Status::Opened { .. }
-        ) {
-            PANEL.into()
-        } else {
-            BG.into()
-        },
+        placeholder_color: FAINT,
+        handle_color: DIM,
+        background: BG.into(),
         border: Border {
-            radius: 5.0.into(),
-            ..Border::default()
+            color: if open { ORANGE } else { Color::from_rgb8(0x45, 0x46, 0x4D) },
+            width: 1.0,
+            radius: 7.0.into(),
         },
     }
 }
-fn slider_style_with_opacity(
-    status: slider::Status,
-    opacity: f32,
-    handle_opacity: f32,
-) -> slider::Style {
-    let fade = |color: Color| Color { a: color.a * opacity, ..color };
-    slider::Style {
-        rail: slider::Rail {
-            backgrounds: (fade(ORANGE).into(), fade(LINE).into()),
-            width: 4.0,
-            border: Border::default(),
+fn input_style(_: &Theme, status: text_input::Status) -> text_input::Style {
+    let focused = matches!(status, text_input::Status::Focused { .. });
+    let hover = matches!(status, text_input::Status::Hovered);
+    text_input::Style {
+        background: BG.into(),
+        border: Border {
+            color: if focused { ORANGE } else if hover { Color::from_rgb8(0x6B, 0x6C, 0x73) } else { Color::from_rgb8(0x2E, 0x2F, 0x34) },
+            width: 1.0,
+            radius: 7.0.into(),
         },
-        handle: slider::Handle {
-            shape: slider::HandleShape::Circle {
-                radius: if matches!(status, slider::Status::Hovered | slider::Status::Dragged) {
-                    7.0
-                } else {
-                    6.0
-                },
-            },
-            background: Color { a: handle_opacity, ..INK }.into(),
-            border_width: 0.0,
-            border_color: fade(ORANGE),
-        },
+        icon: DIM,
+        placeholder: FAINT,
+        value: INK,
+        selection: Color { a: 0.35, ..ORANGE },
     }
 }
-fn slider_style(_: &Theme, status: slider::Status) -> slider::Style {
-    slider_style_with_opacity(status, 1.0, 1.0)
+fn switch<'a>(on: bool, message: impl Fn(bool) -> Msg + 'a, enabled: bool) -> widget::Toggler<'a, Msg> {
+    widget::toggler(on)
+        .size(18)
+        .on_toggle_maybe(enabled.then_some(message))
+        .style(|_, status| {
+            use widget::toggler::Status::*;
+            let (Active { is_toggled } | Hovered { is_toggled } | Disabled { is_toggled }) = status;
+            widget::toggler::Style {
+                background: (if is_toggled { ORANGE } else { Color::from_rgb8(0x34, 0x35, 0x3A) }).into(),
+                background_border_width: 0.0,
+                background_border_color: Color::TRANSPARENT,
+                foreground: (if is_toggled { ORANGE_DARK } else { DIM }).into(),
+                foreground_border_width: 0.0,
+                foreground_border_color: Color::TRANSPARENT,
+                text_color: Some(DIM),
+                border_radius: None,
+                padding_ratio: 0.18,
+            }
+        })
 }
-/// Grey mark behind a rail: the 100 % point, or zero of a signed value.
-const TICK: Color = Color::from_rgb8(100, 100, 106);
-/// Where a slider's orange starts and which point of its range gets a tick.
-#[derive(Clone, Copy)]
-enum Rail {
-    /// Orange from the left edge, as Iced draws it; tick at this value.
-    Tick(f32),
-    /// Signed value: orange between zero and the handle, zero ticked, so 0 shows no fill.
-    Signed,
+/// Segmented level meter, the same vocabulary as the sliders.
+fn meter<'a>(level: f32, color: Color) -> Element<'a, Msg> {
+    let segments = 40usize;
+    let lit = (level.clamp(0.0, 1.0) * segments as f32).round() as usize;
+    widget::Row::with_children((0..segments).map(|i| {
+        let fill = if i < lit { color } else { Color::from_rgb8(0x26, 0x27, 0x2B) };
+        container(Space::new().width(Length::Fill).height(10))
+            .width(Length::Fill)
+            .style(move |_| container::Style { background: Some(fill.into()), ..Default::default() })
+            .into()
+    }))
+    .spacing(2)
+    .width(Length::Fill)
+    .into()
 }
-/// A slider with a tick under its rail. Ctrl+click resets it to `default`.
-/// Marks use the handle's resting radius (6) as inset, the same geometry Iced uses to
-/// place the handle, so a tick sits exactly under the handle at that value.
-fn marked_slider<'a>(
-    range: std::ops::RangeInclusive<f32>,
-    value: f32,
-    on_change: impl Fn(f32) -> Msg + 'a,
-    step: f32,
-    default: f32,
-    rail: Rail,
-    opacity: f32,
-) -> Element<'a, Msg> {
-    let (min, max) = (*range.start(), *range.end());
-    let at = |v: f32| (((v - min) / (max - min)).clamp(0.0, 1.0) * 1000.0).round() as u16;
-    let fade = move |c: Color| Color { a: c.a * opacity, ..c };
-    let bar = |width: Length, height: f32, color: Color| {
-        container(Space::new().width(Length::Fill).height(height))
-            .width(width)
-            .style(move |_| container::Style {
-                background: Some(color.into()),
-                border: Border { radius: 2.0.into(), ..Default::default() },
-                ..Default::default()
-            })
-    };
-    // One element spanning [from, to] of the handle track, in thousandths.
-    let span = |from: u16, to: u16, content: widget::Container<'a, Msg>| -> Element<'a, Msg> {
-        let mut line = row![].align_y(iced::Center);
-        if from > 0 {
-            line = line.push(Space::new().width(Length::FillPortion(from)));
-        }
-        line = line.push(content);
-        if to < 1000 {
-            line = line.push(Space::new().width(Length::FillPortion(1000 - to)));
-        }
-        container(line).padding([0, 6]).height(Length::Fill).center_y(Length::Fill).into()
-    };
-    let tick = match rail {
-        Rail::Tick(v) => at(v),
-        Rail::Signed => at(0.0),
-    };
-    let signed = matches!(rail, Rail::Signed);
-    let mut stack = widget::Stack::new()
-        .width(Length::Fill)
-        .push(
-            slider(range, value, on_change)
-                .step(step)
-                .default(default)
-                .style(move |_, status| {
-                    let mut style = slider_style_with_opacity(status, opacity, opacity);
-                    if signed {
-                        style.rail.backgrounds = (Color::TRANSPARENT.into(), Color::TRANSPARENT.into());
-                    }
-                    style
-                }),
-        );
-    if signed {
-        let (from, to) = (tick.min(at(value)), tick.max(at(value)));
-        if to > from {
-            stack = stack.push_under(span(from, to, bar(Length::FillPortion(to - from), 4.0, fade(ORANGE))));
-        }
-        stack = stack.push_under(
-            container(bar(Length::Fill, 4.0, fade(LINE))).height(Length::Fill).center_y(Length::Fill),
-        );
-    }
-    stack.push_under(span(tick, tick, bar(Length::Fixed(2.0), 12.0, fade(TICK)))).into()
+fn panel_row<'a>(name: Element<'a, Msg>, control: Element<'a, Msg>) -> widget::Row<'a, Msg> {
+    row![container(name).width(112), control].spacing(12).align_y(iced::Center).height(34)
 }
-/// A checked box is a setting, not something happening now: it fills DIM, and orange
-/// stays for live state (a firing effect, a playing clip). Filled vs hollow still reads.
-fn check_style(theme: &Theme, status: widget::checkbox::Status) -> widget::checkbox::Style {
-    use widget::checkbox::Status::*;
-    let mut style = widget::checkbox::primary(theme, status);
-    let (Active { is_checked } | Hovered { is_checked } | Disabled { is_checked }) = status;
-    if is_checked {
-        let fill = if matches!(status, Hovered { .. }) { INK } else { DIM };
-        style.background = fill.into();
-        style.border.color = fill;
-        style.icon_color = BG;
-    }
-    style
+fn effect_grid<'a>(a: Element<'a, Msg>, b: Element<'a, Msg>, c: Element<'a, Msg>, d: Element<'a, Msg>, e: Element<'a, Msg>) -> widget::Row<'a, Msg> {
+    row![
+        container(a).width(36),
+        container(b).width(128),
+        container(c).width(Length::Fill),
+        container(d).width(150),
+        container(e).width(150),
+    ]
+    .spacing(14)
+    .align_y(iced::Center)
 }
+fn db(peak: f32) -> f32 {
+    if peak > 0.000001 { 20.0 * peak.log10() } else { -100.0 }
+}
+fn db_text(peak: f32) -> String {
+    let v = db(peak);
+    if v <= -99.0 { "−∞ dB".into() } else { format!("{:.0} dB", v).replace('-', "−") }
+}
+
 impl App {
+    fn clock(&self) -> Clock {
+        Clock { epoch: self.epoch, opened: self.opened_at, animate: self.ui_active() }
+    }
+    fn page_main(&self) -> bool {
+        !self.details && !self.rvc_page && !self.soundpad_page && !self.logs_page && !self.effects_page
+    }
+
     pub fn view(&self, _: window::Id) -> Element<'_, Msg> {
         let logo = widget::Row::with_children([10, 22, 14].into_iter().map(|h| {
             container(Space::new().width(3).height(h))
                 .style(|_| container::Style {
                     background: Some(ORANGE.into()),
-                    border: Border {
-                        radius: 3.0.into(),
-                        ..Default::default()
-                    },
+                    border: Border { radius: 3.0.into(), ..Default::default() },
                     ..Default::default()
                 })
                 .into()
         }))
         .spacing(3)
         .align_y(iced::Center);
-        let title = mouse_area(
-            container(
-                row![logo, bold("Mic Noize", 18, INK)]
-                    .spacing(12)
-                    .align_y(iced::Center),
+        let titlebar = row![
+            mouse_area(
+                container(row![logo, bold("Mic Noize", 15, INK)].spacing(12).align_y(iced::Center))
+                    .padding([0, 16])
+                    .width(Length::Fill)
+                    .height(46)
+                    .center_y(46),
             )
-            .width(Length::Fill)
-            .height(36)
-            .center_y(36),
-        )
-        .on_press(Msg::Drag);
-        let header = row![
-            title,
-            window_action("−", Msg::Minimize),
-            window_action("×", Msg::Hide)
+            .on_press(Msg::Drag),
+            caption_button(glyph::MINIMIZE, Msg::Minimize, false),
+            caption_button(glyph::CLOSE, Msg::Hide, true),
         ]
-        .spacing(4)
         .align_y(iced::Center);
-        let content = if self.logs_page {
+        let titlebar = container(titlebar).width(Length::Fill).style(|_| container::Style {
+            border: Border { color: LINE, width: 0.0, radius: 0.0.into() },
+            ..Default::default()
+        });
+
+        let content: Element<'_, Msg> = if self.logs_page {
             self.logs_view()
         } else if self.soundpad_page {
             self.soundpad_view()
-        } else if self.headphone_page {
-            self.headphone_view()
         } else if self.details {
             self.settings_view()
         } else if self.rvc_page {
             self.rvc_view()
+        } else if self.effects_page {
+            self.effects_view()
         } else {
             self.main_view()
         };
-        let mut body = column![header, line()].spacing(8).width(Length::Fill);
-        {
-            let tab = |title, page, selected| {
-                action(
-                    label(title, 13, if selected { BG } else { INK }),
-                    Msg::Page(page),
-                    self.focus == focus::tab(page),
-                    selected,
-                )
-            };
-            body = body.push(
-                row![
-                    tab(
-                        "Микрофон",
-                        0,
-                        !self.details
-                            && !self.rvc_page
-                            && !self.headphone_page
-                            && !self.soundpad_page
-                            && !self.logs_page
-                    ),
-                    tab("Наушники", 3, self.headphone_page),
-                    tab("Voice Changer", 1, self.rvc_page && !self.details),
-                    tab("Саундпад", 4, self.soundpad_page),
-                    Space::new().width(Length::Fill),
-                    tab("Логи", 5, self.logs_page),
-                    tab("Настройки", 2, self.details),
-                ]
-                .spacing(6)
-                .align_y(iced::Center),
-            );
-        }
-        // A ready update used to be visible only inside Настройки. It now sits above every
-        // page, with the action in the same place as the status.
-        if self.update_ready {
-            body = body.push(
-                panel(
-                    row![
-                        column![
-                            bold("Доступно обновление", 13, ORANGE),
-                            label(&self.update_status, 12, DIM)
-                        ]
-                        .spacing(2),
-                        Space::new().width(Length::Fill),
-                        action(
-                            label("Обновить и перезапустить", 13, BG),
-                            Msg::ApplyUpdate,
-                            self.focus == focus::UPDATE_BANNER,
-                            true
-                        )
-                    ]
-                    .spacing(10)
-                    .align_y(iced::Center),
-                )
-                .width(Length::Fill),
-            );
-        }
+        let mut page = column![].spacing(12).width(Length::Fill).height(Length::Fill);
         if !self.message.is_empty() {
-            let color=match self.message.as_str(){DEVICE_REPAIRED=>GREEN,DEVICE_REPAIRING=>DIM,_=>RED};
-            body = body.push(container(label(&self.message, 13, color)).padding([4, 0]));
+            let (color, glyph) = match self.message.as_str() {
+                DEVICE_REPAIRED => (GREEN, glyph::CHECK),
+                DEVICE_REPAIRING => (DIM, glyph::REFRESH),
+                _ => (RED, glyph::WARNING),
+            };
+            page = page.push(
+                container(row![icon(glyph, 14, color), label(&self.message, 13, color)].spacing(10).align_y(iced::Center))
+                    .padding([9, 14])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(Color { a: 0.08, ..color }.into()),
+                        border: Border { color: Color { a: 0.45, ..color }, width: 1.0, radius: 8.0.into() },
+                        ..Default::default()
+                    }),
+            );
         }
         // The soundpad owns its own scrollable list (and the "body" id) so its toolbar and
         // sidebar stay put while hundreds of clips scroll.
-        if self.soundpad_page && self.sound_folder.is_some() {
-            body = body.push(container(content).width(Length::Fill).height(Length::Fill));
+        let body: Element<'_, Msg> = if self.soundpad_page && self.sound_folder.is_some() {
+            page.push(container(content).width(Length::Fill).height(Length::Fill)).padding([20, 26]).into()
         } else {
-            body = body.push(
+            page.push(
                 scrollable(
-                    mouse_area(container(content).padding(iced::Padding {
-                        right: 10.0,
-                        ..Default::default()
-                    }))
-                    .on_scroll(|d| Msg::Wheel("body", smooth::wheel_pixels(d))),
+                    mouse_area(container(content).padding(iced::Padding { right: 12.0, bottom: 8.0, ..Default::default() }))
+                        .on_scroll(|d| Msg::Wheel("body", smooth::wheel_pixels(d))),
                 )
                 .id("body")
                 .width(Length::Fill)
                 .height(Length::Fill),
-            );
-        }
-        container(body.height(Length::Fill))
-            .padding([8, 12])
+            )
+            .padding(iced::Padding { top: 20.0, right: 14.0, bottom: 6.0, left: 26.0 })
+            .into()
+        };
+        let root = column![
+            titlebar,
+            container(Space::new().height(1)).width(Length::Fill).style(|_| container::Style {
+                background: Some(LINE.into()),
+                ..Default::default()
+            }),
+            row![self.rail(), body].height(Length::Fill),
+        ];
+        container(root)
             .width(Length::Fill)
             .height(Length::Fill)
             .style(|_| container::Style {
                 background: Some(BG.into()),
                 text_color: Some(INK),
-                border: Border {
-                    color: LINE,
-                    width: 1.0,
-                    radius: 10.0.into(),
-                },
+                border: Border { color: Color::from_rgb8(0x2A, 0x2B, 0x30), width: 1.0, radius: 12.0.into() },
                 ..Default::default()
             })
             .into()
     }
-    fn main_view(&self) -> Element<'_, Msg> {
-        let full_monitor = if self.monitor_all { self.monitor } else { 0 };
-        let output = self
-            .output
-            .as_ref()
-            .map(|d| d.name.as_str())
-            .unwrap_or("Выберите выход");
-        let route = row![
-            container(frame(
-                pick_list(self.inputs.as_slice(), self.input.as_ref(), Msg::Input)
-                    .placeholder("Выберите микрофон")
-                    .text_size(12)
-                    .padding([4, 6])
-                    .width(Length::Fill)
-                    .style(device_style),
-                self.focus == focus::effects::INPUT,
+
+    /// Left rail: what the app does, in order of use; settings and a ready update at the bottom.
+    fn rail(&self) -> Element<'_, Msg> {
+        let item = |glyph: &'static str, name: &'static str, page: u8, selected: bool| {
+            let focused = self.focus == focus::tab(page);
+            button(focus_target(
+                row![
+                    icon(glyph, 15, if selected { ORANGE } else { DIM }),
+                    label(name, 14, if selected { INK } else { DIM }),
+                ]
+                .spacing(12)
+                .align_y(iced::Center),
+                focused,
             ))
+            .width(Length::Fill)
+            .height(40)
+            .padding([0, 12])
+            .on_press(Msg::Page(page))
+            .style(move |_, status| button::Style {
+                background: Some(
+                    (if selected {
+                        Color::from_rgb8(0x1F, 0x20, 0x23)
+                    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                        Color::from_rgb8(0x1A, 0x1B, 0x1E)
+                    } else {
+                        Color::TRANSPARENT
+                    })
+                    .into(),
+                ),
+                text_color: INK,
+                border: Border {
+                    color: if focused { ORANGE } else { Color::TRANSPARENT },
+                    width: if focused { 2.0 } else { 0.0 },
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            })
+        };
+        let mut rail = column![
+            item(glyph::MIC, "Шумодав", 0, self.page_main()),
+            item(glyph::EFFECTS, "Эффекты", 6, self.effects_page),
+            item(glyph::SOUNDPAD, "Саундпад", 4, self.soundpad_page),
+            item(glyph::VOICE, "Смена голоса", 1, self.rvc_page),
+            Space::new().height(Length::Fill),
+        ]
+        .spacing(2)
+        .padding([14, 10])
+        .width(196)
+        .height(Length::Fill);
+        if self.update_ready {
+            rail = rail.push(
+                container(
+                    column![
+                        bold("Обновление готово", 13, INK),
+                        label(&self.update_status, 12, DIM),
+                        action(
+                            container(label("Перезапустить", 13, ORANGE_DARK)).center_x(Length::Fill),
+                            Msg::ApplyUpdate,
+                            self.focus == focus::UPDATE_BANNER,
+                            true,
+                        )
+                        .width(Length::Fill),
+                    ]
+                    .spacing(8),
+                )
+                .padding(12)
+                .style(|_| container::Style {
+                    background: Some(CARD.into()),
+                    border: Border { color: Color::from_rgb8(0x2A, 0x2B, 0x30), width: 1.0, radius: 10.0.into() },
+                    ..Default::default()
+                }),
+            );
+            rail = rail.push(Space::new().height(8));
+        }
+        rail = rail.push(item(glyph::SETTINGS, "Настройки", 2, self.details || self.logs_page));
+        container(rail)
+            .height(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(RAIL.into()),
+                border: Border { color: LINE, width: 0.0, radius: iced::border::Radius::default().bottom_left(12.0) },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// Шумодав: the devices you can change on top, the fixed route folded away, then strength.
+    fn main_view(&self) -> Element<'_, Msg> {
+        use focus::effects::*;
+        let clock = self.clock();
+        let mic = row![
+            tile(glyph::MIC, 52.0, true),
+            column![
+                label("Микрофон", 12, DIM),
+                frame(
+                    pick_list(self.inputs.as_slice(), self.input.as_ref(), Msg::Input)
+                        .placeholder("Выберите микрофон")
+                        .text_size(13)
+                        .padding([6, 10])
+                        .width(Length::Fill)
+                        .style(device_style),
+                    self.focus == INPUT,
+                ),
+            ]
+            .spacing(3)
             .width(Length::Fill),
-            label("›", 18, ORANGE),
-            label("NVIDIA", 12, INK),
-            label("›", 18, ORANGE),
-            label(output, 12, DIM).width(Length::Fill)
         ]
         .spacing(12)
         .align_y(iced::Center);
-        let db = if self.peak > 0.000001 {
-            20.0 * self.peak.log10()
-        } else {
-            -100.0
-        };
-        let level = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
-        let meter = widget::progress_bar(0.0..=1.0, level)
-            .girth(6)
-            .style(move |_| widget::progress_bar::Style {
-                background: LINE.into(),
-                bar: if level > 0.9 {
-                    ORANGE.into()
-                } else {
-                    GREEN.into()
+        let hp_live = matches!(self.headphone_state, 1 | 2);
+        let modded = hp_live || self.headphone_reverse || self.headphone_pitch != 0;
+        let gear_focused = self.focus == HEADPHONE_GEAR;
+        let open = self.headphone_page;
+        let gear = button(focus_target(
+            widget::stack![
+                container(icon(glyph::SETTINGS, 16, if open { ORANGE_DARK } else { DIM })).center(40),
+                container(
+                    container(Space::new().width(7).height(7)).style(move |_| container::Style {
+                        background: Some((if modded { if open { ORANGE_DARK } else { ORANGE } } else { Color::TRANSPARENT }).into()),
+                        border: Border { radius: 4.0.into(), ..Border::default() },
+                        ..Default::default()
+                    }),
+                )
+                .padding(iced::Padding { top: 6.0, left: 27.0, ..Default::default() }),
+            ],
+            gear_focused,
+        ))
+        .width(40)
+        .height(40)
+        .padding(0)
+        .on_press(Msg::HeadphonePanel(!open))
+        .style(move |_, status| {
+            let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            button::Style {
+                background: Some((if open { ORANGE } else if hover { HOVER } else { CARD }).into()),
+                text_color: INK,
+                border: Border {
+                    color: if gear_focused || open { ORANGE } else { EDGE },
+                    width: if gear_focused { 2.0 } else { 1.0 },
+                    radius: 9.0.into(),
                 },
-                border: Border::default(),
-            });
-        let level_view = column![
-            row![
-                label("Выходной голос", 12, DIM),
-                Space::new().width(Length::Fill),
-                label(
-                    if db <= -99.0 {
-                        "−∞ dBFS".into()
-                    } else {
-                        format!("{db:.0} dBFS")
-                    },
-                    13,
-                    INK
-                )
-            ],
-            meter,
-        ]
-        .spacing(5);
-        let can_monitor = !self.busy && !self.quitting && matches!(self.snapshot.state, 2 | 3);
-        let mut monitoring = column![
-            row![
-                action(
-                    label(
-                        match full_monitor {
-                            1 => "Подключение…",
-                            2 => "Слышу весь голос",
-                            _ => "Слышать весь голос",
-                        },
-                        13,
-                        if full_monitor == 2 { BG } else if can_monitor { INK } else { DIM }
-                    ),
-                    Msg::Monitor,
-                    self.focus == focus::effects::MONITOR,
-                    full_monitor == 2
-                )
-                .on_press_maybe(can_monitor.then_some(Msg::Monitor)),
-                self.bind_button(10, self.keys[10], self.focus == focus::effects::MONITOR_BIND, false, 150.0),
-            ]
-            .spacing(8)
-            .align_y(iced::Center),
-        ]
-        .spacing(5)
-        .width(Length::Fill);
-        // Only while there is something to say: an empty line would push the checkboxes
-        // away from the button they belong with.
-        let monitor_note = if self.monitor_all && matches!(self.monitor, 1 | 2) {
-            "Сейчас слышен весь голос; режим эффектов сохранён."
-        } else if self.effect_monitoring() && self.monitor == 1 {
-            "Подключение наушников…"
-        } else if self.effect_monitoring() && self.monitor == 3 {
-            "Ошибка прослушивания — см. сообщение сверху."
-        } else {
-            ""
-        };
-        if !monitor_note.is_empty() {
-            monitoring = monitoring.push(label(monitor_note, 11, DIM));
-        }
-        let monitoring = monitoring
-            .push(frame(widget::checkbox(self.effects_monitor)
-                .label("Слышать эффекты").text_size(13).size(16).style(check_style)
-                .on_toggle(Msg::EffectsMonitor), self.focus == focus::effects::EFFECTS_MONITOR))
-            .push(frame(widget::checkbox(self.boost_monitor)
-                .label("Слышать усиление").text_size(13).size(16).style(check_style)
-                .on_toggle(Msg::BoostMonitor), self.focus == focus::effects::BOOST_MONITOR));
-        // Discord volume first: the replay key then sits right above the recordings it plays.
-        let output_controls = column![
-            row![
-                label("Громкость Discord", 13, DIM),
-                Space::new().width(Length::Fill),
-                label(
-                    format!(
-                        "{:.0}%",
-                        discord_volume_percent(self.controls.discord_volume)
-                    ),
-                    13,
-                    INK
-                )
-            ],
-            frame(
-                marked_slider(
-                    0.0..=DISCORD_VOLUME_MAX_PERCENT,
-                    discord_volume_percent(self.controls.discord_volume),
-                    Msg::DiscordVolume,
-                    1.0,
-                    100.0,
-                    Rail::Tick(100.0),
-                    1.0,
+                ..Default::default()
+            }
+        });
+        let phones = row![
+            tile(glyph::HEADPHONES, 52.0, true),
+            column![
+                label("Наушники", 12, DIM),
+                frame(
+                    pick_list(self.headphone_outputs(), self.headphone_output.clone(), Msg::HeadphoneOutput)
+                        .placeholder("Выберите наушники")
+                        .text_size(13)
+                        .padding([6, 10])
+                        .width(Length::Fill)
+                        .style(device_style),
+                    self.focus == focus::headphones::OUTPUT,
                 ),
-                self.focus == focus::effects::DISCORD_VOLUME
-            ),
+            ]
+            .spacing(3)
+            .width(Length::Fill),
+            gear,
+        ]
+        .spacing(12)
+        .align_y(iced::Center);
+        let device_card = |content| {
+            container(content).padding(10).width(Length::Fill).style(|_| container::Style {
+                background: Some(CARD2.into()),
+                border: Border { color: EDGE, width: 1.0, radius: 10.0.into() },
+                ..Default::default()
+            })
+        };
+        let processing = match self.denoiser.0 {
+            3 => "DeepFilterNet (процессор)".to_owned(),
+            4 => "Шум убран на входе".to_owned(),
+            2 => "Без шумодава".to_owned(),
+            _ => format!("NVIDIA Denoiser v{}", self.version),
+        };
+        let gpu = match &self.gpu {
+            Ok((_, name)) => format!("{}, буфер {} мс", name.trim_start_matches("NVIDIA ").trim_start_matches("GeForce "), self.buffer),
+            Err(_) => format!("буфер {} мс", self.buffer),
+        };
+        let output = self.output.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| "Не выбран".into());
+        let route_focused = self.focus == ROUTE;
+        let route_toggle = button(focus_target(
             row![
-                label("Повтор последнего", 13, INK),
-                self.bind_button(11, self.keys[11], self.focus == focus::effects::REPLAY_BIND, false, 150.0)
+                icon(if self.route_open { glyph::DOWN } else { glyph::RIGHT }, 10, DIM),
+                label("Обработка и выход", 12, DIM),
+                Space::new().width(Length::Fill),
+                label(format!("{processing}  ›  {output}"), 12, FAINT),
             ]
             .spacing(8)
             .align_y(iced::Center),
-        ]
-        .spacing(5)
+            route_focused,
+        ))
         .width(Length::Fill)
-        .push(self.clips_view());
-        // Defaults for Ctrl+click match the settings defaults in main.rs.
-        let noise = |value: f32, message: fn(f32) -> Msg, default: f32| {
-            marked_slider(0.0..=200.0, value * 100.0, message, 1.0, default, Rail::Tick(100.0), 1.0)
+        .padding([8, 14])
+        .on_press(Msg::RouteToggle)
+        .style(move |_, status| button::Style {
+            background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| Color::from_rgb8(0x1F, 0x20, 0x23).into()),
+            text_color: INK,
+            border: Border {
+                color: if route_focused { ORANGE } else { Color::TRANSPARENT },
+                width: if route_focused { 2.0 } else { 0.0 },
+                radius: iced::border::Radius::default().bottom(10.0),
+            },
+            ..Default::default()
+        });
+        let fixed = |glyph: &'static str, name: &'static str, main: String, detail: String| {
+            row![
+                tile(glyph, 38.0, false),
+                column![
+                    row![icon(glyph::LOCK, 9, FAINT), label(name, 11, FAINT)].spacing(5).align_y(iced::Center),
+                    label(main, 13, Color::from_rgb8(0xCF, 0xCB, 0xC2)),
+                    label(detail, 11, FAINT),
+                ]
+                .spacing(1),
+            ]
+            .spacing(10)
+            .align_y(iced::Center)
+            .width(Length::Fill)
         };
+        let mut devices = column![
+            container(row![device_card(mic), device_card(phones)].spacing(12)).padding(12),
+            container(Space::new().height(1)).width(Length::Fill).style(|_| container::Style { background: Some(LINE.into()), ..Default::default() }),
+            route_toggle,
+        ];
+        if self.route_open {
+            devices = devices.push(
+                container(
+                    row![
+                        fixed(glyph::CHIP, "Обработка", processing.clone(), gpu),
+                        icon(glyph::RIGHT, 12, ORANGE),
+                        fixed(glyph::OUTPUT, "Выход", output.clone(), "Выберите его микрофоном в Discord".into()),
+                    ]
+                    .spacing(14)
+                    .align_y(iced::Center),
+                )
+                .padding(iced::Padding { top: 0.0, right: 14.0, bottom: 12.0, left: 14.0 }),
+            );
+        }
+        let devices = container(devices).width(Length::Fill).style(|_| container::Style {
+            background: Some(CARD.into()),
+            border: Border { color: LINE, width: 1.0, radius: 10.0.into() },
+            ..Default::default()
+        });
+
+        let before = self.in_peak;
+        let after = self.peak;
+        let level = |p: f32| ((db(p) + 60.0) / 60.0).clamp(0.0, 1.0);
+        let meters = card(
+            column![
+                row![label("До", 12, DIM).width(56), meter(level(before), Color::from_rgb8(0x6B, 0x6C, 0x73)), numbers(db_text(before), 12, DIM).width(64).align_x(iced::alignment::Horizontal::Right)]
+                    .spacing(12)
+                    .align_y(iced::Center),
+                row![label("После", 12, INK).width(56), meter(level(after), if level(after) > 0.9 { ORANGE } else { GREEN }), numbers(db_text(after), 12, INK).width(64).align_x(iced::alignment::Horizontal::Right)]
+                    .spacing(12)
+                    .align_y(iced::Center),
+            ]
+            .spacing(10),
+        )
+        .padding([12, 16]);
+
+        let strength = self.controls.intensity * 100.0;
+        let risky = strength > 100.0;
+        let noise_card = container(
+            column![
+                row![label("Сила", 13, DIM), Space::new().width(Length::Fill)].height(26).align_y(iced::Center),
+                frame(
+                    tacho(0.0..=200.0, strength, Msg::Intensity, clock).default(100.0).red_above(100.0).segments(20),
+                    self.focus == INTENSITY,
+                ),
+            ]
+            .push(risky.then(|| {
+                row![
+                    icon(glyph::WARNING, 12, Color::from_rgb8(0xFF, 0x77, 0x76)),
+                    label("Выше 100% могут наблюдаться редкие звуковые неполадки в голосе", 12, Color::from_rgb8(0xFF, 0x77, 0x76)),
+                ]
+                .spacing(7)
+                .align_y(iced::Center)
+            }))
+            .spacing(10),
+        )
+        .padding([14, 16])
+        .width(Length::Fill);
+        // In the red zone the card's background carries the police tape under its content.
+        let mut layers = widget::stack![noise_card].width(Length::Fill);
+        if risky {
+            layers = layers.push_under(tacho::caution(clock));
+        }
+        let noise_card = card(layers).padding(0);
+        let hold_card = card(
+            column![
+                row![
+                    label("Пока держу", 13, DIM),
+                    Space::new().width(Length::Fill),
+                    self.bind_button(12, self.keys[12], self.focus == NOISE_BIND, false, 140.0),
+                ]
+                .height(26)
+                .align_y(iced::Center),
+                frame(
+                    tacho(0.0..=200.0, self.controls.alternate_intensity * 100.0, Msg::AlternateIntensity, clock)
+                        .default(15.0)
+                        .red_above(100.0)
+                        .segments(20)
+                        .phase(20.0 * 64.0 + 128.0),
+                    self.focus == ALT_INTENSITY,
+                ),
+                label("Смена силы шумодава при удержании", 12, FAINT),
+            ]
+            .spacing(10),
+        );
+        let mut body = column![
+            title("Шумодав"),
+            devices,
+            meters,
+            row![noise_card, hold_card].spacing(14),
+        ]
+        .spacing(14);
         // Without NVIDIA the sliders do nothing; say so next to them, not in the error line.
-        // The range note only appears once a slider is past the 100 % tick: a warning that
-        // is always there stops being read.
         let note = if self.denoiser.0 == 2 && self.running() {
-            Some(label(format!("Шумодав выключен: {}. Голос, эффекты и виртуальный микрофон работают.", self.denoiser.1),12,ORANGE))
+            Some((format!("Шумодав выключен: {}. Голос, эффекты и виртуальный микрофон работают.", self.denoiser.1), ORANGE))
         } else if self.denoiser.0 == 3 && self.running() {
-            Some(label(format!("Шумодав DeepFilterNet на процессоре (+30 мс). NVIDIA: {}", self.denoiser.1),12,DIM))
+            Some((format!("Шумодав DeepFilterNet на процессоре (+30 мс). NVIDIA: {}", self.denoiser.1), DIM))
         } else if self.denoiser.0 == 4 && self.running() {
-            Some(label(format!("Шум уже убран на входе ({}): свой шумодав выключен, силу задаёт он.", self.denoiser.1),12,DIM))
-        } else if self.controls.intensity > 1.0 || self.controls.alternate_intensity > 1.0 {
-            Some(label("Выше 100%: запрос вне диапазона NVIDIA. SDK может отклонить его или не усилить эффект.",12,ORANGE))
+            Some((format!("Шум уже убран на входе ({}): свой шумодав выключен, силу задаёт он.", self.denoiser.1), DIM))
         } else {
             None
         };
-        let mut body = column![
-            route,
-            level_view,
-            row![
-                column![
-                    container(label(format!("Шумоподавление · {:.0}%", self.controls.intensity * 100.0), 14, INK)).height(30).center_y(30),
-                    frame(noise(self.controls.intensity, Msg::Intensity, 100.0), self.focus == focus::effects::INTENSITY),
-                ].spacing(5).width(Length::Fill),
-                column![
-                    row![
-                        label(format!("При удержании · {:.0}%", self.controls.alternate_intensity * 100.0), 14, INK),
-                        Space::new().width(Length::Fill),
-                        self.bind_button(12, self.keys[12], self.focus == focus::effects::NOISE_BIND, false, 150.0),
-                    ].spacing(8).height(30).align_y(iced::Center),
-                    frame(noise(self.controls.alternate_intensity, Msg::AlternateIntensity, 15.0), self.focus == focus::effects::ALT_INTENSITY),
-                ].spacing(5).width(Length::Fill),
-            ].spacing(20),
-        ]
-        .spacing(12);
-        if let Some(note) = note {
-            body = body.push(note);
+        if let Some((note, color)) = note {
+            body = body.push(label(note, 12, color));
         }
-        body.push(self.effects_table())
-            .push(line())
-            .push(row![monitoring, output_controls].spacing(20))
+        if !open {
+            return body.into();
+        }
+        // The headphone settings open over the page, anchored under the gear.
+        let panel = self.headphone_panel();
+        widget::stack![
+            body,
+            container(widget::opaque(panel))
+                .padding(iced::Padding { top: 138.0, right: 12.0, ..Default::default() })
+                .align_right(Length::Fill),
+        ]
+        .into()
+    }
+
+    /// Что слышите вы: processing of the sound you hear, opened from the gear.
+    fn headphone_panel(&self) -> Element<'_, Msg> {
+        use focus::headphones::*;
+        let clock = self.clock();
+        let live = matches!(self.headphone_state, 1 | 2) || self.headphone_busy;
+        let rowl = panel_row;
+        let named = |name: &'static str| -> Element<'static, Msg> { label(name, 13, DIM).into() };
+        let noise_name: Element<'static, Msg> = row![label("Шумодав", 13, DIM), Space::new().width(Length::Fill)].into();
+        let mut content = column![
+            row![
+                icon(glyph::HEADPHONES, 15, ORANGE),
+                bold("Что слышите вы", 13, INK),
+                label("звук приложений", 12, FAINT),
+                Space::new().width(Length::Fill),
+                caption_button(glyph::CLOSE, Msg::HeadphonePanel(false), false).width(28).height(28),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+            container(Space::new().height(1)).width(Length::Fill).style(|_| container::Style { background: Some(Color::from_rgb8(0x2E, 0x2F, 0x34).into()), ..Default::default() }),
+            row![
+                label(if live { "Обработка наушников включена" } else { "Обработка наушников выключена" }, 12, if live { GREEN } else { FAINT }),
+                Space::new().width(Length::Fill),
+                action(label(if live { "Остановить" } else { "Включить" }, 13, if live { INK } else { ORANGE_DARK }), Msg::HeadphoneToggle, self.focus == TOGGLE, !live),
+            ]
+            .align_y(iced::Center),
+            rowl(
+                row![noise_name, frame(switch(self.headphone_denoise, Msg::HeadphoneNoise, !self.headphone_busy), self.focus == NOISE)].align_y(iced::Center).into(),
+                frame(
+                    tacho(0.0..=200.0, self.headphone_intensity * 100.0, Msg::HeadphoneIntensity, clock)
+                        .default(80.0)
+                        .red_above(100.0)
+                        .segments(16)
+                        .compact()
+                        .phase(3000.0)
+                        .enabled(self.headphone_denoise),
+                    self.focus == INTENSITY,
+                ),
+            ),
+            rowl(
+                named("Громкость"),
+                frame(
+                    tacho(0.0..=100.0, self.headphone_volume * 100.0, Msg::HeadphoneVolume, clock).default(70.0).segments(16).compact().phase(4200.0),
+                    self.focus == VOLUME,
+                ),
+            ),
+            rowl(
+                named("Высота"),
+                frame(
+                    tacho(-12.0..=12.0, self.headphone_pitch as f32, Msg::HeadphonePitch, clock)
+                        .default(0.0)
+                        .origin(0.0)
+                        .segments(16)
+                        .compact()
+                        .phase(5400.0)
+                        .format(|v| format!("{:+.0} пт", v).replace('-', "−")),
+                    self.focus == PITCH,
+                ),
+            ),
+            rowl(
+                row![label("Реверс", 13, DIM), Space::new().width(Length::Fill), frame(switch(self.headphone_reverse, Msg::HeadphoneReverse, true), self.focus == REVERSE)].align_y(iced::Center).into(),
+                label("куски по 0,2 с задом наперёд, +200 мс", 12, FAINT).into(),
+            ),
+        ]
+        .spacing(10);
+        if !self.headphone_message.is_empty() {
+            content = content.push(label(&self.headphone_message, 12, RED));
+        }
+        content = content.push(label("Выход в микшере Windows: Mic Noize Headphones. После остановки верните физические наушники.", 11, FAINT));
+        container(content)
+            .padding([14, 16])
+            .width(410)
+            .style(|_| container::Style {
+                background: Some(Color::from_rgb8(0x1F, 0x20, 0x23).into()),
+                border: Border { color: EDGE, width: 1.0, radius: 12.0.into() },
+                shadow: Shadow { color: Color { a: 0.55, ..Color::BLACK }, offset: Vector::new(0.0, 18.0), blur_radius: 40.0 },
+                ..Default::default()
+            })
             .into()
     }
-    /// One recording: play/stop on the left, its save menu on the right.
-    fn clip_cell(&self, i: usize, playing: u32) -> Element<'_, Msg> {
+
+    /// Эффекты: one aligned row per hold effect, then monitoring, Discord level and replays.
+    fn effects_view(&self) -> Element<'_, Msg> {
         use focus::effects::*;
-        let clip = &self.clips[i];
-        let lit = playing == Self::clip_id(i);
-        let failed = matches!(clip.state, SoundState::Failed(_));
-        let chosen = self.clip_menu == Some(i);
-        let focused = self.focus == CLIP_BASE + 2 * i;
-        let outlined = chosen || focused;
-        let play = button(focus_target(
-            row![
-                // U+25B8 / U+25A0 stay text glyphs; U+25B6 falls back to the colour emoji font.
-                label(if lit { "■" } else { "▸" }, 13, if failed { RED } else if lit { ORANGE } else { DIM }).width(11),
-                label(super::clip_label(&clip.name), 12, if lit { ORANGE } else { INK }),
-            ]
-            .spacing(4)
-            .align_y(iced::Center),
-            focused,
-        ))
-        .width(Length::Fill)
-        .height(CLIP_CELL)
-        .padding([0, 6])
-        .on_press(Msg::ClipPlay(i))
-        .style(move |_, status| button::Style {
-            background: Some(
-                (if lit {
-                    Color::from_rgb8(46, 39, 33)
-                } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                    Color::from_rgb8(49, 50, 54)
-                } else {
-                    PANEL
-                })
-                .into(),
-            ),
-            text_color: INK,
-            border: Border {
-                color: if outlined { ORANGE } else { Color::TRANSPARENT },
-                width: if outlined { 2.0 } else { 1.0 },
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        });
-        let save_focused = self.focus == CLIP_BASE + 2 * i + 1;
-        let save = button(focus_target(
-            container(label("↓", 13, if chosen { ORANGE } else { DIM })).center_x(Length::Fill),
-            save_focused,
-        ))
-        .width(22)
-        .height(CLIP_CELL)
-        .padding(0)
-        .on_press(Msg::ClipMenu(Some(i)))
-        .style(move |_, status| button::Style {
-            background: Some(
-                (if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                    Color::from_rgb8(49, 50, 54)
-                } else {
-                    PANEL
-                })
-                .into(),
-            ),
-            text_color: INK,
-            border: Border {
-                color: if save_focused { ORANGE } else { Color::TRANSPARENT },
-                width: if save_focused { 2.0 } else { 1.0 },
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        });
-        row![play, save].spacing(2).width(Length::Fill).into()
-    }
-    /// The last recordings of the hold effects, three per line so all six fit under the
-    /// replay key without scrolling. The header line carries the block's title, or the
-    /// result of the last save, or the two save targets while a menu is open.
-    fn clips_view(&self) -> Element<'_, Msg> {
-        use focus::effects::*;
-        let head: Element<'_, Msg> = match self.clip_menu.filter(|i| *i < self.clips.len()) {
-            Some(i) => row![
-                label("Сохранить:", 12, DIM),
-                action(
-                    label("В папку саундпада", 12, INK),
-                    Msg::ClipSave(i, true),
-                    self.focus == CLIP_TO_SOUNDPAD,
-                    false,
-                )
-                .padding([2, 8]),
-                action(
-                    label("В другую папку", 12, INK),
-                    Msg::ClipSave(i, false),
-                    self.focus == CLIP_TO_FOLDER,
-                    false,
-                )
-                .padding([2, 8]),
-            ]
-            .spacing(6)
-            .align_y(iced::Center)
-            .into(),
-            None if !self.clip_note.is_empty() => {
-                let saved = self.clip_note.starts_with("Сохранено");
-                let hint = self.clip_note.starts_with("Выберите");
-                label(&self.clip_note, 11, if saved { GREEN } else if hint { DIM } else { RED }).into()
-            }
-            None => label("Последние записи", 12, DIM).into(),
-        };
-        let mut list = column![container(head).height(CLIP_CELL).center_y(CLIP_CELL)]
-            .spacing(4)
-            .width(Length::Fill);
-        if self.clips.is_empty() {
-            return list
-                .push(label(
-                    "Появятся после эффектов удержания: высоты, замедления, ускорения или реверса.",
-                    11,
-                    DIM,
-                ))
-                .into();
-        }
-        let playing = self.sound_playing.0;
-        for line in (0..self.clips.len()).collect::<Vec<_>>().chunks(CLIPS_PER_LINE) {
-            let mut cells = row![].spacing(6);
-            for &i in line {
-                cells = cells.push(self.clip_cell(i, playing));
-            }
-            // Keep a short last line in the same column widths as a full one.
-            for _ in line.len()..CLIPS_PER_LINE {
-                cells = cells.push(Space::new().width(Length::Fill));
-            }
-            list = list.push(cells);
-        }
-        list.into()
-    }
-    fn effects_table(&self) -> Element<'_, Msg> {
-        let mut rows = column![
-            row![
-                label("Эффект / значение", 12, DIM).width(Length::Fill),
-                label("Хоткей · микрофон", 12, DIM).width(150),
-                label("Хоткей · Discord", 12, DIM).width(150)
-            ]
-            .spacing(12),
-            line(),
-        ]
-        .spacing(8);
+        let clock = self.clock();
+        let grid = effect_grid;
+        let head = grid(
+            Space::new().into(),
+            label("Эффект", 12, FAINT).into(),
+            label("Сила", 12, FAINT).into(),
+            row![icon(glyph::MIC, 11, FAINT), label("Мой голос", 12, FAINT)].spacing(6).align_y(iced::Center).into(),
+            row![icon(glyph::OUTPUT, 11, FAINT), label("Голоса Discord", 12, FAINT)].spacing(6).align_y(iced::Center).into(),
+        )
+        .padding([0, 13]);
+        let mut rows = column![head].spacing(6);
         for i in 0..5 {
-            use focus::effects::*;
-            let (title, value, focus, bind_focus, active) = match i {
+            let (name, glyph, sub, control, bind_focus, active): (&str, &str, Element<'_, Msg>, Element<'_, Msg>, usize, bool) = match i {
                 0 => (
                     "Усиление",
-                    format!("{:.0}%", self.controls.boost * 100.0),
-                    BOOST,
+                    glyph::BOOST,
+                    row![frame(switch(self.controls.overload, Msg::Overload, true), self.focus == OVERLOAD), label("перегрузка", 11, FAINT)]
+                        .spacing(2)
+                        .align_y(iced::Center)
+                        .into(),
+                    frame(
+                        tacho(100.0..=2000.0, self.controls.boost * 100.0, Msg::Boost, clock)
+                            .step(10.0)
+                            .default(300.0)
+                            .red_above(1600.0)
+                            .segments(16)
+                            .compact()
+                            .phase(0.0),
+                        self.focus == BOOST,
+                    ),
                     BOOST_BIND,
                     self.snapshot.boost_active != 0,
                 ),
                 1 => (
                     "Высота",
-                    format!("{:+} полутонов", self.controls.pitch),
-                    PITCH,
+                    glyph::NOTE,
+                    label("полутоны", 11, FAINT).into(),
+                    frame(
+                        tacho(-12.0..=12.0, self.controls.pitch as f32, Msg::Pitch, clock)
+                            .default(-5.0)
+                            .origin(0.0)
+                            .segments(16)
+                            .compact()
+                            .phase(150.0)
+                            .format(|v| format!("{:+.0}", v).replace('-', "−")),
+                        self.focus == PITCH,
+                    ),
                     PITCH_BIND,
                     self.snapshot.pitch_active != 0,
                 ),
+                // Mirrored so that, as on every other slider, more orange means a stronger
+                // effect: ×0.50 (slowest) sits on the right.
                 2 => (
                     "Замедление",
-                    format!("×{:.2}", self.controls.slow),
-                    SLOW,
+                    glyph::SLOW,
+                    label("запись, пока держите", 11, FAINT).into(),
+                    frame(
+                        tacho(-95.0..=-50.0, -self.controls.slow * 100.0, |v| Msg::Slow(-v), clock)
+                            .step(5.0)
+                            .default(-70.0)
+                            .segments(16)
+                            .compact()
+                            .phase(300.0)
+                            .format(|v| format!("×{:.2}", -v / 100.0)),
+                        self.focus == SLOW,
+                    ),
                     SLOW_BIND,
                     (1..=8).contains(&self.phrase_state) && self.phrase_state % 2 == 1,
                 ),
                 3 => (
                     "Ускорение",
-                    format!("×{:.2}", self.controls.fast),
-                    FAST,
+                    glyph::FAST,
+                    label("запись, пока держите", 11, FAINT).into(),
+                    frame(
+                        tacho(105.0..=200.0, self.controls.fast * 100.0, Msg::Fast, clock)
+                            .step(5.0)
+                            .default(150.0)
+                            .segments(16)
+                            .compact()
+                            .phase(450.0)
+                            .format(|v| format!("×{:.2}", v / 100.0)),
+                        self.focus == FAST,
+                    ),
                     FAST_BIND,
                     (1..=8).contains(&self.phrase_state) && self.phrase_state % 2 == 0,
                 ),
                 _ => (
                     "Реверс",
-                    "После отпускания".into(),
-                    focus::NONE,
+                    glyph::REVERSE,
+                    label("после отпускания", 11, FAINT).into(),
+                    self.reverse_demo(),
                     REVERSE_BIND,
                     self.phrase_state >= 9,
                 ),
             };
-            let control: Element<'_, Msg> = match i {
-                0 => frame(
-                    slider(100.0..=2000.0, self.controls.boost * 100.0, Msg::Boost)
-                        .step(10.0_f32)
-                        .default(300.0_f32)
-                        .style(slider_style),
-                    self.focus == focus,
-                ),
-                1 => frame(
-                    marked_slider(-12.0..=12.0, self.controls.pitch as f32, Msg::Pitch, 1.0, -5.0, Rail::Signed, 1.0),
-                    self.focus == focus,
-                ),
-                // Mirrored so that, as on every other slider, more orange means a stronger
-                // effect: ×0.50 (slowest) sits on the right.
-                2 => frame(
-                    slider(-95.0..=-50.0, -self.controls.slow * 100.0, |v| Msg::Slow(-v))
-                        .step(5.0_f32)
-                        .default(-70.0_f32)
-                        .style(slider_style),
-                    self.focus == focus,
-                ),
-                3 => frame(
-                    slider(105.0..=200.0, self.controls.fast * 100.0, Msg::Fast)
-                        .step(5.0_f32)
-                        .default(150.0_f32)
-                        .style(slider_style),
-                    self.focus == focus,
-                ),
-                _ => Space::new().into(),
-            };
-            let mut heading = row![
-                bold(title, 14, if active { ORANGE } else { INK }),
-                Space::new().width(Length::Fill),
-                label(value, 13, INK)
-            ]
-            .spacing(8)
-            .align_y(iced::Center);
-            if i == 0 {
-                heading = heading.push(frame(
-                    widget::checkbox(self.controls.overload)
-                        .label("Перегрузка")
-                        .size(16)
-                        .text_size(12)
-                        .style(check_style)
-                        .on_toggle(Msg::Overload),
-                    self.focus == OVERLOAD,
-                ));
-            }
-            let parameter = column![heading, control,].spacing(4).width(Length::Fill);
             let binding = |discord: bool| {
                 let lit = active && self.discord_source == discord;
                 let target = i + if discord { 5 } else { 0 };
@@ -907,21 +1000,38 @@ impl App {
                     150.0,
                 )
             };
-            rows = rows.push(
-                row![parameter, binding(false), binding(true)]
-                    .spacing(12)
-                    .align_y(iced::Center),
+            let line = grid(
+                container(icon(glyph, 16, if active { ORANGE } else { Color::from_rgb8(0xCF, 0xCB, 0xC2) }))
+                    .width(36)
+                    .height(36)
+                    .center(36)
+                    .style(move |_| container::Style {
+                        background: Some((if active { Color { a: 0.14, ..ORANGE } } else { Color::from_rgb8(0x25, 0x26, 0x2A) }).into()),
+                        border: Border { radius: 8.0.into(), ..Border::default() },
+                        ..Default::default()
+                    })
+                    .into(),
+                column![bold(name, 14, INK), sub].spacing(2).into(),
+                control,
+                binding(false),
+                binding(true),
             );
-            rows = rows.push(line());
+            rows = rows.push(
+                container(line)
+                    .padding([8, 12])
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some((if active { LIVE_BG } else { CARD }).into()),
+                        border: Border { color: if active { Color { a: 0.45, ..ORANGE } } else { LINE }, width: 1.0, radius: 10.0.into() },
+                        ..Default::default()
+                    }),
+            );
         }
         // Values mirror mic::PhraseEffect::State in src/effects.hpp: 1/2 record slow/fast,
         // 3/4 play slow/fast, 5/6 tail capture, 7/8 limit reached, 9 record reverse,
         // 10 reverse pause, 11 reverse limit, 12 play reverse.
         let status = match self.phrase_state {
-            1 | 2 | 9 => format!(
-                "Запись {:.1} / 10 с · отпустите хоткей",
-                self.phrase_seconds
-            ),
+            1 | 2 | 9 => format!("Запись {:.1} / 10 с · отпустите хоткей", self.phrase_seconds),
             10 => "Пауза 0,15 с перед реверсом…".into(),
             3 | 4 | 12 => format!("Воспроизведение · осталось {:.1} с", self.phrase_seconds),
             5 | 6 => "Завершаем последний слог…".into(),
@@ -930,35 +1040,272 @@ impl App {
         };
         if self.phrase_state != 0 {
             rows = rows.push(
-                container(
-                    row![
-                        label(
-                            status,
-                            12,
-                            if self.phrase_state != 0 { ORANGE } else { DIM }
-                        )
-                        .width(Length::Fill),
-                        action(
-                            label("Отмена", 12, INK),
-                            Msg::CancelPhrase,
-                            self.focus == focus::effects::CANCEL_PHRASE,
-                            false
-                        )
-                        .on_press_maybe((self.phrase_state != 0).then_some(Msg::CancelPhrase)),
-                    ]
-                    .spacing(8)
-                    .align_y(iced::Center),
-                )
-                .height(44)
-                .center_y(44),
+                row![
+                    label(status, 12, ORANGE).width(Length::Fill),
+                    action(label("Отмена", 12, INK), Msg::CancelPhrase, self.focus == CANCEL_PHRASE, false),
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
             );
         }
         if self.discord_state == 3 {
             rows = rows.push(label(&self.discord_message, 12, RED));
         }
-        rows.into()
+        let full_monitor = if self.monitor_all { self.monitor } else { 0 };
+        let can_monitor = !self.busy && !self.quitting && matches!(self.snapshot.state, 2 | 3);
+        let monitor_note = if self.monitor_all && matches!(self.monitor, 1 | 2) {
+            "Сейчас слышен весь голос; режим эффектов сохранён."
+        } else if self.effect_monitoring() && self.monitor == 1 {
+            "Подключение наушников…"
+        } else if self.effect_monitoring() && self.monitor == 3 {
+            "Ошибка прослушивания — см. сообщение сверху."
+        } else {
+            ""
+        };
+        let mut hear = column![
+            heading_row(glyph::HEADPHONES, "Слышать себя", Space::new().into()),
+            row![
+                action(
+                    label(
+                        match full_monitor {
+                            1 => "Подключение…",
+                            2 => "Слышу весь голос",
+                            _ => "Весь голос",
+                        },
+                        13,
+                        if full_monitor == 2 { ORANGE_DARK } else if can_monitor { INK } else { FAINT },
+                    ),
+                    Msg::Monitor,
+                    self.focus == MONITOR,
+                    full_monitor == 2,
+                )
+                .on_press_maybe(can_monitor.then_some(Msg::Monitor)),
+                self.bind_button(10, self.keys[10], self.focus == MONITOR_BIND, false, 140.0),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+            row![
+                frame(switch(self.effects_monitor, Msg::EffectsMonitor, true), self.focus == EFFECTS_MONITOR),
+                label("эффекты", 12, DIM),
+                Space::new().width(16),
+                frame(switch(self.boost_monitor, Msg::BoostMonitor, true), self.focus == BOOST_MONITOR),
+                label("усиление", 12, DIM),
+            ]
+            .spacing(4)
+            .align_y(iced::Center),
+        ]
+        .spacing(8);
+        if !monitor_note.is_empty() {
+            hear = hear.push(label(monitor_note, 11, FAINT));
+        }
+        let discord = column![
+            heading_row(glyph::VOLUME, "Громкость Discord", label("ваш голос не трогает", 11, FAINT).into()),
+            frame(
+                tacho(0.0..=DISCORD_VOLUME_MAX_PERCENT, discord_volume_percent(self.controls.discord_volume), Msg::DiscordVolume, clock)
+                    .default(100.0)
+                    .segments(18)
+                    .compact()
+                    .phase(600.0),
+                self.focus == DISCORD_VOLUME,
+            ),
+        ]
+        .spacing(8);
+        let replay = column![
+            heading_row(glyph::REPEAT, "Повтор последнего", self.bind_button(11, self.keys[11], self.focus == REPLAY_BIND, false, 140.0)),
+            self.clips_view(),
+        ]
+        .spacing(8)
+        .width(Length::FillPortion(135));
+        let bottom = card(
+            row![column![hear, discord].spacing(14).width(Length::FillPortion(100)), replay].spacing(24),
+        )
+        .padding([13, 16]);
+        column![title("Эффекты"), rows, bottom].spacing(14).into()
     }
+
+    /// Reverse row: a practice word that turns around; click it to type your own.
+    fn reverse_demo(&self) -> Element<'_, Msg> {
+        if self.reverse_edit {
+            return frame(
+                text_input("ваше слово", &self.reverse_word)
+                    .id("reverse-word")
+                    .size(14)
+                    .padding([4, 8])
+                    .width(180)
+                    .on_input(Msg::ReverseWord)
+                    .on_submit(Msg::ReverseEdit(false))
+                    .style(input_style),
+                self.focus == focus::effects::REVERSE_WORD,
+            );
+        }
+        frame(
+            button(tacho::reverse_word(&self.reverse_word, self.clock()))
+                .padding([2, 4])
+                .on_press(Msg::ReverseEdit(true))
+                .style(|_, status| button::Style {
+                    background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+                        .then(|| Color::from_rgb8(0x22, 0x23, 0x27).into()),
+                    text_color: INK,
+                    border: Border { radius: 6.0.into(), ..Border::default() },
+                    ..Default::default()
+                }),
+            self.focus == focus::effects::REVERSE_WORD,
+        )
+    }
+
+    /// The newest recording large, the other five as chips; each can be played and saved.
+    fn clips_view(&self) -> Element<'_, Msg> {
+        use focus::effects::*;
+        if self.clips.is_empty() {
+            return label("Появятся после эффектов удержания: высоты, замедления, ускорения или реверса.", 12, FAINT).into();
+        }
+        let (playing, position, length) = self.sound_playing;
+        let progress = |i: usize| -> Option<f32> {
+            (playing == Self::clip_id(i)).then(|| if length > 0.0 { (position / length).clamp(0.0, 1.0) } else { 0.0 })
+        };
+        let save_button = |i: usize| {
+            let focused = self.focus == CLIP_BASE + 2 * i + 1;
+            let chosen = self.clip_menu == Some(i);
+            button(focus_target(container(icon(glyph::SAVE, 12, if chosen { ORANGE_DARK } else { DIM })).center(Length::Fill), focused))
+                .width(30)
+                .height(Length::Fill)
+                .padding(0)
+                .on_press(Msg::ClipMenu(Some(i)))
+                .style(move |_, status| {
+                    let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                    button::Style {
+                        background: Some((if chosen || hover { ORANGE } else { Color::TRANSPARENT }).into()),
+                        text_color: INK,
+                        border: Border { color: if focused { ORANGE } else { Color::TRANSPARENT }, width: 2.0, radius: 6.0.into() },
+                        ..Default::default()
+                    }
+                })
+        };
+        let hero = {
+            let clip = &self.clips[0];
+            let p = progress(0);
+            let failed = matches!(clip.state, SoundState::Failed(_));
+            let focused = self.focus == CLIP_BASE;
+            let play = button(focus_target(
+                container(icon(if p.is_some() { glyph::STOP } else { glyph::PLAY }, 14, ORANGE_DARK)).center(Length::Fill),
+                focused,
+            ))
+            .width(40)
+            .height(40)
+            .padding(0)
+            .on_press(Msg::ClipPlay(0))
+            .style(move |_, status| button::Style {
+                background: Some((if matches!(status, button::Status::Hovered | button::Status::Pressed) { Color::from_rgb8(0xFF, 0xB0, 0x70) } else { ORANGE }).into()),
+                text_color: ORANGE_DARK,
+                border: Border { color: if focused { INK } else { Color::TRANSPARENT }, width: 2.0, radius: 8.0.into() },
+                ..Default::default()
+            });
+            let seconds = match clip.state {
+                SoundState::Loaded(s) => format!("{s:.1} с").replace('.', ","),
+                _ => String::new(),
+            };
+            let bar = meter(p.unwrap_or(0.0), ORANGE);
+            container(
+                row![
+                    play,
+                    column![
+                        numbers(super::clip_label(&clip.name), 14, if failed { RED } else { INK }),
+                        label(if seconds.is_empty() { "последняя запись".to_owned() } else { format!("последняя · {seconds}") }, 11, FAINT),
+                    ]
+                    .spacing(2)
+                    .width(118),
+                    container(bar).width(Length::Fill).center_y(40),
+                    save_button(0),
+                ]
+                .spacing(12)
+                .height(40)
+                .align_y(iced::Center),
+            )
+            .padding([8, 10])
+            .style(move |_| container::Style {
+                background: Some((if p.is_some() { LIVE_BG } else { CARD2 }).into()),
+                border: Border { color: if p.is_some() { Color { a: 0.6, ..ORANGE } } else { Color::from_rgb8(0x2E, 0x2F, 0x34) }, width: 1.0, radius: 10.0.into() },
+                ..Default::default()
+            })
+        };
+        let chip = |i: usize| -> Element<'_, Msg> {
+            let clip = &self.clips[i];
+            let p = progress(i);
+            let focused = self.focus == CLIP_BASE + 2 * i;
+            let failed = matches!(clip.state, SoundState::Failed(_));
+            let play = button(focus_target(
+                row![
+                    icon(if p.is_some() { glyph::STOP } else { glyph::PLAY }, 9, if p.is_some() { ORANGE } else { DIM }),
+                    numbers(super::clip_label(&clip.name), 13, if failed { RED } else if p.is_some() { ORANGE } else { INK }),
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+                focused,
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding([0, 10])
+            .on_press(Msg::ClipPlay(i))
+            .style(move |_, status| button::Style {
+                background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| HOVER.into()),
+                text_color: INK,
+                border: Border { color: if focused { ORANGE } else { Color::TRANSPARENT }, width: 2.0, radius: 6.0.into() },
+                ..Default::default()
+            });
+            container(row![play, save_button(i)].height(34))
+                .style(move |_| container::Style {
+                    background: Some((if p.is_some() { LIVE_BG } else { CARD2 }).into()),
+                    border: Border { color: if p.is_some() { Color { a: 0.6, ..ORANGE } } else { Color::from_rgb8(0x2E, 0x2F, 0x34) }, width: 1.0, radius: 7.0.into() },
+                    ..Default::default()
+                })
+                .width(Length::Fill)
+                .into()
+        };
+        let mut list = column![hero].spacing(6);
+        match self.clip_menu.filter(|i| *i < self.clips.len()) {
+            Some(i) => {
+                list = list.push(
+                    row![
+                        label(format!("Сохранить «{}»", super::clip_label(&self.clips[i].name)), 12, DIM),
+                        action(label("В саундпад", 12, INK), Msg::ClipSave(i, true), self.focus == CLIP_TO_SOUNDPAD, false),
+                        action(label("В папку…", 12, INK), Msg::ClipSave(i, false), self.focus == CLIP_TO_FOLDER, false),
+                        caption_button(glyph::CLOSE, Msg::ClipMenu(None), false).width(30).height(30),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Center),
+                );
+            }
+            None if !self.clip_note.is_empty() => {
+                let saved = self.clip_note.starts_with("Сохранено");
+                let hint = self.clip_note.starts_with("Выберите");
+                list = list.push(
+                    row![
+                        icon(if saved { glyph::CHECK } else { glyph::WARNING }, 12, if saved { GREEN } else if hint { DIM } else { RED }),
+                        label(&self.clip_note, 12, if saved { GREEN } else if hint { DIM } else { RED }),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Center),
+                );
+            }
+            None => {}
+        }
+        let others: Vec<usize> = (1..self.clips.len()).collect();
+        for line in others.chunks(3) {
+            let mut cells = row![].spacing(6);
+            for &i in line {
+                cells = cells.push(chip(i));
+            }
+            for _ in line.len()..3 {
+                cells = cells.push(Space::new().width(Length::Fill));
+            }
+            list = list.push(cells);
+        }
+        list.into()
+    }
+
     fn rvc_view(&self) -> Element<'_, Msg> {
+        use focus::rvc::*;
+        let clock = self.clock();
         let rvc_status = match self.snapshot.rvc_state {
             1 => "Загрузка / буферизация модели…".into(),
             2 => format!(
@@ -970,288 +1317,141 @@ impl App {
             _ if self.controls.rvc => "Включится вместе с обработкой".into(),
             _ => "Выключено".into(),
         };
-        let runtime_action: Element<'_, Msg> = if self.rvc_runtime_installed {
-            Space::new().into()
-        } else {
-            // Without the runtime this is the only thing on the page that does anything, so it
-            // is the page's one orange button.
-            action(
-                label(
-                    if self.rvc_runtime_installing {
-                        "Установка RVC…"
-                    } else {
-                        "Установить RVC runtime"
-                    },
-                    13,
-                    BG,
-                ),
-                Msg::RvcInstall,
-                self.focus == focus::rvc::INSTALL,
-                true,
-            )
-            .on_press_maybe((!self.rvc_runtime_installing).then_some(Msg::RvcInstall))
-            .into()
-        };
-        let mut content = column![
+        let mut top = column![
             row![
-                bold(
-                    "Голос по модели · RVC",
-                    15,
-                    if self.snapshot.rvc_state == 2 {
-                        GREEN
-                    } else {
-                        INK
-                    }
-                ),
-                Space::new().width(Length::Fill),
-                frame(
-                    widget::checkbox(self.controls.rvc)
-                        .label("Включён")
-                        .text_size(13)
-                        .size(16)
-                        .on_toggle(Msg::Rvc),
-                    self.focus == focus::rvc::ENABLE
-                )
-            ]
-            .align_y(iced::Center),
-            label(
-                rvc_status,
-                12,
-                if self.snapshot.rvc_state == 3 {
-                    RED
-                } else {
-                    DIM
-                }
-            ),
-            runtime_action,
-            row![
-                container(frame(
-                    pick_list(
-                        self.rvc_models.as_slice(),
-                        self.rvc_models
-                            .iter()
-                            .find(|m| m.slot == self.controls.rvc_options.slot)
-                            .cloned(),
-                        Msg::RvcModel
-                    )
-                    .placeholder("Выберите модель")
-                    .width(Length::Fill),
-                    self.focus == focus::rvc::MODEL,
-                ))
+                tile(glyph::VOICE, 44.0, self.controls.rvc),
+                column![
+                    bold("Голос по модели RVC", 15, if self.snapshot.rvc_state == 2 { GREEN } else { INK }),
+                    label(rvc_status, 12, if self.snapshot.rvc_state == 3 { RED } else { DIM }),
+                ]
+                .spacing(2)
                 .width(Length::Fill),
-                action(
-                    label(
-                        if self.rvc_importing {
-                            "Импорт…"
-                        } else {
-                            "Импорт модели"
-                        },
-                        13,
-                        if self.rvc_importing || !self.rvc_runtime_installed { DIM } else { INK }
-                    ),
-                    Msg::RvcImport,
-                    self.focus == focus::rvc::IMPORT,
-                    false,
-                )
-                .on_press_maybe(
-                    (self.rvc_runtime_installed && !self.rvc_importing).then_some(Msg::RvcImport),
-                )
+                frame(switch(self.controls.rvc, Msg::Rvc, self.rvc_runtime_installed), self.focus == ENABLE),
             ]
-            .spacing(10)
+            .spacing(12)
             .align_y(iced::Center),
-            row![
-                container(frame(
-                    text_input("Название модели", &self.rvc_name)
-                        .id("rvc-name")
-                        .on_input_maybe(self.rvc_can_manage().then_some(Msg::RvcName))
-                        .on_submit_maybe(self.rvc_can_manage().then_some(Msg::RvcRename)),
-                    self.focus == focus::rvc::NAME,
-                ))
-                .width(Length::Fill),
-                action(
-                    label(
-                        "Переименовать",
-                        12,
-                        if self.rvc_can_manage() { INK } else { DIM },
-                    ),
-                    Msg::RvcRename,
-                    self.focus == focus::rvc::RENAME,
-                    false,
-                )
-                .on_press_maybe(self.rvc_can_manage().then_some(Msg::RvcRename)),
-                action(
-                    label(
-                        if self.rvc_delete_confirm {
-                            "Удалить ещё раз"
-                        } else {
-                            "Удалить"
-                        },
-                        12,
-                        if self.rvc_can_manage() { RED } else { DIM },
-                    ),
-                    Msg::RvcDelete,
-                    self.focus == focus::rvc::DELETE,
-                    false,
-                )
-                .on_press_maybe(self.rvc_can_manage().then_some(Msg::RvcDelete)),
-            ]
-            .spacing(10)
-            .align_y(iced::Center),
-            line(),
-            heading("Тон модели", format!("{:+} полутонов", self.controls.rvc_options.pitch)),
-            frame(
-                marked_slider(-24.0..=24.0, self.controls.rvc_options.pitch as f32, Msg::RvcPitch, 1.0, 0.0, Rail::Signed, 1.0),
-                self.focus == focus::rvc::PITCH
-            ),
-            action(
-                label(
-                    if self.rvc_advanced {
-                        "Скрыть параметры"
-                    } else {
-                        "Дополнительные параметры"
-                    },
-                    13,
-                    INK
-                ),
-                Msg::RvcAdvanced,
-                self.focus == focus::rvc::ADVANCED,
-                false
-            ),
         ]
         .spacing(12);
+        if !self.rvc_runtime_installed {
+            // Without the runtime this is the only thing on the page that does anything, so it
+            // is the page's one orange button.
+            top = top.push(
+                action(
+                    label(if self.rvc_runtime_installing { "Установка RVC…" } else { "Установить RVC runtime" }, 13, ORANGE_DARK),
+                    Msg::RvcInstall,
+                    self.focus == INSTALL,
+                    true,
+                )
+                .on_press_maybe((!self.rvc_runtime_installing).then_some(Msg::RvcInstall)),
+            );
+        }
+        let model = card(
+            column![
+                row![
+                    container(frame(
+                        pick_list(
+                            self.rvc_models.as_slice(),
+                            self.rvc_models.iter().find(|m| m.slot == self.controls.rvc_options.slot).cloned(),
+                            Msg::RvcModel,
+                        )
+                        .placeholder("Выберите модель")
+                        .text_size(13)
+                        .padding([6, 10])
+                        .width(Length::Fill)
+                        .style(device_style),
+                        self.focus == MODEL,
+                    ))
+                    .width(Length::Fill),
+                    action(
+                        label(if self.rvc_importing { "Импорт…" } else { "Импорт модели" }, 13, if self.rvc_importing || !self.rvc_runtime_installed { FAINT } else { INK }),
+                        Msg::RvcImport,
+                        self.focus == IMPORT,
+                        false,
+                    )
+                    .on_press_maybe((self.rvc_runtime_installed && !self.rvc_importing).then_some(Msg::RvcImport)),
+                ]
+                .spacing(10)
+                .align_y(iced::Center),
+                row![
+                    container(frame(
+                        text_input("Название модели", &self.rvc_name)
+                            .id("rvc-name")
+                            .size(13)
+                            .padding([6, 10])
+                            .on_input_maybe(self.rvc_can_manage().then_some(Msg::RvcName))
+                            .on_submit_maybe(self.rvc_can_manage().then_some(Msg::RvcRename))
+                            .style(input_style),
+                        self.focus == NAME,
+                    ))
+                    .width(Length::Fill),
+                    action(label("Переименовать", 12, if self.rvc_can_manage() { INK } else { FAINT }), Msg::RvcRename, self.focus == RENAME, false)
+                        .on_press_maybe(self.rvc_can_manage().then_some(Msg::RvcRename)),
+                    action(
+                        label(if self.rvc_delete_confirm { "Удалить ещё раз" } else { "Удалить" }, 12, if self.rvc_can_manage() { RED } else { FAINT }),
+                        Msg::RvcDelete,
+                        self.focus == DELETE,
+                        false,
+                    )
+                    .on_press_maybe(self.rvc_can_manage().then_some(Msg::RvcDelete)),
+                ]
+                .spacing(10)
+                .align_y(iced::Center),
+            ]
+            .spacing(10),
+        );
+        let pitch = card(
+            column![
+                heading_row(glyph::NOTE, "Тон модели", label("от −24 до +24 полутонов", 11, FAINT).into()),
+                frame(
+                    tacho(-24.0..=24.0, self.controls.rvc_options.pitch as f32, Msg::RvcPitch, clock)
+                        .default(0.0)
+                        .origin(0.0)
+                        .segments(24)
+                        .format(|v| format!("{:+.0} пт", v).replace('-', "−")),
+                    self.focus == PITCH,
+                ),
+                action(label(if self.rvc_advanced { "Скрыть параметры" } else { "Дополнительные параметры" }, 13, INK), Msg::RvcAdvanced, self.focus == ADVANCED, false),
+            ]
+            .spacing(10),
+        );
+        let mut content = column![title("Смена голоса"), top, model, pitch].spacing(14);
         if !self.rvc_import_note.is_empty() {
             content = content.push(label(&self.rvc_import_note, 12, DIM));
         }
         if self.rvc_advanced {
-            content = content.push(column![
-                    line(),
-                    heading("Влияние индекса", format!("{}%", self.controls.rvc_options.index)),
-                    if self.rvc_has_index() {
-                        frame(slider(0.0..=100.0, self.controls.rvc_options.index as f32, Msg::RvcIndex).step(1.0_f32).default(0.0_f32).style(slider_style), self.focus == focus::rvc::INDEX)
-                    } else { label("Недоступно без .index", 12, DIM).into() },
-                    label(if self.rvc_has_index() {
-                        "Индекс усиливает сходство с обучающими примерами модели"
-                    } else {"У этой модели нет .index — регулятор индекса не влияет на звук"}, 11, DIM),
-                    line(),
-                    heading("Вход модели", format!("{}%", self.controls.rvc_options.gain)),
-                    frame(marked_slider(50.0..=300.0, self.controls.rvc_options.gain as f32, Msg::RvcGain, 5.0, 100.0, Rail::Tick(100.0), 1.0), self.focus == focus::rvc::GAIN),
-                    line(),
+            let index: Element<'_, Msg> = if self.rvc_has_index() {
+                frame(tacho(0.0..=100.0, self.controls.rvc_options.index as f32, Msg::RvcIndex, clock).default(0.0).segments(20).compact().phase(900.0), self.focus == INDEX)
+            } else {
+                label("Недоступно без .index", 12, FAINT).into()
+            };
+            content = content.push(card(
+                column![
+                    heading_row(glyph::CHIP, "Влияние индекса", Space::new().into()),
+                    index,
+                    label(
+                        if self.rvc_has_index() { "Индекс усиливает сходство с обучающими примерами модели" } else { "У этой модели нет .index — регулятор индекса не влияет на звук" },
+                        11,
+                        FAINT,
+                    ),
+                    heading_row(glyph::VOLUME, "Вход модели", Space::new().into()),
+                    frame(tacho(50.0..=300.0, self.controls.rvc_options.gain as f32, Msg::RvcGain, clock).step(5.0).default(100.0).segments(20).compact().phase(1800.0), self.focus == GAIN),
                     row![
-                        label("Блок аудио, мс", 13, INK),
-                        frame(pick_list(rvc::CHUNKS, Some(self.controls.rvc_options.chunk), Msg::RvcChunk), self.focus == focus::rvc::CHUNK),
+                        label("Блок аудио, мс", 13, DIM),
+                        frame(pick_list(rvc::CHUNKS, Some(self.controls.rvc_options.chunk), Msg::RvcChunk).style(device_style), self.focus == CHUNK),
                         Space::new().width(Length::Fill),
-                        action(label("Обновить модели", 12, INK), Msg::RvcRefresh, self.focus == focus::rvc::REFRESH, false),
-                    ].spacing(10).align_y(iced::Center),
-                    label("Задержка = блок + 200 мс, всегда постоянная. При лаге модели — тишина, не обычный голос. 100–150 мс: меньше задержка, выше нагрузка.", 11, DIM),
-
-                    label("Только микрофон. Выключение завершает сервер и выгружает модель; повторный запуск требует загрузки.", 11, DIM)
-            ].spacing(12));
+                        action(label("Обновить модели", 12, INK), Msg::RvcRefresh, self.focus == REFRESH, false),
+                    ]
+                    .spacing(10)
+                    .align_y(iced::Center),
+                    label("Задержка = блок + 200 мс, всегда постоянная. При лаге модели — тишина, не обычный голос. 100–150 мс: меньше задержка, выше нагрузка.", 11, FAINT),
+                    label("Только микрофон. Выключение завершает сервер и выгружает модель; повторный запуск требует загрузки.", 11, FAINT),
+                ]
+                .spacing(10),
+            ));
         }
-        // Same page anatomy as Наушники: no card, bold name left / value right, full-width
-        // slider below, rules between groups.
         content.into()
     }
-    fn headphone_view(&self) -> Element<'_, Msg> {
-        let locked = matches!(self.headphone_state, 1 | 2) || self.headphone_busy;
-        let route = row![
-            label("Звук приложений", 12, DIM),
-            label("›", 18, ORANGE),
-            label(
-                if self.headphone_denoise {
-                    "NVIDIA"
-                } else {
-                    "Без обработки"
-                },
-                12,
-                INK
-            ),
-            label("›", 18, ORANGE),
-            container(frame(
-                pick_list(
-                    self.headphone_outputs(),
-                    self.headphone_output.clone(),
-                    Msg::HeadphoneOutput
-                )
-                .placeholder("Выберите наушники")
-                .text_size(12)
-                .padding([4, 6])
-                .width(Length::Fill)
-                .style(device_style),
-                self.focus == focus::headphones::OUTPUT,
-            ))
-            .width(Length::Fill),
-        ]
-        .spacing(12)
-        .align_y(iced::Center);
-        let mut body = column![route].spacing(12);
-        // One column: the start/stop action first, then each switch sits on its own slider.
-        // The NVIDIA box is the heading of the strength slider it enables (switchable while
-        // running); without it the route is "Без обработки" and the slider fades.
-        let mut params = column![
-            action(
-                container(label(if locked { "Остановить" } else { "Включить наушники" }, 13, BG)).center_x(Length::Fill),
-                Msg::HeadphoneToggle,
-                self.focus == focus::headphones::TOGGLE,
-                true,
-            )
-            .width(Length::Fill),
-            line(),
-            row![
-                frame(
-                    widget::checkbox(self.headphone_denoise)
-                        .label("Шумодав NVIDIA")
-                        .size(16)
-                        .text_size(14)
-                        .font(Font { weight: iced::font::Weight::Semibold, ..Font::with_name("Segoe UI") })
-                        .style(check_style)
-                        .on_toggle_maybe((!self.headphone_busy).then_some(Msg::HeadphoneNoise)),
-                    self.focus == focus::headphones::NOISE,
-                ),
-                Space::new().width(Length::Fill),
-                label(format!("{:.0}%", self.headphone_intensity * 100.0), 13, if self.headphone_denoise { INK } else { DIM }),
-            ]
-            .align_y(iced::Center),
-            frame(marked_slider(0.0..=200.0, self.headphone_intensity * 100.0, Msg::HeadphoneIntensity, 1.0, 80.0, Rail::Tick(100.0), if self.headphone_denoise { 1.0 } else { 0.35 }), self.focus == focus::headphones::INTENSITY),
-        ].spacing(12);
-        if self.headphone_intensity > 1.0 {
-            params = params.push(label("Выше 100%: запрос вне диапазона NVIDIA. SDK может отклонить его или не усилить эффект.", 12, ORANGE));
-        }
-        let params = params.extend([
-            line(),
-            row![bold("Громкость", 14, INK), Space::new().width(Length::Fill), label(format!("{:.0}%", self.headphone_volume * 100.0), 13, INK)].into(),
-            frame(slider(0.0..=100.0, self.headphone_volume * 100.0, Msg::HeadphoneVolume).step(1.0_f32).default(70.0_f32).style(slider_style), self.focus == focus::headphones::VOLUME),
-            line(),
-            row![bold("Высота", 14, INK), Space::new().width(Length::Fill), label(format!("{:+} полутонов", self.headphone_pitch), 13, INK)].into(),
-            frame(marked_slider(-12.0..=12.0, self.headphone_pitch as f32, Msg::HeadphonePitch, 1.0, 0.0, Rail::Signed, 1.0), self.focus == focus::headphones::PITCH),
-            line(),
-            row![
-                frame(
-                    widget::checkbox(self.headphone_reverse)
-                        .label("Реверс")
-                        .size(16)
-                        .text_size(14)
-                        .font(Font { weight: iced::font::Weight::Semibold, ..Font::with_name("Segoe UI") })
-                        .style(check_style)
-                        .on_toggle(Msg::HeadphoneReverse),
-                    self.focus == focus::headphones::REVERSE,
-                ),
-                Space::new().width(Length::Fill),
-                label("куски по 0,2 с задом наперёд · +200 мс", 12, DIM),
-            ]
-            .align_y(iced::Center)
-            .into(),
-            line(),
-            label("Выход приложения в микшере Windows → Mic Noize Headphones. После остановки верните физические наушники.", 11, DIM).into(),
-            label("Шумодав NVIDIA подавляет и музыку, и атмосферу; переключение на ходу перезапускает звук на долю секунды.", 11, DIM).into(),
-        ]);
-        // Three lone full-width sliders read as a wall of rails on an 820 px window; a
-        // centred 600 px column keeps name, value and slider end within one glance.
-        body = body.push(container(container(params).max_width(600)).center_x(Length::Fill));
-        if !self.headphone_message.is_empty() {
-            body = body.push(label(&self.headphone_message, 13, RED));
-        }
-        body.into()
-    }
+
     /// One report to copy and send: the buttons first, the text exactly as it will be copied.
     fn logs_view(&self) -> Element<'_, Msg> {
         use focus::logs::*;
@@ -1263,143 +1463,160 @@ impl App {
         };
         column![
             row![
-                action(label(if self.logs_copied { "Скопировано" } else { "Копировать всё" }, 13, BG), Msg::LogsCopy, self.focus == COPY, true),
+                action(row![icon(glyph::BACK, 11, INK), label("Настройки", 13, INK)].spacing(8).align_y(iced::Center), Msg::Page(2), self.focus == BACK, false),
+                title("Логи"),
+            ]
+            .spacing(14)
+            .align_y(iced::Center),
+            row![
+                action(label(if self.logs_copied { "Скопировано" } else { "Копировать всё" }, 13, ORANGE_DARK), Msg::LogsCopy, self.focus == COPY, true),
                 action(label("Открыть папку", 13, INK), Msg::LogsFolder, self.focus == FOLDER, false),
                 Space::new().width(Length::Fill),
                 action(label(if self.report_sending { "Отправляем…" } else { "Отправить разработчику" }, 13, INK), Msg::SendReport, self.focus == SEND, false)
                     .on_press_maybe((!self.report_sending).then_some(Msg::SendReport)),
-            ].spacing(8).align_y(iced::Center),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
             label("Версия, видеокарта, состояние и последние строки каждого лога. Имя пользователя Windows заменено.", 12, DIM),
-            panel(report).width(Length::Fill),
-        ].spacing(12).into()
+            card(report),
+        ]
+        .spacing(12)
+        .into()
     }
+
     fn soundpad_view(&self) -> Element<'_, Msg> {
         use focus::soundpad::*;
-        let folder_name = self
-            .sound_folder
-            .as_ref()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Папка не выбрана".into());
-        let toolbar = row![
-            label(folder_name, 12, if self.sound_folder.is_some() { INK } else { DIM }).width(Length::Fill),
-            action(label("Выбрать папку", 13, INK), Msg::SoundpadFolder, self.focus == FOLDER, false)
-                .on_press_maybe((!self.sound_dialog).then_some(Msg::SoundpadFolder)),
-            action(label("Добавить звуки", 13, BG), Msg::SoundpadAdd, self.focus == ADD, true)
-                .on_press_maybe((!self.sound_dialog && self.sound_folder.is_some()).then_some(Msg::SoundpadAdd)),
-            action(label("Обновить", 13, INK), Msg::SoundpadRefresh, self.focus == REFRESH, false)
-                .on_press_maybe(self.sound_folder.is_some().then_some(Msg::SoundpadRefresh)),
-        ]
-        .spacing(8)
-        .align_y(iced::Center);
+        let clock = self.clock();
         let (playing_id, position, length) = self.sound_playing;
         let playing = playing_id != 0;
-        let controls = row![
-            column![
-                row![
-                    label("Громкость звуков", 13, INK),
-                    Space::new().width(Length::Fill),
-                    label(format!("{:.0}%", self.sound_volume * 100.0), 13, INK),
-                ],
-                frame(
-                    marked_slider(0.0..=200.0, self.sound_volume * 100.0, Msg::SoundpadVolume, 1.0, 100.0, Rail::Tick(100.0), 1.0),
-                    self.focus == VOLUME,
-                ),
-                frame(
-                    widget::checkbox(self.sound_normalize)
-                        .label("Выравнивать громкость")
-                        .text_size(13)
-                        .size(16)
-                        .style(check_style)
-                        .on_toggle(Msg::SoundpadNormalize),
-                    self.focus == NORMALIZE,
-                ),
-                label("Тихие звуки поднимаются, громкие приглушаются. Файлы не меняются.", 11, DIM),
-            ]
-            .spacing(5)
-            .width(Length::Fill),
-            column![
-                frame(
-                    widget::checkbox(self.sound_monitor)
-                        .label("Слышать звуки в наушниках")
-                        .text_size(13)
-                        .size(16)
-                        .style(check_style)
-                        .on_toggle(Msg::SoundpadHear),
-                    self.focus == HEAR,
-                ),
-                label(self.monitor_hint(), 11, if self.sound_monitor && self.monitor == 3 { RED } else { DIM }),
-                row![
-                    label("Остановить всё", 13, INK),
-                    self.bind_button(super::SOUND_STOP_BIND, self.sound_stop_key, self.focus == STOP_BIND, false, 150.0),
-                    action(label("Стоп", 12, if playing { BG } else { DIM }), Msg::SoundpadStop, false, playing)
-                        .on_press_maybe(playing.then_some(Msg::SoundpadStop)),
-                ]
-                .spacing(8)
-                .align_y(iced::Center),
-            ]
-            .spacing(6)
-            .width(Length::Fill),
-        ]
-        .spacing(20)
-        .align_y(iced::alignment::Vertical::Top);
-        let mut body = column![toolbar, controls].spacing(10);
+        let visible = self.visible_sounds();
+        let mut toolbar = row![title("Саундпад")].spacing(10).align_y(iced::Center);
+        if self.sound_folder.is_some() {
+            toolbar = toolbar.push(numbers(
+                if self.sound_filter.trim().is_empty() && self.section == super::Selection::All {
+                    format!("{}", self.sounds.len())
+                } else {
+                    format!("{} из {}", visible.len(), self.sounds.len())
+                },
+                13,
+                FAINT,
+            ));
+        }
+        toolbar = toolbar.push(Space::new().width(Length::Fill));
+        if self.sound_folder.is_some() {
+            toolbar = toolbar.push(
+                container(frame(
+                    text_input("Поиск", &self.sound_filter)
+                        .id("sound-filter")
+                        .size(13)
+                        .padding([6, 10])
+                        .on_input(Msg::SoundpadFilter)
+                        .style(input_style),
+                    self.focus == FILTER,
+                ))
+                .width(220),
+            );
+            toolbar = toolbar.push(frame(
+                pick_list(SoundSort::ALL, Some(self.sound_sort), Msg::SoundpadSort)
+                    .text_size(13)
+                    .padding([6, 10])
+                    .width(150)
+                    .style(device_style),
+                self.focus == SORT,
+            ));
+        }
+        toolbar = toolbar
+            .push(
+                action(label("Добавить звуки", 13, ORANGE_DARK), Msg::SoundpadAdd, self.focus == ADD, true)
+                    .on_press_maybe((!self.sound_dialog && self.sound_folder.is_some()).then_some(Msg::SoundpadAdd)),
+            )
+            .push(icon_button(glyph::FOLDER, Msg::SoundpadFolder, self.focus == FOLDER).on_press_maybe((!self.sound_dialog).then_some(Msg::SoundpadFolder)))
+            .push(icon_button(glyph::REFRESH, Msg::SoundpadRefresh, self.focus == REFRESH).on_press_maybe(self.sound_folder.is_some().then_some(Msg::SoundpadRefresh)));
+        let folder_name = self.sound_folder.as_ref().map(|f| f.to_string_lossy().into_owned());
+        let mut body = column![toolbar].spacing(12);
+        if let Some(name) = folder_name {
+            body = body.push(row![icon(glyph::FOLDER, 11, FAINT), label(name, 12, FAINT)].spacing(8).align_y(iced::Center));
+        }
         if !self.sound_note.is_empty() {
             body = body.push(label(&self.sound_note, 12, if self.sound_note.starts_with("Добавлено") || self.sound_note.starts_with('«') { GREEN } else { DIM }));
         }
-        body = body.push(line());
         if self.sound_folder.is_none() {
             return body
-                .push(
+                .push(card(
                     column![
                         bold("Звуки поверх голоса в виртуальный микрофон", 15, INK),
                         label("Выберите папку с mp3, wav, ogg или m4a. Каждому звуку в списке назначается свой хоткей; звуки без хоткея запускаются кнопкой в строке.", 12, DIM),
                         label("Хоткей звука: нажатие играет, повторное нажатие останавливает, быстрое двойное перезапускает с начала.", 12, DIM),
+                        action(label("Выбрать папку", 13, ORANGE_DARK), Msg::SoundpadFolder, false, true).on_press_maybe((!self.sound_dialog).then_some(Msg::SoundpadFolder)),
                     ]
-                    .spacing(8)
-                    .padding([12, 0]),
-                )
+                    .spacing(10),
+                ))
+                .push(self.soundpad_footer(clock, playing, playing_id, position, length))
                 .into();
         }
-        let visible = self.visible_sounds();
-        body = body.push(
-            row![
-                container(frame(
-                    text_input("Поиск по названию", &self.sound_filter)
-                        .id("sound-filter")
-                        .size(13)
-                        .padding([5, 8])
-                        .on_input(Msg::SoundpadFilter),
-                    self.focus == FILTER,
-                ))
-                .width(Length::Fill),
-                label(
-                    if self.sound_filter.trim().is_empty() && self.section == super::Selection::All {
-                        format!("{} зв.", self.sounds.len())
-                    } else {
-                        format!("{} из {}", visible.len(), self.sounds.len())
-                    },
-                    12,
-                    DIM
-                ),
-                frame(
-                    pick_list(SoundSort::ALL, Some(self.sound_sort), Msg::SoundpadSort)
-                        .text_size(12)
-                        .padding([4, 8])
-                        .width(170)
-                        .style(device_style),
-                    self.focus == SORT,
-                ),
-            ]
-            .spacing(10)
-            .align_y(iced::Center),
-        );
         let custom = self.custom_section();
         body = body.push(
-            row![self.section_sidebar(custom), self.sound_list(&visible, custom, playing_id, position, length)]
-                .spacing(12)
+            row![self.section_sidebar(custom), self.sound_list(&visible, custom, playing_id, position, length, clock)]
+                .spacing(16)
                 .height(Length::Fill),
         );
-        body.height(Length::Fill).into()
+        body.push(self.soundpad_footer(clock, playing, playing_id, position, length)).height(Length::Fill).into()
+    }
+    /// Now playing on top, the soundpad-wide controls below.
+    fn soundpad_footer(&self, clock: Clock, playing: bool, playing_id: u32, position: f32, length: f32) -> Element<'_, Msg> {
+        use focus::soundpad::*;
+        let name = (playing_id != 0)
+            .then(|| self.sounds.iter().enumerate().find(|(i, _)| super::App::sound_id(*i) == playing_id))
+            .flatten()
+            .map(|(_, s)| s.name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(&s.name).to_owned())
+            .unwrap_or_else(|| if playing { "Запись".into() } else { "Ничего не играет".into() });
+        let now = row![
+            button(container(icon(glyph::STOP, 12, if playing { ORANGE_DARK } else { FAINT })).center(Length::Fill))
+                .width(32)
+                .height(32)
+                .padding(0)
+                .on_press_maybe(playing.then_some(Msg::SoundpadStop))
+                .style(move |_, _| button::Style {
+                    background: Some((if playing { ORANGE } else { CARD2 }).into()),
+                    border: Border { radius: 7.0.into(), ..Border::default() },
+                    ..Default::default()
+                }),
+            column![
+                row![
+                    label(name, 13, if playing { INK } else { FAINT }).width(Length::Fill),
+                    numbers(if playing { format!("{} / {}", clock_text(position), clock_text(length)) } else { String::new() }, 12, DIM),
+                ]
+                .spacing(12),
+                meter(if playing && length > 0.0 { position / length } else { 0.0 }, ORANGE),
+            ]
+            .spacing(6)
+            .width(Length::Fill),
+        ]
+        .spacing(12)
+        .align_y(iced::Center);
+        let controls = row![
+            label("Стоп всё", 12, DIM),
+            self.bind_button(super::SOUND_STOP_BIND, self.sound_stop_key, self.focus == STOP_BIND, false, 130.0),
+            Space::new().width(Length::Fill),
+            icon(glyph::VOLUME, 13, DIM),
+            container(frame(
+                tacho(0.0..=200.0, self.sound_volume * 100.0, Msg::SoundpadVolume, clock).default(100.0).segments(18).compact().phase(0.0),
+                self.focus == VOLUME,
+            ))
+            .width(250),
+            frame(switch(self.sound_normalize, Msg::SoundpadNormalize, true), self.focus == NORMALIZE),
+            label("выравнивать", 12, DIM),
+            frame(switch(self.sound_monitor, Msg::SoundpadHear, true), self.focus == HEAR),
+            label("в наушниках", 12, DIM),
+        ]
+        .spacing(8)
+        .align_y(iced::Center);
+        let mut footer = column![now, container(Space::new().height(1)).width(Length::Fill).style(|_| container::Style { background: Some(LINE.into()), ..Default::default() }), controls].spacing(10);
+        let hint = self.monitor_hint();
+        if !hint.is_empty() {
+            footer = footer.push(label(hint, 11, if self.sound_monitor && self.monitor == 3 { RED } else { FAINT }));
+        }
+        card(footer).padding([12, 14]).into()
     }
     /// Left column: "all", automatic prefix groups, custom sections, and the editor of the
     /// selected custom section. Custom entries are drop targets while a clip is dragged.
@@ -1417,60 +1634,52 @@ impl App {
             let focused = self.focus == SECTION_BASE + i;
             let entry = button(focus_target(
                 row![
-                    label(&item.label, 12, if selected { BG } else { INK }).width(Length::Fill),
-                    label(item.count.to_string(), 11, if selected { BG } else { DIM }),
+                    label(&item.label, 13, if selected { INK } else { DIM }).width(Length::Fill),
+                    numbers(item.count.to_string(), 12, if selected { DIM } else { FAINT }),
                 ]
                 .spacing(6)
                 .align_y(iced::Center),
                 focused,
             ))
             .width(Length::Fill)
-            .padding([5, 8])
+            .padding([6, 10])
             .on_press(Msg::SectionSelect(i))
             .style(move |_, status| button::Style {
                 background: Some(
                     (if selected {
-                        ORANGE
+                        Color::from_rgb8(0x1F, 0x20, 0x23)
                     } else if hot || matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                        Color::from_rgb8(49, 50, 54)
+                        Color::from_rgb8(0x1B, 0x1C, 0x1F)
                     } else {
                         Color::TRANSPARENT
                     })
                     .into(),
                 ),
-                text_color: if selected { BG } else { INK },
+                text_color: INK,
                 border: Border {
                     color: if hot || focused { ORANGE } else { Color::TRANSPARENT },
-                    width: if hot { 2.0 } else { 1.0 },
-                    radius: 6.0.into(),
+                    width: if hot || focused { 2.0 } else { 0.0 },
+                    radius: 7.0.into(),
                 },
                 ..Default::default()
             });
             // Drop targets report the cursor; the global mouse release finishes the drop. Every
             // entry is wrapped so the tree (and the sidebar scroll offset) stays stable.
-            list = list.push(
-                mouse_area(entry)
-                    .on_enter(Msg::DragOver(target))
-                    .on_exit(Msg::DragOver(None)),
-            );
+            list = list.push(mouse_area(entry).on_enter(Msg::DragOver(target)).on_exit(Msg::DragOver(None)));
         }
         let mut sidebar = column![
-            label(
-                if self.dragging.is_some() { "Отпустите на разделе" } else { "Разделы" },
-                12,
-                if self.dragging.is_some() { ORANGE } else { DIM }
-            ),
+            label(if self.dragging.is_some() { "Отпустите на разделе" } else { "Разделы" }, 12, if self.dragging.is_some() { ORANGE } else { FAINT }),
             scrollable(
                 mouse_area(container(list).padding(iced::Padding { right: 10.0, ..Default::default() }))
                     .on_scroll(|d| Msg::Wheel("sections", smooth::wheel_pixels(d))),
             )
-                .id("sections")
-                .height(Length::Fill)
-                .width(Length::Fill),
-            action(label("+ Раздел", 12, INK), Msg::SectionAdd, self.focus == SECTION_ADD, false).width(Length::Fill),
+            .id("sections")
+            .height(Length::Fill)
+            .width(Length::Fill),
+            action(label("+ Новый раздел", 12, DIM), Msg::SectionAdd, self.focus == SECTION_ADD, false).width(Length::Fill),
         ]
         .spacing(6)
-        .width(170)
+        .width(180)
         .height(Length::Fill);
         if custom.is_some() {
             sidebar = sidebar.push(
@@ -1480,15 +1689,16 @@ impl App {
                             custom.and_then(|i| self.sections.get(i)).map(|s| s.name.as_str()).unwrap_or("Название раздела"),
                             &self.section_name,
                         )
-                            .id("section-name")
-                            .size(12)
-                            .padding([4, 8])
-                            .on_input(Msg::SectionName)
-                            .on_submit(Msg::SectionRename),
+                        .id("section-name")
+                        .size(12)
+                        .padding([5, 8])
+                        .on_input(Msg::SectionName)
+                        .on_submit(Msg::SectionRename)
+                        .style(input_style),
                         self.focus == SECTION_NAME,
                     ),
                     action(label("Удалить раздел", 12, RED), Msg::SectionDelete, self.focus == SECTION_DELETE, false).width(Length::Fill),
-                    label("Перетащите звук за ≡ из списка; × в строке убирает его из раздела.", 11, DIM),
+                    label("Перетащите звук за ≡ из списка; × в строке убирает его из раздела.", 11, FAINT),
                 ]
                 .spacing(6),
             );
@@ -1497,13 +1707,13 @@ impl App {
     }
     /// Header plus the virtualised clip list in its own scrollable (id "body" so keyboard
     /// focus reveal keeps working here).
-    fn sound_list(&self, visible: &[usize], custom: Option<usize>, playing_id: u32, position: f32, length: f32) -> Element<'_, Msg> {
+    fn sound_list(&self, visible: &[usize], custom: Option<usize>, playing_id: u32, position: f32, length: f32, clock: Clock) -> Element<'_, Msg> {
         use focus::soundpad::*;
         let header = row![
-            Space::new().width(18),
-            label("Звук", 12, DIM).width(Length::Fill),
-            label("Громкость", 12, DIM).width(130),
-            label("Хоткей", 12, DIM).width(if custom.is_some() { 150 } else { 120 }),
+            Space::new().width(46),
+            label("Звук", 12, FAINT).width(Length::Fill),
+            label("Громкость", 12, FAINT).width(170),
+            label("Клавиша", 12, FAINT).width(if custom.is_some() { 164 } else { 130 }),
         ]
         .spacing(10);
         if self.sounds.is_empty() {
@@ -1512,11 +1722,7 @@ impl App {
         if visible.is_empty() {
             return column![
                 header,
-                label(
-                    if custom.is_some() { "Раздел пуст: перетащите сюда звуки из «Все звуки» за ≡." } else { "Ничего не найдено." },
-                    13,
-                    DIM
-                )
+                label(if custom.is_some() { "Раздел пуст: перетащите сюда звуки из «Все звуки» за ≡." } else { "Ничего не найдено." }, 13, DIM)
             ]
             .spacing(8)
             .into();
@@ -1526,8 +1732,7 @@ impl App {
         // Keys keep row state (shaped text) attached to the same clip as the window slides.
         const PITCH: f32 = ROW_HEIGHT + ROW_SPACING;
         let (scroll, viewport) = self.sound_scroll;
-        let focused = self.focus.checked_sub(ROW_BASE)
-            .and_then(|f| visible.iter().position(|&i| i == f / 3));
+        let focused = self.focus.checked_sub(ROW_BASE).and_then(|f| visible.iter().position(|&i| i == f / 3));
         let mounted = sound_rows(visible.len(), scroll, viewport, PITCH, focused);
         let mut rows: widget::keyed::Column<'_, usize, Msg> = widget::keyed::Column::new().spacing(ROW_SPACING);
         let mut next = 0;
@@ -1542,103 +1747,79 @@ impl App {
             let dragged = self.dragging == Some(i);
             let stem = sound.name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(&sound.name);
             let status = match &sound.state {
-                _ if lit => format!("{} / {}", clock(position), clock(length)),
-                SoundState::Loaded(seconds) => clock(*seconds),
+                _ if lit => format!("{} / {}", clock_text(position), clock_text(length)),
+                SoundState::Loaded(seconds) => clock_text(*seconds),
                 SoundState::Loading => "загрузка…".into(),
                 SoundState::Failed(e) => e.clone(),
                 SoundState::Unloaded => String::new(),
             };
             let failed = matches!(sound.state, SoundState::Failed(_));
             let play_focused = self.focus == ROW_BASE + 3 * i;
-            let volume_active = self.sound_hover == Some(i);
-            let grip = mouse_area(
-                container(label("≡", 14, if dragged { ORANGE } else { DIM }))
-                    .width(18)
-                    .height(ROW_HEIGHT)
-                    .center_y(ROW_HEIGHT),
-            )
-            .on_press(Msg::DragStart(i))
-            .interaction(iced::mouse::Interaction::Grab);
+            let volume_focused = self.focus == ROW_BASE + 3 * i + 1;
+            let volume_active = self.sound_hover == Some(i) || volume_focused || sound.volume != 100;
+            let grip = mouse_area(container(label("≡", 14, if dragged { ORANGE } else { FAINT })).width(14).height(ROW_HEIGHT).center_y(ROW_HEIGHT))
+                .on_press(Msg::DragStart(i))
+                .interaction(iced::mouse::Interaction::Grab);
             let play = button(focus_target(
                 row![
-                    // U+25B8 / U+25A0 stay text glyphs; U+25B6 falls back to the colour emoji font.
-                    label(if lit { "■" } else { "▸" }, 15, if lit { ORANGE } else { DIM }).width(14),
-                    label(stem, 13, if lit { ORANGE } else { INK }).width(Length::Fill),
-                    label(status, 11, if failed { RED } else if lit { ORANGE } else { DIM }),
+                    container(icon(if lit { glyph::STOP } else { glyph::PLAY }, 10, if lit { ORANGE_DARK } else { DIM }))
+                        .width(26)
+                        .height(26)
+                        .center(26)
+                        .style(move |_| container::Style {
+                            background: Some((if lit { ORANGE } else { Color::from_rgb8(0x1D, 0x1E, 0x21) }).into()),
+                            border: Border { color: if lit { ORANGE } else { Color::from_rgb8(0x34, 0x35, 0x3A) }, width: 1.0, radius: 13.0.into() },
+                            ..Default::default()
+                        }),
+                    label(stem, 13, if lit { Color::from_rgb8(0xFF, 0xB2, 0x7A) } else { INK }).width(Length::Fill),
+                    numbers(status, 12, if failed { RED } else if lit { ORANGE } else { FAINT }),
                 ]
-                .spacing(8)
+                .spacing(10)
                 .align_y(iced::Center),
                 play_focused,
             ))
             .width(Length::Fill)
             .height(ROW_HEIGHT)
-            .padding([0, 8])
+            .padding([0, 6])
             .on_press(Msg::SoundPlay(i))
             .style(move |_, status| button::Style {
                 background: Some(
                     (if lit {
-                        Color::from_rgb8(46, 39, 33)
+                        Color { a: 0.08, ..ORANGE }
                     } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                        Color::from_rgb8(49, 50, 54)
+                        CARD
                     } else {
                         Color::TRANSPARENT
                     })
                     .into(),
                 ),
                 text_color: INK,
-                border: Border {
-                    color: if play_focused { ORANGE } else { Color::TRANSPARENT },
-                    width: if play_focused { 2.0 } else { 1.0 },
-                    radius: 6.0.into(),
-                },
+                border: Border { color: if play_focused { ORANGE } else { Color::TRANSPARENT }, width: 2.0, radius: 8.0.into() },
                 ..Default::default()
             });
-            let volume = row![
+            let volume: Element<'_, Msg> = if volume_active {
                 frame(
-                    slider(0.0..=200.0, sound.volume as f32, move |v| Msg::SoundVolume(i, v))
-                        .step(5.0_f32)
-                        .default(100.0_f32)
-                        .width(76)
-                        .style(move |_, status| {
-                            let active = volume_active
-                                || matches!(status, slider::Status::Hovered | slider::Status::Dragged);
-                            slider_style_with_opacity(
-                                status,
-                                if active { 1.0 } else { 0.15 },
-                                if active { 1.0 } else { 0.0 },
-                            )
-                        }),
-                    self.focus == ROW_BASE + 3 * i + 1,
-                ),
-                label(
-                    format!("{}%", sound.volume),
-                    12,
-                    Color {
-                        a: if volume_active { 1.0 } else { 0.15 },
-                        ..if sound.volume == 100 { DIM } else { INK }
-                    },
+                    tacho(0.0..=200.0, sound.volume as f32, move |v| Msg::SoundVolume(i, v), Clock { animate: false, ..clock })
+                        .step(5.0)
+                        .default(100.0)
+                        .segments(12)
+                        .compact(),
+                    volume_focused,
                 )
-                .width(38),
-            ]
-            .spacing(4)
-            .align_y(iced::Center)
-            .width(130);
-            let bind = self.bind_button(
-                super::SOUND_BIND_BASE + i,
-                sound.key,
-                self.focus == ROW_BASE + 3 * i + 2,
-                false,
-                120.0,
-            );
-            let mut line = row![grip, play, volume, bind].spacing(10).height(ROW_HEIGHT).align_y(iced::Center);
+            } else {
+                Space::new().into()
+            };
+            let bind = self.bind_button(super::SOUND_BIND_BASE + i, sound.key, self.focus == ROW_BASE + 3 * i + 2, false, 130.0);
+            let mut line = row![grip, play, container(volume).width(170), bind].spacing(10).height(ROW_HEIGHT).align_y(iced::Center);
             if custom.is_some() {
                 line = line.push(
-                    button(label("×", 14, DIM))
+                    button(container(icon(glyph::CLOSE, 9, RED)).center(Length::Fill))
                         .width(24)
+                        .height(24)
                         .padding(0)
                         .on_press(Msg::SoundUnassign(i))
                         .style(|_, status| button::Style {
-                            background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| PANEL.into()),
+                            background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| HOVER.into()),
                             text_color: RED,
                             border: Border { radius: 6.0.into(), ..Default::default() },
                             ..Default::default()
@@ -1647,12 +1828,14 @@ impl App {
             }
             // A row-sized clip layer lets tiny-skia invalidate the moving row as a whole.
             // Without it, scattered text/slider damage fragments repaint the same list repeatedly.
-            rows = rows.push(i, widget::stack![
-                Space::new().width(Length::Fill).height(ROW_HEIGHT),
-                mouse_area(line)
-                    .on_enter(Msg::SoundHover(i, true))
-                    .on_exit(Msg::SoundHover(i, false)),
-            ].clip(true));
+            rows = rows.push(
+                i,
+                widget::stack![
+                    Space::new().width(Length::Fill).height(ROW_HEIGHT),
+                    mouse_area(line).on_enter(Msg::SoundHover(i, true)).on_exit(Msg::SoundHover(i, false)),
+                ]
+                .clip(true),
+            );
         }
         if next < visible.len() {
             rows = rows.push(usize::MAX - next, Space::new().height((visible.len() - next) as f32 * PITCH - ROW_SPACING));
@@ -1663,10 +1846,10 @@ impl App {
                 mouse_area(container(rows).padding(iced::Padding { right: 10.0, ..Default::default() }))
                     .on_scroll(|d| Msg::Wheel("body", smooth::wheel_pixels(d))),
             )
-                .id("body")
-                .on_scroll(|v| Msg::SoundpadScroll(v.absolute_offset().y, v.bounds().height))
-                .width(Length::Fill)
-                .height(Length::Fill),
+            .id("body")
+            .on_scroll(|v| Msg::SoundpadScroll(v.absolute_offset().y, v.bounds().height))
+            .width(Length::Fill)
+            .height(Length::Fill),
         ]
         .spacing(6)
         .width(Length::Fill)
@@ -1695,170 +1878,177 @@ impl App {
         }
     }
     fn settings_view(&self) -> Element<'_, Msg> {
+        use focus::settings::*;
         let locked = self.running() || self.busy;
-        let input = pick_list(self.inputs.as_slice(), self.input.as_ref(), Msg::Input)
-            .placeholder("Микрофон отключён / не выбран")
-            .width(Length::Fill)
-            .text_size(14);
-        let output = pick_list(self.outputs.as_slice(), self.output.as_ref(), Msg::Output)
-            .placeholder("Выберите выход")
-            .width(Length::Fill)
-            .text_size(14);
-        let route = if locked {
+        let route: Element<'_, Msg> = if locked {
             column![
-                label("Микрофон и выход", 12, DIM),
-                label(
-                    self.input
-                        .as_ref()
-                        .map(|d| d.name.clone())
-                        .unwrap_or_default(),
-                    14,
-                    INK
-                ),
-                label(
-                    self.output
-                        .as_ref()
-                        .map(|d| d.name.clone())
-                        .unwrap_or_default(),
-                    14,
-                    INK
-                ),
-                label(
-                    "Остановите обработку для смены устройств и модели.",
-                    12,
-                    DIM
-                )
-            ]
-            .spacing(10)
-        } else {
-            column![
-                label("Микрофон", 12, DIM),
-                frame(input, self.focus == focus::settings::INPUT),
-                label("Передать голос в", 12, DIM),
-                frame(output, self.focus == focus::settings::OUTPUT)
+                row![label("Микрофон", 12, FAINT).width(150), label(self.input.as_ref().map(|d| d.name.clone()).unwrap_or_default(), 13, INK)],
+                row![label("Передать голос в", 12, FAINT).width(150), label(self.output.as_ref().map(|d| d.name.clone()).unwrap_or_default(), 13, INK)],
+                row![label("Модель", 12, FAINT).width(150), label(format!("Denoiser v{}  ·  буфер {} мс", self.version, self.buffer), 13, INK)],
+                label("Выход и модель меняются, пока обработка остановлена.", 12, FAINT),
             ]
             .spacing(8)
-        };
-        let model: Element<'_, Msg> = if locked {
-            label(
-                format!("Denoiser v{}  ·  буфер {} мс", self.version, self.buffer),
-                14,
-                INK,
-            )
             .into()
         } else {
-            row![
-                frame(
-                    pick_list([1, 2], Some(self.version), Msg::Version).width(90),
-                    self.focus == focus::settings::VERSION
-                ),
-                label("Модель v2 экспериментальная", 12, DIM),
-                Space::new().width(Length::Fill),
-                label("Буфер, мс", 12, DIM),
-                frame(
-                    pick_list([10, 20, 30, 40, 60, 80], Some(self.buffer), Msg::Buffer).width(80),
-                    self.focus == focus::settings::BUFFER
-                )
+            column![
+                row![
+                    label("Микрофон", 12, FAINT).width(150),
+                    frame(pick_list(self.inputs.as_slice(), self.input.as_ref(), Msg::Input).placeholder("Микрофон отключён / не выбран").width(Length::Fill).text_size(13).style(device_style), self.focus == INPUT),
+                ]
+                .align_y(iced::Center),
+                row![
+                    label("Передать голос в", 12, FAINT).width(150),
+                    frame(pick_list(self.outputs.as_slice(), self.output.as_ref(), Msg::Output).placeholder("Выберите выход").width(Length::Fill).text_size(13).style(device_style), self.focus == OUTPUT),
+                ]
+                .align_y(iced::Center),
+                row![
+                    label("Модель", 12, FAINT).width(150),
+                    frame(pick_list([1, 2], Some(self.version), Msg::Version).width(90).style(device_style), self.focus == VERSION),
+                    label("v2 экспериментальная", 12, FAINT),
+                    Space::new().width(Length::Fill),
+                    label("Буфер, мс", 12, FAINT),
+                    frame(pick_list([10, 20, 30, 40, 60, 80], Some(self.buffer), Msg::Buffer).width(80).style(device_style), self.focus == BUFFER),
+                ]
+                .spacing(10)
+                .align_y(iced::Center),
             ]
-            .spacing(10)
-            .align_y(iced::Center)
+            .spacing(8)
             .into()
         };
+        let startup = column![
+            row![frame(switch(self.app_autostart, Msg::AppAutostart, true), self.focus == APP_AUTOSTART), label("Запускать Mic Noize вместе с Windows (в трее)", 13, INK)].spacing(8).align_y(iced::Center),
+            row![frame(switch(self.autostart, Msg::Autostart, true), self.focus == AUTOSTART), label("Держать виртуальный микрофон доступным после входа в Windows", 13, INK)].spacing(8).align_y(iced::Center),
+        ]
+        .spacing(6);
         // Only while the virtual microphone is missing: a button that can do nothing is noise.
-        let driver_row: Element<'_, Msg> = if self.driver_ready {
-            Space::new().height(0).into()
-        } else {
-            column![
-                label(
-                    "Виртуальный микрофон не установлен: Windows запросит права администратора.",
-                    12,
-                    DIM
-                ),
-                action(
-                    label(
-                        if self.driver_installing { "Устанавливаем…" } else { "Установить виртуальный микрофон" },
-                        13,
-                        INK
-                    ),
-                    Msg::InstallDriver,
-                    self.focus == focus::settings::DRIVER,
-                    false
-                )
-                .on_press_maybe((!self.driver_installing).then_some(Msg::InstallDriver))
+        let mut device = column![
+            row![
+                label("Устройство Mic Noize", 13, DIM),
+                label(self.device_state.label(), 13, match self.device_state {
+                    engine::DeviceState::Ready => GREEN,
+                    engine::DeviceState::UserAction => RED,
+                    _ => DIM,
+                }),
             ]
-            .spacing(6)
-            .into()
-        };
-        let repair_row: Element<'_,Msg> = if self.repair_confirm {
-            column![
-                bold("Восстановление устройства",16,INK),
-                label("Обработка микрофона и наушников будет остановлена на время проверки. Текущая линия сохранится, если перенос не требуется.",12,DIM),
-                frame(widget::checkbox(self.repair_lines)
-                    .label("Освободить место для наушников и перенести старые линии Mic Noize")
-                    .text_size(13).size(16).on_toggle(Msg::RepairLines).style(check_style),self.focus==focus::settings::REPAIR_LINES),
-                label("Стандартный вход TAG Microphone будет освобождён, в том числе после перезагрузок. При переносе старой линии Mic Noize её потребуется снова выбрать в Discord и других программах. Физический микрофон не меняется.",12,DIM),
-                frame(widget::checkbox(self.repair_reinstall)
-                    .label("Разрешить переустановку драйвера, если проверка и перезапуск не помогут")
-                    .text_size(13).size(16).on_toggle(Msg::RepairReinstall).style(check_style),self.focus==focus::settings::REPAIR_REINSTALL),
-                label("При переустановке Windows запросит права администратора. Устройство может получить новый идентификатор — тогда его нужно снова выбрать в Discord и других программах.",12,DIM),
-                row![action(label("Восстановить",13,BG),Msg::RepairConfirm,self.focus==focus::settings::REPAIR_CONFIRM,true),
-                    action(label("Отмена",13,INK),Msg::RepairCancel,self.focus==focus::settings::REPAIR_CANCEL,false)].spacing(8)
-            ].spacing(8).into()
+            .spacing(8),
+            label(&self.device_detail, 12, FAINT),
+        ]
+        .spacing(8);
+        if !self.driver_ready {
+            device = device.push(label("Виртуальный микрофон не установлен: Windows запросит права администратора.", 12, DIM)).push(
+                action(label(if self.driver_installing { "Устанавливаем…" } else { "Установить виртуальный микрофон" }, 13, INK), Msg::InstallDriver, self.focus == DRIVER, false)
+                    .on_press_maybe((!self.driver_installing).then_some(Msg::InstallDriver)),
+            );
+        }
+        let device = if self.repair_confirm {
+            device.push(
+                column![
+                    bold("Восстановление устройства", 15, INK),
+                    label("Обработка микрофона и наушников будет остановлена на время проверки. Текущая линия сохранится, если перенос не требуется.", 12, DIM),
+                    row![frame(switch(self.repair_lines, Msg::RepairLines, true), self.focus == REPAIR_LINES), label("Освободить место для наушников и перенести старые линии Mic Noize", 13, INK)].spacing(8).align_y(iced::Center),
+                    label("Стандартный вход TAG Microphone будет освобождён, в том числе после перезагрузок. При переносе старой линии Mic Noize её потребуется снова выбрать в Discord и других программах. Физический микрофон не меняется.", 12, DIM),
+                    row![frame(switch(self.repair_reinstall, Msg::RepairReinstall, true), self.focus == REPAIR_REINSTALL), label("Разрешить переустановку драйвера, если проверка и перезапуск не помогут", 13, INK)].spacing(8).align_y(iced::Center),
+                    label("При переустановке Windows запросит права администратора. Устройство может получить новый идентификатор — тогда его нужно снова выбрать в Discord и других программах.", 12, DIM),
+                    row![
+                        action(label("Восстановить", 13, ORANGE_DARK), Msg::RepairConfirm, self.focus == REPAIR_CONFIRM, true),
+                        action(label("Отмена", 13, INK), Msg::RepairCancel, self.focus == REPAIR_CANCEL, false),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(8),
+            )
         } else {
-            action(label(if self.repair_resume.is_some(){"Восстанавливаем…"}else{"Восстановить устройство"},13,INK),Msg::Repair,self.focus==focus::settings::REPAIR,false)
-                .on_press_maybe((!self.driver_installing && !self.core_installing && !self.quitting && !self.apply_pending).then_some(Msg::Repair)).into()
+            device.push(
+                row![
+                    action(label(if self.repair_resume.is_some() { "Восстанавливаем…" } else { "Восстановить устройство" }, 13, INK), Msg::Repair, self.focus == REPAIR, false)
+                        .on_press_maybe((!self.driver_installing && !self.core_installing && !self.quitting && !self.apply_pending).then_some(Msg::Repair)),
+                    action(label("Обновить устройства", 13, INK), Msg::Refresh, self.focus == REFRESH, false),
+                ]
+                .spacing(8),
+            )
         };
-        column![bold("Настройки",24,INK),route,model,
-
-            line(),label(format!("NVIDIA {:.2} мс  ·  очередь {:.1} мс  ·  пропуски {} / {}",self.snapshot.process_ms,self.snapshot.queue_ms,self.snapshot.underruns,self.snapshot.drops),12,DIM),
-            label(format!("Pitch: задержка {:.1} мс  ·  максимум обработки {:.2} мс",self.snapshot.pitch_delay_ms,self.snapshot.pitch_max_ms),12,DIM),
-            label("Буфер — запас от обрывов, не полная задержка. Pitch добавляет задержку только при удержании.",12,DIM),
-            frame(widget::checkbox(self.app_autostart)
-                .label("Запускать Mic Noize вместе с Windows (в трее)")
-                .text_size(13)
-                .size(16)
-                .on_toggle(Msg::AppAutostart)
-                .style(check_style), self.focus == focus::settings::APP_AUTOSTART),
-            frame(widget::checkbox(self.autostart)
-                .label("Держать виртуальный микрофон доступным после входа в Windows")
-                .text_size(13)
-                .size(16)
-                .on_toggle(Msg::Autostart)
-                .style(check_style), self.focus == focus::settings::AUTOSTART),
-            driver_row,
-            label(format!("Устройство Mic Noize: {}",self.device_state.label()),13,match self.device_state {
-                engine::DeviceState::Ready=>GREEN,engine::DeviceState::UserAction=>RED,_=>DIM,
-            }),
-            label(&self.device_detail,12,DIM),
-            repair_row,
-            widget::rule::horizontal(1),
-            label(format!("Mic Noize {}", env!("CARGO_PKG_VERSION")), 13, INK),
-            label(&self.update_status, 12, if self.update_ready { GREEN } else { DIM }),
+        let updates = column![
+            row![label(format!("Mic Noize {}", env!("CARGO_PKG_VERSION")), 13, INK), label(&self.update_status, 12, if self.update_ready { GREEN } else { FAINT })].spacing(12).align_y(iced::Center),
             // "Обновить сейчас" exists only with an update to apply (the Tab order already
             // skips it otherwise); a disabled orange button read as the page's main action.
             row![
-                action(label(if self.update_checking { "Проверка…" } else { "Проверить обновления" },13,if self.update_checking { DIM } else { INK }),Msg::UpdateCheck,self.focus==focus::settings::UPDATE,false)
+                action(label(if self.update_checking { "Проверка…" } else { "Проверить обновления" }, 13, if self.update_checking { FAINT } else { INK }), Msg::UpdateCheck, self.focus == UPDATE, false)
                     .on_press_maybe((!self.update_checking).then_some(Msg::UpdateCheck)),
-            ].push(self.update_ready.then(|| action(label("Обновить сейчас",13,BG),Msg::ApplyUpdate,self.focus==focus::settings::APPLY_UPDATE,true)))
+            ]
+            .push(self.update_ready.then(|| action(label("Обновить сейчас", 13, ORANGE_DARK), Msg::ApplyUpdate, self.focus == APPLY_UPDATE, true)))
             .spacing(8),
-            row![action(label("Обновить устройства",13,INK),Msg::Refresh,self.focus==focus::settings::REFRESH,false),Space::new().width(Length::Fill),action(label("Выход",13,INK),Msg::Quit,self.focus==focus::settings::QUIT,false),action(label("Готово",13,BG),Msg::Settings,self.focus==focus::settings::DONE,true)].spacing(8)
-        ].spacing(12).into()
+        ]
+        .spacing(8);
+        let diagnostics = column![
+            numbers(
+                format!(
+                    "NVIDIA {:.2} мс   очередь {:.1} мс   пропуски {} / {}   pitch {:.1} мс (макс {:.2} мс)",
+                    self.snapshot.process_ms, self.snapshot.queue_ms, self.snapshot.underruns, self.snapshot.drops, self.snapshot.pitch_delay_ms, self.snapshot.pitch_max_ms
+                ),
+                13,
+                DIM,
+            ),
+            label("Буфер — запас от обрывов, не полная задержка. Pitch добавляет задержку только при удержании.", 12, FAINT),
+            row![
+                action(row![icon(glyph::LOGS, 12, INK), label("Логи и отчёт", 13, INK)].spacing(8).align_y(iced::Center), Msg::Page(5), self.focus == LOGS, false),
+                Space::new().width(Length::Fill),
+                action(label("Выход из Mic Noize", 13, INK), Msg::Quit, self.focus == QUIT, false),
+            ]
+            .spacing(8)
+            .align_y(iced::Center),
+        ]
+        .spacing(8);
+        column![
+            title("Настройки"),
+            card(column![heading_row(glyph::MIC, "Микрофон и выход", Space::new().into()), route].spacing(10)),
+            card(column![heading_row(glyph::REFRESH, "Запуск", Space::new().into()), startup].spacing(10)),
+            card(column![heading_row(glyph::OUTPUT, "Виртуальный микрофон", Space::new().into()), device].spacing(10)),
+            card(column![heading_row(glyph::SAVE, "Обновления", Space::new().into()), updates].spacing(10)),
+            card(column![heading_row(glyph::CHIP, "Диагностика", Space::new().into()), diagnostics].spacing(10)),
+        ]
+        .spacing(14)
+        .into()
     }
-    /// A hotkey button that captures its key in place: click, press the key, done. A clash
-    /// stays on the button in red and keeps waiting; a second click or Esc cancels; the small
-    /// cross clears an existing binding while capturing.
+    /// A hotkey shown as keycaps that captures its key in place: click, press the key, done.
+    /// A clash stays on the button in red and keeps waiting; a second click or Esc cancels; the
+    /// small cross clears an existing binding while capturing.
     fn bind_button(&self, target: usize, key: u32, focused: bool, lit: bool, width: f32) -> Element<'_, Msg> {
         if self.binding != Some(target) {
-            // An unassigned slot is a placeholder, not a value: 30 % ink so bound keys stand out.
-            let color = if lit {
-                BG
-            } else if key == 0 {
-                Color { a: 0.3, ..INK }
+            let content: Element<'_, Msg> = if key == 0 {
+                label("+ клавиша", 12, FAINT).into()
             } else {
-                INK
+                let name = key_name(key);
+                widget::Row::with_children(name.split(" + ").map(|part| {
+                    container(label(part.to_owned(), 11, if lit { ORANGE_DARK } else { Color::from_rgb8(0xE8, 0xE3, 0xD9) }).font(Font::with_name("Consolas")))
+                        .padding([3, 6])
+                        .style(move |_| container::Style {
+                            background: Some((if lit { ORANGE } else { Color::from_rgb8(0x2A, 0x2B, 0x30) }).into()),
+                            border: Border { color: if lit { Color::from_rgb8(0xC9, 0x72, 0x2F) } else { EDGE }, width: 1.0, radius: 5.0.into() },
+                            shadow: Shadow { color: if lit { Color { a: 0.5, ..ORANGE } } else { Color { a: 0.35, ..Color::BLACK } }, offset: Vector::new(0.0, if lit { 0.0 } else { 1.5 }), blur_radius: if lit { 10.0 } else { 0.0 } },
+                            ..Default::default()
+                        })
+                        .into()
+                }))
+                .spacing(3)
+                .align_y(iced::Center)
+                .into()
             };
-            return action(label(key_name(key), 12, color), Msg::Bind(target), focused, lit)
-                .width(width)
+            return button(focus_target(content, focused))
+                .padding([4, 6])
+                .on_press(Msg::Bind(target))
+                .style(move |_, status| {
+                    let hover = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                    button::Style {
+                        background: hover.then(|| HOVER.into()),
+                        text_color: INK,
+                        border: Border {
+                            color: if focused { ORANGE } else if key == 0 { Color::from_rgb8(0x3A, 0x3B, 0x41) } else { Color::TRANSPARENT },
+                            width: if focused { 2.0 } else { 1.0 },
+                            radius: 7.0.into(),
+                        },
+                        ..Default::default()
+                    }
+                })
                 .into();
         }
         let (text, color) = match self.bind_conflict {
@@ -1872,11 +2062,7 @@ impl App {
             .style(|_, _| button::Style {
                 background: Some(BG.into()),
                 text_color: ORANGE,
-                border: Border {
-                    color: ORANGE,
-                    width: 2.0,
-                    radius: 8.0.into(),
-                },
+                border: Border { color: ORANGE, width: 2.0, radius: 8.0.into() },
                 ..Default::default()
             });
         if key == 0 {
@@ -1884,12 +2070,13 @@ impl App {
         }
         row![
             capture,
-            button(label("×", 14, RED))
+            button(container(icon(glyph::CLOSE, 9, RED)).center(Length::Fill))
                 .width(24)
-                .padding([5, 0])
+                .height(28)
+                .padding(0)
                 .on_press(Msg::ClearBind)
                 .style(|_, status| button::Style {
-                    background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| PANEL.into()),
+                    background: matches!(status, button::Status::Hovered | button::Status::Pressed).then(|| HOVER.into()),
                     text_color: RED,
                     border: Border { radius: 6.0.into(), ..Default::default() },
                     ..Default::default()
@@ -1902,13 +2089,10 @@ impl App {
     }
 }
 
-const ROW_HEIGHT: f32 = 30.0;
-/// Recordings block: three cells per line, two lines, so all six fit under the replay key.
-const CLIP_CELL: f32 = 22.0;
-const CLIPS_PER_LINE: usize = 3;
+const ROW_HEIGHT: f32 = 34.0;
 const ROW_SPACING: f32 = 2.0;
 /// m:ss for clip lengths and playback position.
-fn clock(seconds: f32) -> String {
+fn clock_text(seconds: f32) -> String {
     let whole = seconds.max(0.0).round() as u32;
     format!("{}:{:02}", whole / 60, whole % 60)
 }
@@ -1993,6 +2177,91 @@ mod tests {
         }
         // Same damage grouping and rasterizer as the window compositor; excludes OS presentation.
     }
+    /// Renders every page headlessly: `MNR_DESIGN_DIR=<dir> cargo test design_snapshots -- --ignored`.
+    #[test]
+    #[ignore]
+    fn design_snapshots() {
+        use iced::advanced::{Renderer as _, Layout, graphics::{damage, Viewport}};
+        let dir = PathBuf::from(std::env::var("MNR_DESIGN_DIR").expect("MNR_DESIGN_DIR"));
+        let render = |app: &App, name: &str| {
+            let (w, h) = (1040.0_f32, 740.0_f32);
+            let size = Size::new(w as u32, h as u32);
+            let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
+            let mut tree = iced::advanced::widget::Tree::empty();
+            let limits = iced::advanced::layout::Limits::new(Size::ZERO, Size::new(w, h));
+            let mut element = app.view(window::Id::unique());
+            tree.diff(element.as_widget());
+            let layout = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            renderer.reset(iced::Rectangle::with_size(Size::new(w, h)));
+            element.as_widget().draw(&tree, &mut renderer, &Theme::Dark,
+                &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&layout),
+                iced::mouse::Cursor::Unavailable, &iced::Rectangle::with_size(Size::new(w, h)));
+            let changes = damage::group(damage::diff(&[], renderer.layers(),
+                |layer| vec![layer.bounds], iced_tiny_skia::Layer::damage),
+                iced::Rectangle::with_size(Size::new(w, h)));
+            let mut pixels = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
+            let mut mask = tiny_skia::Mask::new(size.width, size.height).unwrap();
+            renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, 1.0), &changes, BG);
+            // The renderer writes BGRA into the pixmap; PNG wants RGBA.
+            let mut data = pixels.data().to_vec();
+            for px in data.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            let mut encoder = png::Encoder::new(std::fs::File::create(dir.join(format!("design-{name}.png"))).unwrap(), size.width, size.height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().unwrap().write_image_data(&data).unwrap();
+        };
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        app.window = Some(window::Id::unique());
+        app.inputs = vec![Device { id: "mic".into(), name: "Microphone (HyperX QuadCast S)".into() }];
+        app.input = app.inputs.first().cloned();
+        app.outputs = vec![
+            Device { id: "TAG".into(), name: "Mic Noize Microphone".into() },
+            Device { id: "dac".into(), name: "Speakers (SMSL USB DAC)".into() },
+        ];
+        app.output = app.outputs.first().cloned();
+        app.headphone_output = app.outputs.get(1).cloned();
+        // (modifiers << 8) | virtual key: 1 Ctrl, 2 Alt; 36 Home, 4/6 mouse 3/5, 0x54 T.
+        app.keys = [3 << 8 | 0x54, 3 << 8 | 36, 1 << 8 | 36, 2 << 8 | 36, 36, 0, 3 << 8 | 6, 1 << 8 | 6, 2 << 8 | 6, 6, 1 << 8 | 4, 2 << 8 | 4, 4];
+        app.in_peak = 0.2;
+        app.peak = 0.08;
+        app.controls.intensity = 0.99;
+        render(&app, "main");
+        app.controls.intensity = 1.35;
+        app.route_open = true;
+        render(&app, "main-red");
+        app.controls.intensity = 0.99;
+        app.route_open = false;
+        app.headphone_page = true;
+        render(&app, "headphones");
+        app.headphone_page = false;
+        app.effects_page = true;
+        app.clips = (0..6).map(|i| Sound {
+            name: format!("Запись 2026-09-25 14-2{i}-0{i} (mix).wav"), path: PathBuf::new(),
+            key: 0, volume: 100, played: 0, modified: 0, state: SoundState::Loaded(2.4),
+        }).collect();
+        render(&app, "effects");
+        app.effects_page = false;
+        app.soundpad_page = true;
+        app.sound_folder = Some(PathBuf::from(r"E:\Dropbox\sounds"));
+        app.sounds = ["a chto", "a-a chevo", "aga spasiba", "aleeo", "bogdan - 48chasov", "bruh", "chto proishodit", "davay davay", "gerych - nu davay", "nastya - privet"]
+            .iter().map(|n| Sound {
+                name: format!("{n}.wav"), path: PathBuf::new(), key: 0, volume: 100, played: 0, modified: 0,
+                state: SoundState::Loaded(3.0),
+            }).collect();
+        app.sound_scroll = (0.0, 420.0);
+        render(&app, "soundpad");
+        app.soundpad_page = false;
+        app.rvc_page = true;
+        render(&app, "rvc");
+        app.rvc_page = false;
+        app.details = true;
+        render(&app, "settings");
+        app.details = false;
+        app.logs_page = true;
+        render(&app, "logs");
+    }
     #[test]
     fn sound_rows_stay_bounded_with_distant_focus() {
         // A selected first clip must not mount the 400 intervening rows while scrolling.
@@ -2009,9 +2278,9 @@ mod tests {
     }
     #[test]
     fn clock_formats_minutes() {
-        assert_eq!(clock(0.0), "0:00");
-        assert_eq!(clock(7.4), "0:07");
-        assert_eq!(clock(125.6), "2:06");
+        assert_eq!(clock_text(0.0), "0:00");
+        assert_eq!(clock_text(7.4), "0:07");
+        assert_eq!(clock_text(125.6), "2:06");
     }
     #[test]
     fn focus_scroll_moves_only_when_outside_viewport() {

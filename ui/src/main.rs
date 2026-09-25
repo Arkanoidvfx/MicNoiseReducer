@@ -7,6 +7,7 @@ mod paths;
 mod rvc;
 mod settings;
 mod smooth;
+mod tacho;
 mod soundpad;
 mod telemetry;
 mod updater;
@@ -176,10 +177,13 @@ mod focus {
     pub const UPDATE_BANNER: usize = 74;
     /// Page 5 (logs), outside `TAB_BASE + page` like the soundpad.
     pub const TAB_LOGS: usize = 76;
+    /// Page 6 (effects), split from the microphone page in 0.2.8.
+    pub const TAB_EFFECTS: usize = 80;
     pub fn tab(page: u8) -> usize {
         match page {
             4 => TAB_SOUNDPAD,
             5 => TAB_LOGS,
+            6 => TAB_EFFECTS,
             _ => TAB_BASE + page as usize,
         }
     }
@@ -187,6 +191,7 @@ mod focus {
         pub const COPY: usize = 77;
         pub const FOLDER: usize = 78;
         pub const SEND: usize = 73;
+        pub const BACK: usize = 84;
     }
     pub mod soundpad {
         pub const FOLDER: usize = 61;
@@ -224,6 +229,7 @@ mod focus {
         pub const REPAIR_CONFIRM: usize = 92;
         pub const REPAIR_CANCEL: usize = 93;
         pub const REPAIR_LINES: usize = 94;
+        pub const LOGS: usize = 95;
     }
     pub mod effects {
         pub const INPUT: usize = 35;
@@ -254,6 +260,10 @@ mod focus {
         pub const DISCORD_VOLUME: usize = 22;
         pub const EFFECTS_MONITOR: usize = 31;
         pub const BOOST_MONITOR: usize = 36;
+        /// Шумодав page: headphone gear and the folded processing route.
+        pub const HEADPHONE_GEAR: usize = 81;
+        pub const ROUTE: usize = 82;
+        pub const REVERSE_WORD: usize = 83;
     }
     pub mod rvc {
         pub const ENABLE: usize = 24;
@@ -384,6 +394,10 @@ fn set_app_autostart(enabled: bool) -> Result<(), String> {
 
 #[derive(Debug, Clone)]
 enum Msg {
+    HeadphonePanel(bool),
+    RouteToggle,
+    ReverseWord(String),
+    ReverseEdit(bool),
     HeadphoneToggle,
     HeadphoneOutput(Device),
     HeadphoneNoise(bool),
@@ -568,7 +582,16 @@ struct App {
     clip_note: String,
     /// Decayed peak of the monitor's own output: shows that "hear sounds" really renders.
     monitor_peak: f32,
+    /// The headphone panel is open over the Шумодав page (old page 3).
     headphone_page: bool,
+    effects_page: bool,
+    route_open: bool,
+    reverse_word: String,
+    reverse_edit: bool,
+    /// Shared animation clock and the moment the window was last shown.
+    epoch: Instant,
+    opened_at: Option<Instant>,
+    in_peak: f32,
     headphone_output: Option<Device>,
     headphone_denoise: bool,
     headphone_intensity: f32,
@@ -722,12 +745,12 @@ impl App {
             size: if small {
                 Size::new(620.0, 440.0)
             } else {
-                Size::new(820.0, 820.0)
+                Size::new(1040.0, 740.0)
             },
             min_size: Some(if small {
                 Size::new(620.0, 440.0) // Explicit QA mode only.
             } else {
-                Size::new(820.0, 820.0)
+                Size::new(960.0, 680.0)
             }),
             position: window::Position::Centered,
             icon: Some(window_icon()),
@@ -945,6 +968,13 @@ impl App {
                 input: None,
                 output: None,
                 headphone_page: args.iter().any(|s| s == "--ui-headphones"),
+                effects_page: args.iter().any(|s| s == "--ui-effects"),
+                route_open: false,
+                reverse_word: "Привет".into(),
+                reverse_edit: false,
+                epoch: Instant::now(),
+                opened_at: None,
+                in_peak: 0.0,
                 headphone_output: None,
                 headphone_denoise,
                 headphone_intensity,
@@ -1854,6 +1884,7 @@ impl App {
                 }
                 if self.ui_active() {
                     self.peak = snapshot.output_peak.max(self.peak * 0.80);
+                    self.in_peak = snapshot.input_peak.max(self.in_peak * 0.80);
                     self.monitor_peak = self.engine.monitor_peak().max(self.monitor_peak * 0.80);
                 }
                 if snapshot.captured_key != 0 && self.binding.is_some() {
@@ -1927,6 +1958,7 @@ impl App {
             }
             Msg::Opened(id) => {
                 self.window = Some(id);
+                self.opened_at = Some(Instant::now());
             }
             Msg::WindowFocus(id, focused) => {
                 if self.window == Some(id) {
@@ -2105,16 +2137,36 @@ impl App {
             Msg::Settings => {
                 return self.update(Msg::Page(if self.details { 0 } else { 2 }));
             }
+            Msg::HeadphonePanel(open) => {
+                self.headphone_page = open;
+                if !open && (focus::headphones::TOGGLE..=focus::headphones::REVERSE).contains(&self.focus) {
+                    self.focus = focus::effects::HEADPHONE_GEAR;
+                }
+            }
+            Msg::RouteToggle => self.route_open = !self.route_open,
+            Msg::ReverseWord(word) => self.reverse_word = word.chars().take(12).collect(),
+            Msg::ReverseEdit(edit) => {
+                self.reverse_edit = edit;
+                if !edit && self.reverse_word.trim().is_empty() {
+                    self.reverse_word = "Привет".into();
+                }
+                if edit {
+                    return iced::widget::operation::focus("reverse-word");
+                }
+            }
             Msg::Page(page) => {
                 if self.binding.is_some() {
                     let _ = self.update(Msg::CancelBind);
                 }
                 self.soundpad_page = page == 4;
+                // Page 3 is no longer a page: the headphone panel opens over Шумодав.
                 self.headphone_page = page == 3;
                 self.logs_page = page == 5;
                 self.logs_copied = false;
                 self.details = page == 2;
                 self.rvc_page = page == 1;
+                self.effects_page = page == 6;
+                self.reverse_edit = false;
                 self.focus = focus::NONE;
                 let snap = iced::widget::operation::snap_to(
                     "body",
@@ -3161,57 +3213,59 @@ impl App {
             return Task::none();
         }
         if key == Key::Named(Named::Tab) {
-            // Visual order of the page tabs: microphone, headphones, voice changer, soundpad,
-            // logs, settings.
+            // Visual order of the rail: Шумодав, Эффекты, Саундпад, Смена голоса, Настройки.
             let tabs = [
                 focus::TAB_BASE,
-                focus::TAB_BASE + 3,
-                focus::TAB_BASE + 1,
+                focus::TAB_EFFECTS,
                 focus::TAB_SOUNDPAD,
-                focus::TAB_LOGS,
+                focus::TAB_BASE + 1,
                 focus::TAB_BASE + 2,
             ];
             let order = if self.logs_page {
                 use focus::logs::*;
-                let mut items = vec![COPY, FOLDER, SEND];
-                items.extend(tabs);
-                items
-            } else if self.headphone_page {
-                use focus::headphones::*;
-                let mut items = vec![OUTPUT, TOGGLE, NOISE, INTENSITY, VOLUME, PITCH, REVERSE];
+                let mut items = vec![BACK, COPY, FOLDER, SEND];
                 items.extend(tabs);
                 items
             } else if self.soundpad_page {
                 use focus::soundpad::*;
-                let mut items =
-                    vec![FOLDER, ADD, REFRESH, VOLUME, NORMALIZE, HEAR, STOP_BIND, FILTER, SORT];
-                items.extend((0..self.section_items().len()).map(|i| SECTION_BASE + i));
-                items.push(SECTION_ADD);
-                if self.custom_section().is_some() {
-                    items.extend([SECTION_NAME, SECTION_DELETE]);
+                let mut items = if self.sound_folder.is_some() {
+                    vec![FILTER, SORT, ADD, FOLDER, REFRESH]
+                } else {
+                    vec![ADD, FOLDER, REFRESH]
+                };
+                if self.sound_folder.is_some() {
+                    items.extend((0..self.section_items().len()).map(|i| SECTION_BASE + i));
+                    items.push(SECTION_ADD);
+                    if self.custom_section().is_some() {
+                        items.extend([SECTION_NAME, SECTION_DELETE]);
+                    }
+                    for i in self.visible_sounds() {
+                        items.extend([ROW_BASE + 3 * i, ROW_BASE + 3 * i + 1, ROW_BASE + 3 * i + 2]);
+                    }
                 }
-                for i in self.visible_sounds() {
-                    items.extend([ROW_BASE + 3 * i, ROW_BASE + 3 * i + 1, ROW_BASE + 3 * i + 2]);
-                }
+                items.extend([STOP_BIND, VOLUME, NORMALIZE, HEAR]);
                 items.extend(tabs);
                 items
             } else if self.details {
                 use focus::settings::*;
                 let mut items = if self.running() || self.busy {
-                    vec![APP_AUTOSTART, AUTOSTART, REFRESH, UPDATE, QUIT, DONE]
+                    vec![APP_AUTOSTART, AUTOSTART]
                 } else {
-                    vec![
-                        INPUT, OUTPUT, VERSION, BUFFER, APP_AUTOSTART, AUTOSTART, REFRESH, UPDATE, QUIT, DONE,
-                    ]
+                    vec![INPUT, OUTPUT, VERSION, BUFFER, APP_AUTOSTART, AUTOSTART]
                 };
                 if !self.driver_ready {
-                    items.insert(items.len() - 3, DRIVER);
+                    items.push(DRIVER);
                 }
-                items.insert(items.len()-3,REPAIR);
-                if self.repair_confirm {items.extend([REPAIR_LINES,REPAIR_REINSTALL,REPAIR_CONFIRM,REPAIR_CANCEL]);}
+                if self.repair_confirm {
+                    items.extend([REPAIR_LINES, REPAIR_REINSTALL, REPAIR_CONFIRM, REPAIR_CANCEL]);
+                } else {
+                    items.extend([REPAIR, REFRESH]);
+                }
+                items.push(UPDATE);
                 if self.update_ready {
-                    items.insert(items.len() - 2, APPLY_UPDATE);
+                    items.push(APPLY_UPDATE);
                 }
+                items.extend([LOGS, QUIT]);
                 items.extend(tabs);
                 items
             } else if self.rvc_page {
@@ -3237,14 +3291,10 @@ impl App {
                 }
                 items.extend(tabs);
                 items
-            } else {
+            } else if self.effects_page {
                 use focus::effects::*;
                 let discord = |effect| DISCORD_BIND_BASE + effect;
                 let mut items = vec![
-                    INPUT,
-                    INTENSITY,
-                    NOISE_BIND,
-                    ALT_INTENSITY,
                     OVERLOAD,
                     BOOST,
                     BOOST_BIND,
@@ -3258,26 +3308,30 @@ impl App {
                     FAST,
                     FAST_BIND,
                     discord(3),
+                    REVERSE_WORD,
                     REVERSE_BIND,
                     discord(4),
                 ];
                 if self.phrase_state != 0 {
                     items.push(CANCEL_PHRASE);
                 }
-                items.extend([
-                    MONITOR,
-                    MONITOR_BIND,
-                    EFFECTS_MONITOR,
-                    BOOST_MONITOR,
-                    REPLAY_BIND,
-                    DISCORD_VOLUME,
-                ]);
+                items.extend([MONITOR, MONITOR_BIND, EFFECTS_MONITOR, BOOST_MONITOR, DISCORD_VOLUME, REPLAY_BIND]);
                 for i in 0..self.clips.len() {
                     items.extend([CLIP_BASE + 2 * i, CLIP_BASE + 2 * i + 1]);
                     if self.clip_menu == Some(i) {
                         items.extend([CLIP_TO_SOUNDPAD, CLIP_TO_FOLDER]);
                     }
                 }
+                items.extend(tabs);
+                items
+            } else {
+                use focus::effects::*;
+                let mut items = vec![INPUT, focus::headphones::OUTPUT, HEADPHONE_GEAR];
+                if self.headphone_page {
+                    use focus::headphones::*;
+                    items.extend([TOGGLE, NOISE, INTENSITY, VOLUME, PITCH, REVERSE]);
+                }
+                items.extend([ROUTE, INTENSITY, NOISE_BIND, ALT_INTENSITY]);
                 items.extend(tabs);
                 items
             };
@@ -3303,13 +3357,23 @@ impl App {
                     focus::rvc::NAME => "rvc-name",
                     focus::soundpad::FILTER => "sound-filter",
                     focus::soundpad::SECTION_NAME => "section-name",
+                    focus::effects::REVERSE_WORD if self.reverse_edit => "reverse-word",
                     _ => "no-text-input",
                 }),
             ]);
         }
         if key == Key::Named(Named::Escape) && self.repair_confirm {return self.update(Msg::RepairCancel);}
+        if key == Key::Named(Named::Escape) && self.reverse_edit {
+            return self.update(Msg::ReverseEdit(false));
+        }
+        if key == Key::Named(Named::Escape) && self.headphone_page {
+            return self.update(Msg::HeadphonePanel(false));
+        }
+        if key == Key::Named(Named::Escape) && self.logs_page {
+            return self.update(Msg::Page(2));
+        }
         if key == Key::Named(Named::Escape)
-            && (self.details || self.rvc_page || self.soundpad_page || self.logs_page)
+            && (self.details || self.rvc_page || self.soundpad_page || self.effects_page)
         {
             return self.update(Msg::Page(0));
         }
@@ -3327,6 +3391,9 @@ impl App {
             if self.focus == focus::TAB_LOGS {
                 return self.update(Msg::Page(5));
             }
+            if self.focus == focus::TAB_EFFECTS {
+                return self.update(Msg::Page(6));
+            }
         }
         let delta = match key {
             Key::Named(Named::ArrowLeft | Named::ArrowDown) => -1,
@@ -3338,6 +3405,7 @@ impl App {
                 focus::logs::COPY if activate => Msg::LogsCopy,
                 focus::logs::FOLDER if activate => Msg::LogsFolder,
                 focus::logs::SEND if activate => Msg::SendReport,
+                focus::logs::BACK if activate => Msg::Page(2),
                 _ => Msg::Noop,
             }
         } else if self.soundpad_page {
@@ -3380,7 +3448,7 @@ impl App {
                 }
                 _ => Msg::Noop,
             }
-        } else if self.headphone_page {
+        } else if (focus::headphones::OUTPUT..=focus::headphones::REVERSE).contains(&self.focus) {
             use focus::headphones::*;
             match self.focus {
                 OUTPUT if delta != 0 || activate => {
@@ -3471,6 +3539,7 @@ impl App {
                 QUIT if activate => Msg::Quit,
                 AUTOSTART if activate => Msg::Autostart(!self.autostart),
                 APP_AUTOSTART if activate => Msg::AppAutostart(!self.app_autostart),
+                LOGS if activate => Msg::Page(5),
                 _ => Msg::Noop,
             }
         } else {
@@ -3490,6 +3559,9 @@ impl App {
                     )
                 }
                 MONITOR if activate => Msg::Monitor,
+                HEADPHONE_GEAR if activate => Msg::HeadphonePanel(!self.headphone_page),
+                ROUTE if activate => Msg::RouteToggle,
+                REVERSE_WORD if activate && !self.reverse_edit => Msg::ReverseEdit(true),
                 EFFECTS_MONITOR if activate => Msg::EffectsMonitor(!self.effects_monitor),
                 BOOST_MONITOR if activate => Msg::BoostMonitor(!self.boost_monitor),
                 MONITOR_BIND if activate => Msg::Bind(10),
@@ -4017,6 +4089,7 @@ mod controller_tests {
         assert!(app.effects_monitor && !app.boost_monitor);
         assert_eq!(app.monitor_mode(), 2);
         app.window = Some(App::open(1.0).0);
+        let _ = app.update(Msg::Page(6));
         app.focus = 31;
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 36);
@@ -4086,6 +4159,8 @@ mod controller_tests {
         app.window = Some(App::open(1.0).0);
         let _ = app.update(Msg::Page(5));
         assert!(app.logs_page && !app.details && !app.soundpad_page && !app.headphone_page);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::logs::BACK);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, focus::logs::COPY);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
@@ -4179,6 +4254,7 @@ mod controller_tests {
         );
         // Save through the row menu: the two targets are reachable only while it is open.
         app.sound_folder = Some(library.clone());
+        let _ = app.update(Msg::Page(6));
         app.focus = focus::effects::CLIP_BASE + 1;
         let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
         assert_eq!(app.clip_menu, Some(0));
@@ -4246,8 +4322,8 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         let _ = app.update(Msg::SoundHover(0, false));
         assert_eq!(app.sound_hover, None);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, 61);
-        for expected in [62, 63, 64, 75, 65, 66, 67, 68, 20000, 69, 1000, 1001, 1002, 1003, 1004, 1005, 40] {
+        assert_eq!(app.focus, 67);
+        for expected in [68, 62, 61, 63, 20000, 69, 1000, 1001, 1002, 1003, 1004, 1005, 66, 64, 75, 65, 40] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected);
         }
@@ -4466,18 +4542,26 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         app.window = Some(App::open(1.0).0);
         app.keys = [0; 13];
         use keyboard::{Key, Modifiers, key::Named};
-        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, 35);
-        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, 34);
-        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, 38);
-        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, 37);
-        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, 21);
-        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, 2);
+        // Шумодав: devices, the headphone gear, the folded route, then the two strengths.
+        for expected in [35, 50, 81, 82, 34, 38, 37, 40] {
+            let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+            assert_eq!(app.focus, expected);
+        }
+        // The gear opens the headphone panel in place and its controls join the order.
+        app.focus = 81;
+        let _ = app.key(Key::Named(Named::Enter), Modifiers::empty(), false);
+        assert!(app.headphone_page);
+        for expected in [51, 52, 53, 54, 55, 56, 82] {
+            let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+            assert_eq!(app.focus, expected);
+        }
+        let _ = app.key(Key::Named(Named::Escape), Modifiers::empty(), false);
+        assert!(!app.headphone_page && !app.effects_page);
+        let _ = app.update(Msg::Page(6));
+        for expected in [21, 2] {
+            let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+            assert_eq!(app.focus, expected);
+        }
         app.focus = 20;
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 9);
@@ -4491,7 +4575,7 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         let _ = app.update(Msg::AcceptBind);
         assert_eq!(app.keys[10], 200);
         app.focus = 23;
-        for expected in [31, 36, 32] {
+        for expected in [31, 36, 22, 32] {
             let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
             assert_eq!(app.focus, expected, "Tab follows the visual order of the bottom block");
         }
@@ -4505,7 +4589,7 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         let _ = app.key(Key::Named(Named::ArrowLeft), Modifiers::empty(), false);
         assert!((discord_volume_percent(app.controls.discord_volume) - 99.0).abs() < 0.0001);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
-        assert_eq!(app.focus, 40);
+        assert_eq!(app.focus, 32);
         let _ = app.update(Msg::Page(1));
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 24);
@@ -4606,9 +4690,13 @@ sounds=119:80:boom.wav	121:30:airhorn.mp3.wav",
         app.candidate = 122;
         let _ = app.update(Msg::AcceptBind);
         assert_eq!(app.keys[3], 122);
+        let _ = app.update(Msg::Page(6));
         app.focus = 13;
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 19);
+        // The reverse row's practice word sits before its hotkeys, as on screen.
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, 83);
         let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
         assert_eq!(app.focus, 15);
         let _ = app.key(Key::Named(Named::Space), Modifiers::empty(), false);
