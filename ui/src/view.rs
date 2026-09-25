@@ -2204,7 +2204,7 @@ mod tests {
             renderer.draw(&mut pixels.as_mut(), &mut mask, &Viewport::with_physical_size(size, 1.0), &changes, BG);
             // The renderer writes BGRA into the pixmap; PNG wants RGBA.
             let mut data = pixels.data().to_vec();
-            for px in data.chunks_exact_mut(4) {
+            for px in data.as_chunks_mut::<4>().0 {
                 px.swap(0, 2);
             }
             let mut encoder = png::Encoder::new(std::fs::File::create(dir.join(format!("design-{name}.png"))).unwrap(), size.width, size.height);
