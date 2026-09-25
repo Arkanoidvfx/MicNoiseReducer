@@ -404,6 +404,9 @@ impl App {
     fn clock(&self) -> Clock {
         Clock { epoch: self.epoch, opened: self.opened_at, animate: self.ui_active() }
     }
+    fn ring(&self, focused: bool) -> bool {
+        focused && self.focus_visible
+    }
     fn key_held(&self, vk: u32) -> bool {
         self.keys_down[(vk / 64 % 4) as usize] >> (vk % 64) & 1 != 0
     }
@@ -776,7 +779,7 @@ impl App {
                 row![label("Сила", 13, DIM), Space::new().width(Length::Fill)].height(26).align_y(iced::Center),
                 frame(
                     tacho(0.0..=200.0, strength, Msg::Intensity, clock).default(100.0).red_above(100.0).segments(20),
-                    self.focus == INTENSITY,
+                    self.ring(self.focus == INTENSITY),
                 ),
             ]
             .push(risky.then(|| {
@@ -792,10 +795,9 @@ impl App {
         .padding([14, 16])
         .width(Length::Fill);
         // In the red zone the card's background carries the police tape under its content.
-        let mut layers = widget::stack![noise_card].width(Length::Fill);
-        if risky {
-            layers = layers.push_under(tacho::caution(clock));
-        }
+        // The tape layer is always in the tree (drawn only in the red zone): adding it on the fly
+        // would move the slider in the widget tree and drop a drag that crosses 100%.
+        let layers = widget::stack![noise_card].width(Length::Fill).push_under(tacho::caution(clock, risky));
         let noise_card = card(layers).padding(0);
         let hold_card = card(
             column![
@@ -812,7 +814,7 @@ impl App {
                         .red_above(100.0)
                         .segments(20)
                         .phase(20.0 * 64.0 + 128.0),
-                    self.focus == ALT_INTENSITY,
+                    self.ring(self.focus == ALT_INTENSITY),
                 ),
                 label("Смена силы шумодава при удержании", 12, FAINT),
             ]
@@ -887,14 +889,14 @@ impl App {
                         .compact()
                         .phase(3000.0)
                         .enabled(self.headphone_denoise),
-                    self.focus == INTENSITY,
+                    self.ring(self.focus == INTENSITY),
                 ),
             ),
             rowl(
                 named("Громкость"),
                 frame(
                     tacho(0.0..=100.0, self.headphone_volume * 100.0, Msg::HeadphoneVolume, clock).default(70.0).segments(16).compact().phase(4200.0),
-                    self.focus == VOLUME,
+                    self.ring(self.focus == VOLUME),
                 ),
             ),
             rowl(
@@ -907,7 +909,7 @@ impl App {
                         .compact()
                         .phase(5400.0)
                         .format(|v| format!("{:+.0} пт", v).replace('-', "−")),
-                    self.focus == PITCH,
+                    self.ring(self.focus == PITCH),
                 ),
             ),
             rowl(
@@ -970,7 +972,7 @@ impl App {
                             .segments(16)
                             .compact()
                             .phase(0.0),
-                        self.focus == BOOST,
+                        self.ring(self.focus == BOOST),
                     ),
                     BOOST_BIND,
                     self.snapshot.boost_active != 0,
@@ -987,7 +989,7 @@ impl App {
                             .compact()
                             .phase(150.0)
                             .format(|v| format!("{:+.0}", v).replace('-', "−")),
-                        self.focus == PITCH,
+                        self.ring(self.focus == PITCH),
                     ),
                     PITCH_BIND,
                     self.snapshot.pitch_active != 0,
@@ -1006,7 +1008,7 @@ impl App {
                             .compact()
                             .phase(300.0)
                             .format(|v| format!("×{:.2}", -v / 100.0)),
-                        self.focus == SLOW,
+                        self.ring(self.focus == SLOW),
                     ),
                     SLOW_BIND,
                     (1..=8).contains(&self.phrase_state) && self.phrase_state % 2 == 1,
@@ -1023,7 +1025,7 @@ impl App {
                             .compact()
                             .phase(450.0)
                             .format(|v| format!("×{:.2}", v / 100.0)),
-                        self.focus == FAST,
+                        self.ring(self.focus == FAST),
                     ),
                     FAST_BIND,
                     (1..=8).contains(&self.phrase_state) && self.phrase_state % 2 == 0,
@@ -1154,7 +1156,7 @@ impl App {
                     .segments(18)
                     .compact()
                     .phase(600.0),
-                self.focus == DISCORD_VOLUME,
+                self.ring(self.focus == DISCORD_VOLUME),
             ),
         ]
         .spacing(8);
@@ -1456,7 +1458,7 @@ impl App {
                         .origin(0.0)
                         .segments(16)
                         .format(|v| format!("{:+.0} пт", v).replace('-', "−")),
-                    self.focus == PITCH,
+                    self.ring(self.focus == PITCH),
                 ),
                 label("Сдвигает тон готового голоса модели. Ctrl+клик — 0.", 11, FAINT),
             ]
@@ -1474,7 +1476,7 @@ impl App {
         .spacing(8);
         if self.rvc_advanced {
             let index: Element<'_, Msg> = if self.rvc_has_index() {
-                frame(tacho(0.0..=100.0, self.controls.rvc_options.index as f32, Msg::RvcIndex, clock).default(0.0).segments(16).compact().phase(900.0), self.focus == INDEX)
+                frame(tacho(0.0..=100.0, self.controls.rvc_options.index as f32, Msg::RvcIndex, clock).default(0.0).segments(16).compact().phase(900.0), self.ring(self.focus == INDEX))
             } else {
                 label("Недоступно: у модели нет .index", 12, FAINT).into()
             };
@@ -1482,7 +1484,7 @@ impl App {
                 .push(label("Влияние индекса", 12, DIM))
                 .push(index)
                 .push(label("Вход модели", 12, DIM))
-                .push(frame(tacho(50.0..=300.0, self.controls.rvc_options.gain as f32, Msg::RvcGain, clock).step(5.0).default(100.0).segments(16).compact().phase(1800.0), self.focus == GAIN))
+                .push(frame(tacho(50.0..=300.0, self.controls.rvc_options.gain as f32, Msg::RvcGain, clock).step(5.0).default(100.0).segments(16).compact().phase(1800.0), self.ring(self.focus == GAIN)))
                 .push(
                     row![
                         label("Блок аудио, мс", 12, DIM),
@@ -1667,7 +1669,7 @@ impl App {
             icon(glyph::VOLUME, 13, DIM),
             container(frame(
                 tacho(0.0..=200.0, self.sound_volume * 100.0, Msg::SoundpadVolume, clock).default(100.0).segments(18).compact().phase(0.0),
-                self.focus == VOLUME,
+                self.ring(self.focus == VOLUME),
             ))
             .width(250),
             frame(switch(self.sound_normalize, Msg::SoundpadNormalize, true), self.focus == NORMALIZE),
@@ -1870,7 +1872,7 @@ impl App {
                         .default(100.0)
                         .segments(12)
                         .compact(),
-                    volume_focused,
+                    self.ring(volume_focused),
                 )
             } else {
                 Space::new().into()

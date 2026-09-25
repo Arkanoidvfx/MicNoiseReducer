@@ -686,6 +686,8 @@ struct App {
     auto_started: bool,
     recovery: Recovery,
     focus: usize,
+    /// Like CSS `:focus-visible`: slider focus rings show after keyboard use, not after a drag.
+    focus_visible: bool,
     dirty: Option<Instant>,
     hint_shown: bool,
     autostart: bool,
@@ -1079,6 +1081,7 @@ impl App {
                 auto_started: false,
                 recovery: Recovery::default(),
                 focus: focus::NONE,
+                focus_visible: false,
                 dirty: None,
                 hint_shown,
                 autostart: !cfg!(test) && engine::tag_autostart(-1).unwrap_or(false),
@@ -2174,6 +2177,7 @@ impl App {
             Msg::RouteToggle => self.route_open = !self.route_open,
             Msg::ReverseWord(word) => self.reverse_word = word.chars().take(12).collect(),
             Msg::PointerDown => {
+                self.focus_visible = false;
                 if self.reverse_edit {
                     // The field has already handled the click: it stays focused only if clicked.
                     return iced::widget::operation::is_focused("reverse-word")
@@ -3165,7 +3169,10 @@ impl App {
                     }
                 }
             }
-            Msg::Key(key, mods, repeat) => return self.key(key, mods, repeat),
+            Msg::Key(key, mods, repeat) => {
+                self.focus_visible = true;
+                return self.key(key, mods, repeat);
+            }
             Msg::Screenshot(shot) => {
                 if let Some(path) = &self.capture_path {
                     let result = (|| -> Result<(), Box<dyn std::error::Error>> {

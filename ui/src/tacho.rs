@@ -695,11 +695,13 @@ fn label(content: String, size: f32, bounds: Size, align: text::Alignment) -> Te
 
 /// Police tape behind a card whose value is in the red zone: two hatched bands with the
 /// word crawling along them. It rolls out once, then only the text moves.
-pub fn caution<'a, Message: 'a>(clock: Clock) -> Element<'a, Message> {
-    Element::new(Caution { clock })
+pub fn caution<'a, Message: 'a>(clock: Clock, shown: bool) -> Element<'a, Message> {
+    Element::new(Caution { clock, shown })
 }
 struct Caution {
     clock: Clock,
+    /// Hidden tapes stay in the tree so the card's content keeps its widget state.
+    shown: bool,
 }
 #[derive(Default)]
 struct Born(Option<Instant>);
@@ -713,6 +715,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Caution {
     fn update(&mut self, tree: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
         if let Event::Window(window::Event::RedrawRequested(now)) = event {
             let born = tree.state.downcast_mut::<Born>();
+            if !self.shown {
+                born.0 = None;
+                return;
+            }
             born.0.get_or_insert(*now);
             if self.clock.animate {
                 shell.request_redraw_at(RedrawRequest::At(*now + Duration::from_millis(40)));
@@ -722,6 +728,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Caution {
     fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
         let b = layout.bounds();
         let now = Instant::now();
+        if !self.shown {
+            return;
+        }
         // Without a frame event yet (a headless render) the tapes are shown fully rolled out.
         let age = tree.state.downcast_ref::<Born>().0.map_or(1.0, |born| now.saturating_duration_since(born).as_secs_f32());
         let t = now.saturating_duration_since(self.clock.epoch).as_secs_f32();
