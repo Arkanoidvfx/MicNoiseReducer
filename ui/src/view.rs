@@ -2420,6 +2420,88 @@ mod tests {
         save(&app, "update-launching".into());
     }
 
+    #[test]
+    fn page_swap_repaints_whole_window() {
+        let (mut app, _) = App::from_settings(Settings::for_test("")).unwrap().unwrap();
+        let first = app.backdrop();
+        let _ = app.update(Msg::Page(0));
+        assert_eq!(app.backdrop(), first, "same page keeps region repaints");
+        let _ = app.update(Msg::Page(2));
+        assert_ne!(app.backdrop(), first, "a page swap forces one full pass");
+        assert_eq!(app.backdrop().into_rgba8(), BG.into_rgba8(), "the same pixels");
+        let _ = app.update(Msg::PageShiftReveal);
+        assert_eq!(app.backdrop(), first);
+        let _ = app.update(Msg::SoundpadFilter("a".into()));
+        assert_ne!(app.backdrop(), first, "a rebuilt clip list forces one full pass");
+    }
+    /// Whole-window cost of each tab switch as the window pays it: update, view/diff/layout on
+    /// the persistent tree, then a damaged-region raster. `MNR_TAB_BENCH_FOLDER` = real clips.
+    #[test]
+    #[ignore]
+    fn tab_switch_timing() {
+        use iced::advanced::{Renderer as _, Layout, graphics::{damage, Viewport}};
+        let folder = std::env::var("MNR_TAB_BENCH_FOLDER").ok();
+        let settings = folder.as_ref().map(|f| format!("[soundpad]\nfolder={f}")).unwrap_or_default();
+        let (mut app, _) = App::from_settings(Settings::for_test(&settings)).unwrap().unwrap();
+        app.window = Some(window::Id::unique());
+        let scale: f32 = std::env::var("MNR_TAB_BENCH_SCALE").ok().map(|s| s.parse().unwrap()).unwrap_or(1.0);
+        let (w, h) = (1040.0_f32, 740.0_f32);
+        let size = Size::new((w * scale) as u32, (h * scale) as u32);
+        let full = iced::Rectangle::with_size(Size::new(w, h));
+        let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
+        let mut pixels = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
+        let mut mask = tiny_skia::Mask::new(size.width, size.height).unwrap();
+        let viewport = Viewport::with_physical_size(size, scale);
+        let mut tree = iced::advanced::widget::Tree::empty();
+        let mut previous = Vec::new();
+        let mut backdrop = app.backdrop();
+        let mut frame = |app: &App| {
+            let start = Instant::now();
+            let mut element = app.view(window::Id::unique());
+            tree.diff(element.as_widget());
+            let layout = element.as_widget_mut().layout(&mut tree, &renderer, &iced::advanced::layout::Limits::new(Size::ZERO, Size::new(w, h)));
+            let layout_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let start = Instant::now();
+            renderer.reset(full);
+            element.as_widget().draw(&tree, &mut renderer, &Theme::Dark, &iced::advanced::renderer::Style { text_color: INK }, Layout::new(&layout), iced::mouse::Cursor::Unavailable, &full);
+            // As the tiny-skia compositor: a changed background repaints the window in one pass.
+            let changes = if app.backdrop() != backdrop { vec![full] } else {
+                damage::group(damage::diff(&previous, renderer.layers(), |layer| vec![layer.bounds], iced_tiny_skia::Layer::damage), full)
+            };
+            backdrop = app.backdrop();
+            previous = renderer.layers().to_vec();
+            let regions = changes.len();
+            renderer.draw(&mut pixels.as_mut(), &mut mask, &viewport, &changes, BG);
+            (layout_ms, start.elapsed().as_secs_f64() * 1000.0, regions)
+        };
+        let _ = frame(&app);
+        eprintln!("{} clips, scale {scale}", app.sounds.len());
+        for round in 0..2 {
+            for (name, page) in [("effects", 6u8), ("soundpad", 4), ("rvc", 1), ("settings", 2), ("logs", 5), ("main", 0)] {
+                let start = Instant::now();
+                let _ = app.update(Msg::Page(page));
+                let update_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let start = Instant::now();
+                let mosaic = app.page_mosaic();
+                let mosaic_ms = start.elapsed().as_secs_f64() * 1000.0;
+                app.page_shift = None;
+                let (layout_ms, draw_ms, regions) = frame(&app);
+                eprintln!("round {round} {name:9}: update {update_ms:5.1} | mosaic {mosaic_ms:5.1} ({}) | new page view+layout {layout_ms:5.1} draw {draw_ms:5.1} ms in {regions} region(s)",
+                    mosaic.is_some());
+            }
+        }
+        let _ = app.update(Msg::Page(4));
+        let _ = frame(&app);
+        let sort = |app: &App| app.sound_sort;
+        let mut steps: Vec<(&str, Msg)> = vec![("filter a", Msg::SoundpadFilter("a".into())), ("filter ge", Msg::SoundpadFilter("ge".into())), ("filter clear", Msg::SoundpadFilter(String::new()))];
+        steps.push(("sort new", Msg::SoundpadSort(SoundSort::from_code((sort(&app).code() + 3) % 4))));
+        steps.push(("sort back", Msg::SoundpadSort(sort(&app))));
+        for (name, msg) in steps {
+            let _ = app.update(msg);
+            let (layout_ms, draw_ms, regions) = frame(&app);
+            eprintln!("soundpad {name:12}: view+layout {layout_ms:5.1} draw {draw_ms:5.1} ms in {regions} region(s)");
+        }
+    }
     /// Frames of the page-switch pixelation, with their draw + raster time.
     #[test]
     #[ignore]

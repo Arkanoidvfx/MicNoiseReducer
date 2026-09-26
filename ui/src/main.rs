@@ -647,6 +647,8 @@ struct App {
     /// The old and new page, painted small, while the page switch pixelates between them.
     page_shift: Option<(std::sync::Arc<tacho::Mosaic>, std::sync::Arc<tacho::Mosaic>, Instant)>,
     page_shift_revealed: bool,
+    /// Flipped on frames that swap most of the page: see [`App::backdrop`].
+    repaint_all: bool,
     /// The update shrink («Перезапустить») or grow (first start after an update).
     morph: Option<MorphView>,
     /// The downloaded update's version, for the update window.
@@ -1075,6 +1077,7 @@ impl App {
                 keys_down: [0; 4],
                 page_shift: None,
                 page_shift_revealed: false,
+                repaint_all: false,
                 morph: None,
                 update_version: None,
                 intro,
@@ -1374,6 +1377,13 @@ impl App {
         let intent = self.update_resume;
         let at = center.map_or("centered".to_owned(), |c| format!("{:.1},{:.1}", c.x, c.y));
         Task::batch([Task::perform(async move { updater::apply_and_restart(intent, Some(at)) }, Msg::UpdateApplied), timer(false)])
+    }
+    /// The window background. tiny-skia repaints every damaged region separately with all
+    /// that overlaps it; a page swap damages 7–30 regions and cost 10–120 ms a frame, against
+    /// 2–10 ms for one full pass. A changed background is its only switch to a full pass, so
+    /// `repaint_all` flips the lowest mantissa bit: a different colour, the same pixels.
+    fn backdrop(&self) -> iced::Color {
+        iced::Color { r: f32::from_bits(view::BG.r.to_bits() ^ self.repaint_all as u32), ..view::BG }
     }
     fn page_key(&self) -> [bool; 5] {
         [self.soundpad_page, self.logs_page, self.details, self.rvc_page, self.effects_page]
@@ -1740,6 +1750,9 @@ impl App {
             self.scroll_anims.clear();
             self.scroll_pending.clear();
             self.sound_hover = None;
+            // A rebuilt clip list repaints in one pass, as a page swap does. Not on hiding or
+            // focus loss (switching to a game): no extra frame there.
+            self.repaint_all ^= !matches!(&msg, Msg::Page(_) | Msg::Hide | Msg::Minimize | Msg::WindowFocus(..));
         }
         match msg {
             Msg::Tick => {
@@ -2342,6 +2355,7 @@ impl App {
                     .filter(|_| self.page_key() != before)
                     .and_then(|from| Some((from, self.page_mosaic()?, Instant::now())));
                 self.page_shift_revealed = false;
+                self.repaint_all ^= self.page_key() != before;
                 let snap = iced::widget::operation::snap_to(
                     "body",
                     iced::widget::scrollable::RelativeOffset::START,
@@ -3336,7 +3350,10 @@ impl App {
                 self.page_shift = None;
                 self.page_shift_revealed = false;
             }
-            Msg::PageShiftReveal => self.page_shift_revealed = true,
+            Msg::PageShiftReveal => {
+                self.page_shift_revealed = true;
+                self.repaint_all ^= true;
+            }
             Msg::DecayGeometry(position, size) => {
                 let Some(position) = position else { return self.hand_over(None) };
                 let center = iced::Point::new(position.x + size.width / 2.0, position.y + size.height / 2.0);
@@ -4095,6 +4112,7 @@ fn main() {
                 },
             )
         })
+        .style(|s: &App, _| iced::theme::Style { background_color: s.backdrop(), text_color: view::INK })
         .default_font(Font::with_name("Segoe UI"))
         .subscription(App::subscription)
         .scale_factor(|s: &App, _| s.qa_scale)
