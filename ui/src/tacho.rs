@@ -174,7 +174,6 @@ struct State {
     ready: bool,
     drag: bool,
     mods: keyboard::Modifiers,
-    hover: bool,
     shown: f32,
     last: f32,
     old: (i32, i32),
@@ -183,7 +182,6 @@ struct State {
     peak: Option<(i32, Instant)>,
     touched: Option<Instant>,
     frame: Option<Instant>,
-    hover_since: Option<Instant>,
     painted: Painted,
 }
 
@@ -237,18 +235,10 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                 state.touched = Some(Instant::now());
                 shell.request_redraw();
             }
-            Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                if state.drag {
-                    publish(self.locate(track, position.x), shell);
-                    state.touched = Some(Instant::now());
-                    shell.capture_event();
-                }
-                let hover = self.enabled && hit.contains(*position);
-                if hover != state.hover {
-                    state.hover = hover;
-                    state.hover_since = hover.then(Instant::now);
-                    shell.request_redraw();
-                }
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.drag => {
+                publish(self.locate(track, position.x), shell);
+                state.touched = Some(Instant::now());
+                shell.capture_event();
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => state.mods = *m,
             Event::Window(window::Event::RedrawRequested(now)) => {
@@ -320,10 +310,6 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
             .map(|a| now.saturating_duration_since(a).as_secs_f32() / 0.3)
             .filter(|t| *t < 1.0);
         let pulse = 0.85 + 0.15 * (now.saturating_duration_since(self.clock.epoch).as_secs_f32() * std::f32::consts::TAU / 1.8).cos();
-        let scan = state.hover_since.filter(|_| state.hover && self.clock.animate).map(|s| {
-            let t = now.saturating_duration_since(s).as_secs_f32() / 0.75;
-            (t.fract() * 1.6 - 0.3) * track.width + track.x
-        });
         let press = if state.drag { 1.2 } else { 1.0 };
         let w = self.seg_width();
         let mut shapes = Vec::with_capacity(n * 6);
@@ -369,10 +355,6 @@ impl<'a, Message> Widget<Message, Theme, Renderer> for Tacho<'a, Message> {
                 let (dy, b) = wave(self.wave_time(now, i), self.compact);
                 lift = dy;
                 glow = glow.max(b);
-            }
-            if let Some(sx) = scan {
-                let d = ((x + w / 2.0) - sx).abs() / (track.width * 0.08);
-                if d < 1.0 { glow = glow.max((1.0 - d) * 0.5); }
             }
             if glow > 0.0 {
                 color = brighten(color, glow);
@@ -482,7 +464,7 @@ impl<Message> Tacho<'_, Message> {
         if busy {
             return Some(frame_after(now));
         }
-        if state.hover || (self.in_red(self.value) && self.enabled) {
+        if self.in_red(self.value) && self.enabled {
             return Some(soon(33));
         }
         if let Some(t) = state.touched {
@@ -1040,7 +1022,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Keycap {
 }
 
 /// The До / После level bars. The raw microphone is drawn as ragged, gently flickering bars; the denoised output as crisp slanted segments in the sliders'
-/// style, with a glowing head and a peak mark that holds, then sinks. `level` is 0..1.
+/// style, with a glowing head. `level` is 0..1.
 pub fn level_meter<'a, Message: 'a>(level: f32, noisy: bool, color: Color) -> Element<'a, Message> {
     Element::new(LevelMeter { level: level.clamp(0.0, 1.0), noisy, color })
 }
@@ -1051,12 +1033,8 @@ struct LevelMeter {
 }
 const METER_H: f32 = 14.0;
 const CLEAN_SEGMENTS: usize = 40;
-const PEAK_HOLD: Duration = Duration::from_millis(900);
 #[derive(Default)]
 struct MeterState {
-    peak: f32,
-    peak_at: Option<Instant>,
-    frame: Option<Instant>,
     painted: Painted,
 }
 /// Stable pseudo-random 0..1 for bar `i` in flicker frame `t`.
@@ -1070,24 +1048,6 @@ fn grain(i: u32, t: u32) -> f32 {
 impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
     fn tag(&self) -> tree::Tag { tree::Tag::of::<MeterState>() }
     fn state(&self) -> tree::State { tree::State::new(MeterState::default()) }
-    fn update(&mut self, tree: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, _: &mut Shell<'_, Message>, _: &Rectangle) {
-        let Event::Window(window::Event::RedrawRequested(now)) = event else { return };
-        if self.noisy {
-            return;
-        }
-        let m = tree.state.downcast_mut::<MeterState>();
-        let dt = m.frame.map_or(0.0, |f| now.saturating_duration_since(f).as_secs_f32());
-        m.frame = Some(*now);
-        if self.level >= m.peak {
-            m.peak = self.level;
-            m.peak_at = Some(*now);
-        } else if m.peak_at.is_none_or(|at| now.saturating_duration_since(at) >= PEAK_HOLD) {
-            m.peak = (m.peak - dt * 0.6).max(self.level);
-        }
-        // No frames of its own: the level updates (20 per second while shown) already redraw
-        // the meter, and the peak sinks on those. Asking for frames until the peak met a level
-        // that never stops moving kept the UI redrawing flat out.
-    }
     fn size(&self) -> Size<Length> {
         Size { width: Length::Fill, height: Length::Fixed(METER_H) }
     }
@@ -1103,7 +1063,6 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
             let (gap, h) = (3.0, METER_H - 2.0);
             let w = (b.width - 8.0 - gap * (n - 1) as f32) / n as f32;
             let lit = (self.level * n as f32).round() as usize;
-            let peak = ((m.peak.max(self.level) * n as f32).round() as usize).min(n);
             let dim = Color { r: self.color.r * 0.38, g: self.color.g * 0.38, b: self.color.b * 0.38, a: 1.0 };
             let mut shapes = Vec::with_capacity(n * 2 + 8);
             for i in 0..n {
@@ -1119,10 +1078,6 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
                     } else {
                         segment(&mut shapes, x, y, w, h, c);
                     }
-                } else if i + 1 == peak && peak > lit {
-                    // The held peak: an outlined segment in the bar's colour.
-                    segment(&mut shapes, x, y, w, h, Color { a: 0.9, ..self.color });
-                    segment(&mut shapes, x + 1.5, y + 1.5, w - 3.0, h - 3.0, OFF);
                 } else {
                     segment(&mut shapes, x, y, w, h, OFF_EDGE);
                     segment(&mut shapes, x + 1.0, y + 1.0, w - 2.0, h - 2.0, OFF);
