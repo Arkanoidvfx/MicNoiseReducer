@@ -511,11 +511,9 @@ impl App {
             ..Default::default()
         });
 
-        // Under an opaque mosaic the page is not drawn at all; it returns as the mosaic fades.
-        let page: Element<'_, Msg> = if self.page_shift.is_some() && !self.page_shift_revealed { Space::new().into() } else { self.body() };
         let body = widget::stack![
-            page,
-            tacho::page_shift(self.page_shift.as_ref(), Msg::PageShiftReveal, Msg::PageShiftDone),
+            self.body(),
+            tacho::page_shift(self.page_shift.as_ref(), Msg::PageShiftDone),
         ]
         .width(Length::Fill)
         .height(Length::Fill);
@@ -2441,10 +2439,9 @@ mod tests {
         let _ = app.update(Msg::Page(2));
         assert_ne!(app.backdrop(), first, "a page swap forces one full pass");
         assert_eq!(app.backdrop().into_rgba8(), BG.into_rgba8(), "the same pixels");
-        let _ = app.update(Msg::PageShiftReveal);
-        assert_eq!(app.backdrop(), first);
+        let swapped = app.backdrop();
         let _ = app.update(Msg::SoundpadFilter("a".into()));
-        assert_ne!(app.backdrop(), first, "a rebuilt clip list forces one full pass");
+        assert_ne!(app.backdrop(), swapped, "a rebuilt clip list forces one full pass");
     }
     /// Whole-window cost of each tab switch as the window pays it: update, view/diff/layout on
     /// the persistent tree, then a damaged-region raster. `MNR_TAB_BENCH_FOLDER` = real clips.
@@ -2568,26 +2565,25 @@ mod tests {
         }
         let _ = app.update(Msg::Page(0));
         app.page_shift = None;
-        let started = Instant::now();
-        let from = app.page_mosaic().unwrap();
         app.effects_page = true;
+        let started = Instant::now();
         let to = app.page_mosaic().unwrap();
-        eprintln!("two offscreen pages: {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        eprintln!("new page offscreen: {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
         {
             let mut renderer = iced::Renderer::new(Font::with_name("Segoe UI"), iced::Pixels(14.0));
             let mut pixels = tiny_skia::Pixmap::new(size.width, size.height).unwrap();
             let mut previous = Vec::new();
             let mut tree = iced::advanced::widget::Tree::empty();
             let begin = Instant::now() - Duration::from_millis(1);
-            app.page_shift = Some((from.clone(), to.clone(), begin));
+            app.page_shift = Some((to.clone(), begin));
             for step in 0..24u64 {
-                app.page_shift = Some((from.clone(), to.clone(), begin - Duration::from_millis(step * 16)));
+                app.page_shift = Some((to.clone(), begin - Duration::from_millis(step * 16)));
                 let (regions, took) = windowed(&app, &mut tree, &mut previous, &mut renderer, &mut pixels);
                 eprintln!("windowed frame {:3} ms: {regions} damage regions, {took:.1} ms", step * 16);
             }
         }
-        for ms in [0u64, 17, 34, 51, 68, 85] {
-            app.page_shift = Some((from.clone(), to.clone(), Instant::now() - Duration::from_millis(ms)));
+        for ms in [2u64, 13, 24] {
+            app.page_shift = Some((to.clone(), Instant::now() - Duration::from_millis(ms)));
             let (pixels, took) = frame(&app);
             eprintln!("frame at {ms} ms: {took:.1} ms");
             let mut data = pixels.data().to_vec();

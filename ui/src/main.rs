@@ -560,8 +560,6 @@ enum Msg {
     Noop,
     /// The page-switch pixelation has played out.
     PageShiftDone,
-    /// The page-switch mosaic starts to fade: draw the new page under it again.
-    PageShiftReveal,
     /// «Перезапустить»: the window's position and size, to shrink it into the update window.
     DecayGeometry(Option<iced::Point>, Size),
     /// The window's native handle: colour-key it for a morph.
@@ -649,9 +647,8 @@ struct App {
     in_peak: f32,
     /// Bound keys held right now (bitset by virtual-key code), for the pressed keycaps.
     keys_down: [u64; 4],
-    /// The old and new page, painted small, while the page switch pixelates between them.
-    page_shift: Option<(std::sync::Arc<tacho::Mosaic>, std::sync::Arc<tacho::Mosaic>, Instant)>,
-    page_shift_revealed: bool,
+    /// The new page, painted small, while its mosaic resolves over it after a page switch.
+    page_shift: Option<(std::sync::Arc<tacho::Mosaic>, Instant)>,
     /// Flipped on frames that swap most of the page: see [`App::backdrop`].
     repaint_all: bool,
     /// The update shrink («Перезапустить») or grow (first start after an update).
@@ -1085,7 +1082,6 @@ impl App {
                 in_peak: 0.0,
                 keys_down: [0; 4],
                 page_shift: None,
-                page_shift_revealed: false,
                 repaint_all: false,
                 morph: None,
                 update_version: None,
@@ -2352,8 +2348,6 @@ impl App {
                     let _ = self.update(Msg::CancelBind);
                 }
                 let before = self.page_key();
-                // Without the pixelation the page swaps at once and nothing is painted offscreen.
-                let from = (!cfg!(test) && self.pixel_shift && self.ui_active()).then(|| self.page_mosaic()).flatten();
                 self.soundpad_page = page == 4;
                 // Page 3 is no longer a page: the headphone panel opens over Шумодав.
                 self.headphone_page = page == 3;
@@ -2365,10 +2359,11 @@ impl App {
                 self.reverse_edit = false;
                 self.focus = focus::NONE;
                 // Only a real page change pixelates; re-selecting the same page stays still.
-                self.page_shift = from
-                    .filter(|_| self.page_key() != before)
-                    .and_then(|from| Some((from, self.page_mosaic()?, Instant::now())));
-                self.page_shift_revealed = false;
+                // Without the effect nothing is painted offscreen.
+                self.page_shift = (!cfg!(test) && self.pixel_shift && self.ui_active() && self.page_key() != before)
+                    .then(|| self.page_mosaic())
+                    .flatten()
+                    .map(|to| (to, Instant::now()));
                 self.repaint_all ^= self.page_key() != before;
                 let snap = iced::widget::operation::snap_to(
                     "body",
@@ -3370,14 +3365,7 @@ impl App {
                 }
             }
             Msg::Noop => {}
-            Msg::PageShiftDone => {
-                self.page_shift = None;
-                self.page_shift_revealed = false;
-            }
-            Msg::PageShiftReveal => {
-                self.page_shift_revealed = true;
-                self.repaint_all ^= true;
-            }
+            Msg::PageShiftDone => self.page_shift = None,
             Msg::DecayGeometry(position, size) => {
                 let Some(position) = position else { return self.hand_over(None) };
                 let center = iced::Point::new(position.x + size.width / 2.0, position.y + size.height / 2.0);
