@@ -39,7 +39,7 @@ try {
     $registered = $true
     & $config --unattended --url "https://github.com/$repo" --token $registration.token --name $name --labels micnoize-release --no-default-labels --ephemeral *> (Join-Path $root 'results\local-runner-config.log')
     if ($LASTEXITCODE -ne 0) { throw 'Runner registration failed; see results/local-runner-config.log.' }
-    $runner = Start-Process -FilePath $env:ComSpec -ArgumentList '/c','run.cmd' -WorkingDirectory $runnerDir -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $root 'results\local-runner.out.log') -RedirectStandardError (Join-Path $root 'results\local-runner.err.log')
+    $runner = Start-Process -FilePath $env:ComSpec -ArgumentList '/c',('"' + (Join-Path $runnerDir 'run.cmd') + '"') -WorkingDirectory $runnerDir -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $root 'results\local-runner.out.log') -RedirectStandardError (Join-Path $root 'results\local-runner.err.log')
     $online = $false
     for ($i=0; $i -lt 45; $i++) {
         $list = & gh api "repos/$repo/actions/runners" | ConvertFrom-Json
