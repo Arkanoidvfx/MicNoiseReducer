@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{
     path::Path,
     sync::OnceLock,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -29,13 +29,15 @@ pub fn record(data: &Path, name: &str, details: serde_json::Value) {
     let data = data.to_path_buf();
     let name = name.to_owned();
     std::thread::spawn(move || {
-        let _ = send(&data, vec![event("app-lifecycle", &name, details)]);
+        let _ = send(&data, vec![event("app-lifecycle", &name, details)], Duration::from_secs(4));
     });
 }
 
+/// Sent on the UI thread while quitting, so it is capped short: a stalled connection used to
+/// freeze the window for good (ureq has no timeout by default) and only killing the process helped.
 pub fn record_blocking(data: &Path, name: &str, details: serde_json::Value) {
     if enabled() {
-        let _ = send(data, vec![event("app-lifecycle", name, details)]);
+        let _ = send(data, vec![event("app-lifecycle", name, details)], Duration::from_millis(1500));
     }
 }
 
@@ -54,7 +56,7 @@ pub fn report(data: &Path, runtime: &Path, note: &str) -> Result<String, String>
         }
     }
     let count = events.len();
-    send(data, events)?;
+    send(data, events, Duration::from_secs(15))?;
     Ok(format!("Отчёт отправлен ({count})"))
 }
 
@@ -94,7 +96,7 @@ fn support_label(user: &str, computer: &str) -> Option<String> {
     Some(label)
 }
 
-fn send(data: &Path, events: Vec<serde_json::Value>) -> Result<(), String> {
+fn send(data: &Path, events: Vec<serde_json::Value>, timeout: Duration) -> Result<(), String> {
     let install_path = data.join("install-id.txt");
     let install_id = std::fs::read_to_string(&install_path)
         .ok()
@@ -135,7 +137,9 @@ fn send(data: &Path, events: Vec<serde_json::Value>) -> Result<(), String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret().as_bytes()).map_err(|e| e.to_string())?;
     mac.update(signed.as_bytes());
     let hmac = hex::encode(mac.finalize().into_bytes());
-    ureq::post(ENDPOINT)
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(timeout)).build().into();
+    agent
+        .post(ENDPOINT)
         .header("Content-Type", "application/json")
         .header("X-App-Id", "mic_noize")
         .header("X-Install-Id", &install_id.to_string())

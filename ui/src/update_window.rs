@@ -150,7 +150,12 @@ impl Watcher {
                     }
                     Err(_) => {}
                 }
-                // Done: wait for the new UI to cover this window, or give up after a while.
+                // «Готово» for a moment, then «Запускаем…» with a live bar while the new version
+                // starts (engine and GPU take a few seconds): a still green bar read as a hang.
+                if self.stage == BarStage::Done && self.finished.is_some_and(|done| done.elapsed() > Duration::from_millis(400)) {
+                    self.stage = BarStage::Launching;
+                }
+                // Wait for the new UI to cover this window, or give up after a while.
                 if let Some(done) = self.finished {
                     let shown = shown_file(&self.runtime);
                     if shown.exists() || done.elapsed() > Duration::from_secs(12) {

@@ -2100,7 +2100,7 @@ impl App {
                 if self.intro.take().is_some() {
                     // Stand in for the watcher's update window first: same card, same place.
                     self.morph = Some(MorphView {
-                        base: MorphBase::Card(tacho::BarStage::Done),
+                        base: MorphBase::Card(tacho::BarStage::Launching),
                         from_version: String::new(),
                         to_version: env!("CARGO_PKG_VERSION").into(),
                         anim: None,
@@ -3390,7 +3390,7 @@ impl App {
                     width: view::UPDATE_CARD.width,
                     height: view::UPDATE_CARD.height,
                 };
-                let from = view::mosaic_of::<Msg>(view::update_card(tacho::BarStage::Done, "", env!("CARGO_PKG_VERSION")), view::UPDATE_CARD);
+                let from = view::mosaic_of::<Msg>(view::update_card(tacho::BarStage::Launching, "", env!("CARGO_PKG_VERSION")), view::UPDATE_CARD);
                 let to = self.window_mosaic(size);
                 match (&mut self.morph, from, to) {
                     (Some(m), Some(from), Some(to)) => {
@@ -4158,7 +4158,7 @@ mod controller_tests {
         // First start after an update: stand in as the update window, then grow into the app.
         app.intro = Some(iced::Point::new(620.0, 420.0));
         let _ = app.update(Msg::Opened(id));
-        assert!(matches!(app.morph.as_ref().unwrap().base, MorphBase::Card(tacho::BarStage::Done)));
+        assert!(matches!(app.morph.as_ref().unwrap().base, MorphBase::Card(tacho::BarStage::Launching)));
         let _ = app.update(Msg::IntroStart);
         assert!(app.morph.as_ref().unwrap().anim.is_some());
         let _ = app.update(Msg::MorphStep(MorphStep::HideBase));

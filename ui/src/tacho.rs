@@ -1217,8 +1217,8 @@ pub struct Mosaic {
     pub cells: Vec<[u8; 3]>,
 }
 pub const MOSAIC_CELL: f32 = 4.0;
-const SHIFT_OUT_MS: f32 = 170.0;
-const SHIFT_IN_MS: f32 = 210.0;
+const SHIFT_OUT_MS: f32 = 57.0;
+const SHIFT_IN_MS: f32 = 70.0;
 const BLOCK_MAX: f32 = 48.0;
 /// The page area's last laid-out size, so pages can be painted offscreen at the same size.
 // ponytail: one window, one page area; a per-window map if the UI ever opens a second one.
@@ -1342,6 +1342,15 @@ pub enum BarStage {
     /// A solid block of lit segments runs across from this moment; no fading trail.
     Running(Instant),
     Done,
+    /// Installed; the new version is starting. The full green bar carries a sweeping gleam timed
+    /// by the wall clock, so the watcher and the new UI draw the very same frame at hand-over.
+    Launching,
+}
+const GLEAM_MS: u128 = 1400;
+/// Where the gleam is (0..1 over the bar, beyond it between sweeps), from the wall clock.
+fn gleam() -> f32 {
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    (ms % GLEAM_MS) as f32 / GLEAM_MS as f32 * 1.6 - 0.3
 }
 
 /// The update window's bar in the sliders' segment style.
@@ -1372,6 +1381,9 @@ impl<Message> Widget<Message, Theme, Renderer> for RunBar {
         layout::atomic(limits, Length::Fill, Length::Fixed(20.0))
     }
     fn update(&mut self, _: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+        if let (Event::Window(window::Event::RedrawRequested(now)), BarStage::Launching) = (event, self.stage) {
+            shell.request_redraw_at(RedrawRequest::At(*now + Duration::from_millis(33)));
+        }
         if let (Event::Window(window::Event::RedrawRequested(now)), BarStage::Running(since)) = (event, self.stage) {
             let step = Duration::from_millis(BAR_STEP_MS);
             let elapsed = now.saturating_duration_since(since);
@@ -1394,6 +1406,10 @@ impl<Message> Widget<Message, Theme, Renderer> for RunBar {
             let lit = match self.stage {
                 BarStage::Running(_) => (i < pos && i + BAR_BLOCK >= pos).then(|| if i + 1 == pos { HEAD } else { lerp(i as f32 / BAR_SEGMENTS as f32) }),
                 BarStage::Done => Some(if i + 1 == BAR_SEGMENTS { Color::from_rgb8(0xD9, 0xFF, 0xE2) } else { green(i as f32 / BAR_SEGMENTS as f32) }),
+                BarStage::Launching => {
+                    let d = ((i as f32 + 0.5) / BAR_SEGMENTS as f32 - gleam()).abs() / 0.12;
+                    Some(brighten(green(0.35 + 0.65 * i as f32 / BAR_SEGMENTS as f32), (1.0 - d).max(0.0) * 1.6))
+                }
                 BarStage::Waiting => None,
             };
             match lit {

@@ -257,11 +257,10 @@ pub fn mosaic_of<'a, M: 'a>(mut element: Element<'a, M>, area: Size) -> Option<s
 /// large type and the running bar.
 pub const UPDATE_CARD: Size = Size::new(440.0, 176.0);
 pub fn update_card<'a, M: 'a>(stage: tacho::BarStage, from: &str, to: &str) -> Element<'a, M> {
-    let done = stage == tacho::BarStage::Done;
-    let (title_text, version, color) = if done {
-        ("Готово", to.to_owned(), GREEN)
-    } else {
-        ("Обновляем Mic Noize", format!("{from} → {to}"), ORANGE)
+    let (title_text, version, color) = match stage {
+        tacho::BarStage::Done => ("Готово", to.to_owned(), GREEN),
+        tacho::BarStage::Launching => ("Запускаем Mic Noize", to.to_owned(), GREEN),
+        _ => ("Обновляем Mic Noize", format!("{from} → {to}"), ORANGE),
     };
     container(column![
         container(row![tacho::logo(18.0, 0.0), bold("Mic Noize", 13, INK)].spacing(10).align_y(iced::Center)).padding([0, 14]).center_y(38),
@@ -2417,6 +2416,8 @@ mod tests {
         }
         app.morph = Some(MorphView { base: MorphBase::Card(tacho::BarStage::Running(Instant::now() - Duration::from_millis(270))), from_version: "0.2.14".into(), to_version: "0.2.15".into(), anim: None, hwnd: None, center: None });
         save(&app, "update-window".into());
+        app.morph = Some(MorphView { base: MorphBase::Card(tacho::BarStage::Launching), from_version: "0.2.14".into(), to_version: "0.2.15".into(), anim: None, hwnd: None, center: None });
+        save(&app, "update-launching".into());
     }
 
     /// Frames of the page-switch pixelation, with their draw + raster time.
