@@ -58,6 +58,8 @@ pub struct Clock {
     pub opened: Option<Instant>,
     /// False while the window is unfocused: nothing keeps animating then.
     pub animate: bool,
+    /// The idle wave («Визуальные эффекты»); the warm-up follows `opened`.
+    pub idle: bool,
 }
 
 pub struct Tacho<'a, Message> {
@@ -437,6 +439,7 @@ impl<Message> Tacho<'_, Message> {
     }
     fn idle(&self, state: &State, now: Instant) -> bool {
         self.clock.animate
+            && self.clock.idle
             && self.enabled
             && !state.drag
             && self.ignition(now).is_none()
@@ -1172,9 +1175,17 @@ pub struct Mosaic {
     pub cells: Vec<[u8; 3]>,
 }
 pub const MOSAIC_CELL: f32 = 4.0;
-const SHIFT_OUT_MS: f32 = 57.0;
-const SHIFT_IN_MS: f32 = 70.0;
 const BLOCK_MAX: f32 = 48.0;
+/// The page switch, one step per frame: (new page, block side in logical px, mosaic opacity).
+/// The old page coarsens in two steps, the new one appears at the coarsest blocks and resolves
+/// in two, the last fading over the real page. Every step differs clearly from its neighbours:
+/// near-equal fine steps at the end read as the animation hanging.
+const SHIFT: [(bool, f32, f32); 5] = [(false, 10.0, 1.0), (false, 24.0, 1.0), (true, 44.0, 1.0), (true, 20.0, 1.0), (true, 8.0, 0.5)];
+/// From this step on the real page is drawn under the (still opaque) mosaic.
+const SHIFT_REVEAL: usize = 3;
+/// How long each step stays: one 60 Hz refresh, so a step never lands between two screen
+/// refreshes and vanishes unseen. The whole switch takes 5 × 17 ms.
+const SHIFT_STEP: Duration = Duration::from_millis(17);
 /// The page area's last laid-out size, so pages can be painted offscreen at the same size.
 // ponytail: one window, one page area; a per-window map if the UI ever opens a second one.
 static PAGE_AREA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1185,9 +1196,9 @@ pub fn page_area() -> Option<Size> {
 }
 
 /// The page switch: the old page pixelates into big blocks, then the new one resolves out of
-/// them. `shift` holds both pages and the start; `done` is sent when it has played out.
-/// `reveal` is sent when the mosaic starts to fade: until then it hides the page completely, so the
-/// page underneath need not be drawn at all.
+/// them ([`SHIFT`]). `shift` holds both pages and the start; `done` is sent when it has played
+/// out. `reveal` is sent a step before the mosaic starts to fade: until then it hides the page
+/// completely, so the page underneath need not be drawn at all.
 pub fn page_shift<'a, Message: Clone + 'a>(shift: Option<&(std::sync::Arc<Mosaic>, std::sync::Arc<Mosaic>, Instant)>, reveal: Message, done: Message) -> Element<'a, Message> {
     Element::new(PageShift { shift: shift.cloned(), reveal, done })
 }
@@ -1196,11 +1207,28 @@ struct PageShift<Message> {
     reveal: Message,
     done: Message,
 }
-/// When the new page starts to show through the fading mosaic.
-const SHIFT_REVEAL_MS: f32 = SHIFT_OUT_MS + SHIFT_IN_MS * 0.7;
+/// Steps advance by frames, not by the clock: a late frame delays the next step instead of
+/// skipping it, so every step of [`SHIFT`] is seen.
 #[derive(Default)]
 struct ShiftState {
-    revealed: Option<Instant>,
+    /// The switch being played, its step and when that step was first shown.
+    start: Option<Instant>,
+    step: usize,
+    shown: Option<Instant>,
+    revealed: bool,
+}
+impl ShiftState {
+    /// A window frame at `now`: advances at most one step, and only once the current step has
+    /// been up for [`SHIFT_STEP`]. The 2 ms cover a timer that wakes a hair early; other redraws
+    /// (a tick, iced repeating the frame after a rebuild) leave the step alone.
+    fn frame(&mut self, start: Instant, now: Instant) {
+        if self.start != Some(start) {
+            *self = ShiftState { start: Some(start), shown: Some(now), ..ShiftState::default() };
+        } else if self.shown.is_some_and(|s| now.saturating_duration_since(s) + Duration::from_millis(2) >= SHIFT_STEP) {
+            self.step += 1;
+            self.shown = Some(now);
+        }
+    }
 }
 impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
     fn tag(&self) -> tree::Tag { tree::Tag::of::<ShiftState>() }
@@ -1216,35 +1244,31 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
     }
     fn update(&mut self, tree: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
         if let (Event::Window(window::Event::RedrawRequested(now)), Some((_, _, start))) = (event, &self.shift) {
-            let ms = now.saturating_duration_since(*start).as_secs_f32() * 1000.0;
             let state = tree.state.downcast_mut::<ShiftState>();
-            if ms >= SHIFT_REVEAL_MS && state.revealed != Some(*start) {
-                state.revealed = Some(*start);
+            state.frame(*start, *now);
+            if state.step >= SHIFT_REVEAL && !state.revealed {
+                state.revealed = true;
                 shell.publish(self.reveal.clone());
             }
-            if ms >= SHIFT_OUT_MS + SHIFT_IN_MS {
-                shell.publish(self.done.clone());
-            } else {
-                shell.request_redraw_at(frame_after(*now));
+            match state.shown {
+                Some(shown) if state.step < SHIFT.len() => shell.request_redraw_at(RedrawRequest::At(shown + SHIFT_STEP)),
+                _ => shell.publish(self.done.clone()),
             }
         }
     }
-    fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
         let Some((from, to, start)) = &self.shift else { return };
         let b = layout.bounds();
-        let ms = Instant::now().saturating_duration_since(*start).as_secs_f32() * 1000.0;
-        let (page, block, alpha) = if ms < SHIFT_OUT_MS {
-            // Blocks grow at an even pace, so every frame shows a new size.
-            let p = ms / SHIFT_OUT_MS;
-            (from, MOSAIC_CELL + (BLOCK_MAX - MOSAIC_CELL) * p, 1.0)
+        let state = tree.state.downcast_ref::<ShiftState>();
+        // Painted without window frames (the design tests), the step follows the clock.
+        let step = if state.start == Some(*start) {
+            state.step
         } else {
-            // Coarse blocks resolve quickly, the fine last steps settle gently; the last stretch
-            // fades over the real, sharp page underneath.
-            let p = ((ms - SHIFT_OUT_MS) / SHIFT_IN_MS).min(1.0);
-            (to, BLOCK_MAX - (BLOCK_MAX - MOSAIC_CELL) * (1.0 - (1.0 - p).powi(3)), ((1.0 - p) / (1.0 - 0.7)).min(1.0))
+            (Instant::now().saturating_duration_since(*start).as_millis() / SHIFT_STEP.as_millis()) as usize
         };
-        // Any whole-pixel block size, sampled from the fixed small mosaic: the picture changes on
-        // every frame instead of in 4 px jumps, which read as a low frame rate.
+        let Some(&(new, block, alpha)) = SHIFT.get(step) else { return };
+        let page = if new { to } else { from };
+        // Any whole-pixel block size, sampled from the fixed small mosaic.
         let side = block.round().max(MOSAIC_CELL);
         let (cols, rows) = ((b.width / side).ceil() as usize, (b.height / side).ceil() as usize);
         // One cached geometry for the whole mosaic: the window then repaints a single region per
@@ -1592,7 +1616,7 @@ impl<'a, Message: 'a> From<Tacho<'a, Message>> for Element<'a, Message> {
 mod tests {
     use super::*;
     fn t(range: RangeInclusive<f32>, v: f32) -> Tacho<'static, ()> {
-        tacho(range, v, |_| (), Clock { epoch: Instant::now(), opened: None, animate: false })
+        tacho(range, v, |_| (), Clock { epoch: Instant::now(), opened: None, animate: false, idle: false })
     }
     #[test]
     fn red_zone_starts_strictly_above_the_threshold() {
@@ -1610,6 +1634,28 @@ mod tests {
         assert_eq!(s.lit(0.0).0, s.lit(0.0).1);
         assert_eq!(s.lit(-3.0), (6, 8, 6));
         assert_eq!(s.lit(6.0), (8, 12, 11));
+    }
+    #[test]
+    fn page_shift_shows_every_step_once_per_frame() {
+        let start = Instant::now();
+        let ms = |v: u64| start + Duration::from_millis(v);
+        let mut s = ShiftState::default();
+        s.frame(start, ms(3));
+        assert_eq!(s.step, 0);
+        s.frame(start, ms(9));
+        assert_eq!(s.step, 0, "an early redraw keeps the step");
+        s.frame(start, ms(19));
+        s.frame(start, ms(19));
+        assert_eq!(s.step, 1, "a repeated frame advances once");
+        s.frame(start, ms(300));
+        assert_eq!(s.step, 2, "a late frame shows the next step, it does not skip");
+        s.frame(start, ms(316));
+        assert_eq!(s.step, 3, "one step per 17 ms frame, 2 ms early still counts");
+        s.frame(start + Duration::from_millis(1), ms(320));
+        assert_eq!((s.step, s.revealed), (0, false), "a new switch starts over");
+        assert!(SHIFT.windows(2).all(|w| (w[0].1 - w[1].1).abs() >= 8.0), "neighbouring steps differ clearly");
+        assert_eq!(SHIFT.iter().position(|s| s.0), Some(2), "the new page takes over at the coarsest step");
+        assert!(SHIFT[..SHIFT_REVEAL].iter().all(|s| s.2 == 1.0), "the page is hidden until revealed");
     }
     #[test]
     fn wave_lifts_and_settles() {

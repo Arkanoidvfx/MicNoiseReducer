@@ -256,6 +256,8 @@ mod focus {
         pub const REPAIR_LINES: usize = 94;
         pub const LOGS: usize = 95;
         pub const REHEARSE: usize = 96;
+        pub const PIXEL_SHIFT: usize = 97;
+        pub const SLIDER_IDLE: usize = 98;
     }
     pub mod effects {
         pub const INPUT: usize = 35;
@@ -459,6 +461,9 @@ enum Msg {
     Autostart(bool),
     AutostartUpdated(Result<bool, String>),
     AppAutostart(bool),
+    /// Визуальные эффекты: the page-switch pixelation and the sliders' idle wave + warm-up.
+    PixelShift(bool),
+    SliderIdle(bool),
     Input(Device),
     Output(Device),
     Version(i32),
@@ -755,6 +760,8 @@ struct App {
     autostart_busy: bool,
     task_warning: String,
     app_autostart: bool,
+    pixel_shift: bool,
+    slider_idle: bool,
     tray_ok: bool,
     peak: f32,
     ticks: u64,
@@ -953,6 +960,8 @@ impl App {
         let period = settings.number("audio", "period_ms", 5, 2, 20) as u32;
         let graphs = settings.number("audio", "cuda_graphs", -1, -1, 1);
         let hint_shown = settings.get("ui", "tray_hint") == Some("1");
+        let pixel_shift = settings.number("ui", "page_pixelate", 1, 0, 1) != 0;
+        let slider_idle = settings.number("ui", "slider_idle", 1, 0, 1) != 0;
         // On by default: a fresh install starts with Windows until the user unticks it.
         let app_autostart = settings.number("ui", "app_autostart", 1, 0, 1) != 0;
         if !cfg!(test) {
@@ -1171,6 +1180,8 @@ impl App {
                 autostart_busy,
                 task_warning: String::new(),
                 app_autostart,
+                pixel_shift,
+                slider_idle,
                 tray_ok: true,
                 peak: 0.0,
                 ticks: 0,
@@ -1300,6 +1311,8 @@ impl App {
         }
         self.settings.set("ui", "tray_hint", self.hint_shown as i32);
         self.settings.set("ui", "app_autostart", self.app_autostart as i32);
+        self.settings.set("ui", "page_pixelate", self.pixel_shift as i32);
+        self.settings.set("ui", "slider_idle", self.slider_idle as i32);
         self.settings.set("ui", "tag_autostart", self.autostart as i32);
         if let Some(folder) = &self.sound_folder {
             self.settings
@@ -2339,7 +2352,8 @@ impl App {
                     let _ = self.update(Msg::CancelBind);
                 }
                 let before = self.page_key();
-                let from = (!cfg!(test) && self.ui_active()).then(|| self.page_mosaic()).flatten();
+                // Without the pixelation the page swaps at once and nothing is painted offscreen.
+                let from = (!cfg!(test) && self.pixel_shift && self.ui_active()).then(|| self.page_mosaic()).flatten();
                 self.soundpad_page = page == 4;
                 // Page 3 is no longer a page: the headphone panel opens over Шумодав.
                 self.headphone_page = page == 3;
@@ -2463,6 +2477,16 @@ impl App {
                     }
                     Err(e) => self.message = format!("Автозапуск не изменён: {e}"),
                 }
+            }
+            Msg::PixelShift(enabled) => {
+                self.focus = focus::settings::PIXEL_SHIFT;
+                self.pixel_shift = enabled;
+                self.save();
+            }
+            Msg::SliderIdle(enabled) => {
+                self.focus = focus::settings::SLIDER_IDLE;
+                self.slider_idle = enabled;
+                self.save();
             }
             Msg::Autostart(enabled) => {
                 self.focus = focus::settings::AUTOSTART;
@@ -3573,6 +3597,7 @@ impl App {
                 if self.update_ready {
                     items.push(APPLY_UPDATE);
                 }
+                items.extend([PIXEL_SHIFT, SLIDER_IDLE]);
                 items.extend([LOGS, QUIT, REHEARSE]);
                 items.extend(tabs);
                 items
@@ -3847,6 +3872,8 @@ impl App {
                 QUIT if activate => Msg::Quit,
                 AUTOSTART if activate => Msg::Autostart(!self.autostart),
                 APP_AUTOSTART if activate => Msg::AppAutostart(!self.app_autostart),
+                PIXEL_SHIFT if activate => Msg::PixelShift(!self.pixel_shift),
+                SLIDER_IDLE if activate => Msg::SliderIdle(!self.slider_idle),
                 LOGS if activate => Msg::Page(5),
                 REHEARSE if activate => Msg::RehearseUpdate,
                 _ => Msg::Noop,
@@ -4367,6 +4394,42 @@ mod controller_tests {
         assert_eq!(restored.controls.alternate_intensity, 0.15);
         assert_eq!(restored.keys[12], 120 | 256);
         std::fs::remove_file(dir.join("settings.ini")).unwrap();
+    }
+    #[test]
+    fn visual_effect_toggles_load_save_and_take_keyboard() {
+        use keyboard::{Key, Modifiers, key::Named};
+        let (mut app, _) = App::from_settings(Settings::for_test("[ui]
+page_pixelate=0")).unwrap().unwrap();
+        assert!(!app.pixel_shift && app.slider_idle, "pixelation off from INI, wave on by default");
+        assert!(app.clock().idle && app.clock().opened == app.opened_at);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join(".tmp/visual-toggles-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        app.settings.path = dir.join("settings.ini");
+        app.benchmark = false;
+        app.window = Some(App::open(1.0, None).0);
+        let _ = app.update(Msg::Page(2));
+        app.focus = focus::settings::PIXEL_SHIFT;
+        let _ = app.key(Key::Named(Named::Space), Modifiers::empty(), false);
+        assert!(app.pixel_shift);
+        let _ = app.key(Key::Named(Named::Tab), Modifiers::empty(), false);
+        assert_eq!(app.focus, focus::settings::SLIDER_IDLE);
+        let _ = app.key(Key::Named(Named::Space), Modifiers::empty(), false);
+        assert!(!app.slider_idle && !app.clock().idle && app.clock().opened.is_none());
+        assert_eq!(app.settings.get("ui", "page_pixelate"), Some("1"));
+        assert_eq!(app.settings.get("ui", "slider_idle"), Some("0"));
+        let mut saved = 0;
+        for _ in 0..200 {
+            if let Some(Reply::Saved(result)) = app.engine.reply() {
+                result.unwrap();
+                saved += 1;
+                if saved == 2 { break; }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(saved, 2, "Settings writes did not finish");
+        let (restored, _) = App::from_settings(Settings::load(&dir).unwrap()).unwrap().unwrap();
+        assert!(restored.pixel_shift && !restored.slider_idle);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn background_window_stops_meter_updates_and_restores_on_focus() {

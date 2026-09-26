@@ -127,6 +127,7 @@ mod glyph {
     pub const CHECK: &str = "\u{E73E}";
     pub const LOGS: &str = "\u{E9D9}";
     pub const BACK: &str = "\u{E72B}";
+    pub const PALETTE: &str = "\u{E790}";
 }
 fn icon<'a>(glyph: &'a str, size: u32, color: Color) -> widget::Text<'a> {
     text(glyph).size(size).color(color).font(Font::with_name("Segoe MDL2 Assets"))
@@ -453,8 +454,13 @@ fn db_text(peak: f32) -> String {
 }
 
 impl App {
-    fn clock(&self) -> Clock {
-        Clock { epoch: self.epoch, opened: self.opened_at, animate: self.ui_active() }
+    pub fn clock(&self) -> Clock {
+        Clock {
+            epoch: self.epoch,
+            opened: self.opened_at.filter(|_| self.slider_idle),
+            animate: self.ui_active(),
+            idle: self.slider_idle,
+        }
     }
     fn ring(&self, focused: bool) -> bool {
         focused && self.focus_visible
@@ -2134,6 +2140,11 @@ impl App {
             .spacing(8),
         ]
         .spacing(8);
+        let visuals = column![
+            row![frame(switch(self.pixel_shift, Msg::PixelShift, true), self.focus == PIXEL_SHIFT), label("Пиксельный переход между разделами", 13, INK)].spacing(8).align_y(iced::Center),
+            row![frame(switch(self.slider_idle, Msg::SliderIdle, true), self.focus == SLIDER_IDLE), label("Волна и прогрев ползунков", 13, INK)].spacing(8).align_y(iced::Center),
+        ]
+        .spacing(6);
         let diagnostics = column![
             numbers(format!("NVIDIA {:.2} мс   очередь {:.1} мс", self.snapshot.process_ms, self.snapshot.queue_ms), 13, DIM),
             numbers(
@@ -2164,6 +2175,7 @@ impl App {
                 column![
                     card(column![heading_row(glyph::REFRESH, "Запуск", Space::new().into()), startup].spacing(10)),
                     card(column![heading_row(glyph::SAVE, "Обновления", Space::new().into()), updates].spacing(10)),
+                    card(column![heading_row(glyph::PALETTE, "Визуальные эффекты", Space::new().into()), visuals].spacing(10)),
                 ]
                 .spacing(14)
                 .width(Length::FillPortion(1)),
@@ -2574,7 +2586,7 @@ mod tests {
                 eprintln!("windowed frame {:3} ms: {regions} damage regions, {took:.1} ms", step * 16);
             }
         }
-        for ms in [0u64, 60, 120, 169, 200, 260, 330, 370] {
+        for ms in [0u64, 17, 34, 51, 68, 85] {
             app.page_shift = Some((from.clone(), to.clone(), Instant::now() - Duration::from_millis(ms)));
             let (pixels, took) = frame(&app);
             eprintln!("frame at {ms} ms: {took:.1} ms");
