@@ -1177,15 +1177,15 @@ pub struct Mosaic {
 pub const MOSAIC_CELL: f32 = 4.0;
 const BLOCK_MAX: f32 = 48.0;
 /// The page switch, one step per frame: (new page, block side in logical px, mosaic opacity).
-/// The old page coarsens in two steps, the new one appears at the coarsest blocks and resolves
-/// in two, the last fading over the real page. Every step differs clearly from its neighbours:
-/// near-equal fine steps at the end read as the animation hanging.
-const SHIFT: [(bool, f32, f32); 5] = [(false, 10.0, 1.0), (false, 24.0, 1.0), (true, 44.0, 1.0), (true, 20.0, 1.0), (true, 8.0, 0.5)];
+/// The old page coarsens, the new one appears at the coarsest blocks and resolves fading over
+/// the real page. Every step differs clearly from its neighbours: near-equal fine steps at the
+/// end read as the animation hanging.
+const SHIFT: [(bool, f32, f32); 3] = [(false, 24.0, 1.0), (true, 44.0, 1.0), (true, 12.0, 0.5)];
 /// From this step on the real page is drawn under the (still opaque) mosaic.
-const SHIFT_REVEAL: usize = 3;
-/// How long each step stays: one 60 Hz refresh, so a step never lands between two screen
-/// refreshes and vanishes unseen. The whole switch takes 5 × 17 ms.
-const SHIFT_STEP: Duration = Duration::from_millis(17);
+const SHIFT_REVEAL: usize = 1;
+/// How long each step stays. The whole switch takes 3 × 10 ms, a third of the former 5 × 17 ms;
+/// a step shorter than a screen refresh (13.5 ms at 74 Hz) may land between two and go unseen.
+const SHIFT_STEP: Duration = Duration::from_millis(10);
 /// The page area's last laid-out size, so pages can be painted offscreen at the same size.
 // ponytail: one window, one page area; a per-window map if the UI ever opens a second one.
 static PAGE_AREA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1437,7 +1437,24 @@ impl MorphTimeline {
 }
 #[derive(Default)]
 struct MorphState {
+    /// The morph being played: the layer's tree state outlives it, and a count carried over
+    /// from the previous morph (the grow after an update) left the next shrink without events.
+    start: Option<Instant>,
     fired: usize,
+}
+impl MorphState {
+    /// Marks the morph's events due `ms` after its start as fired; returns the index of the
+    /// first newly fired one (`fired` is past the last).
+    fn due<M>(&mut self, m: &Morph<M>, ms: f32) -> usize {
+        if self.start != Some(m.start) {
+            *self = MorphState { start: Some(m.start), fired: 0 };
+        }
+        let first = self.fired;
+        while m.events.get(self.fired).is_some_and(|(at, _)| ms >= *at) {
+            self.fired += 1;
+        }
+        first
+    }
 }
 pub fn morph<'a, Message: Clone + 'a>(morph: Option<&Morph<Message>>) -> Element<'a, Message> {
     Element::new(MorphWidget { morph: morph.cloned() })
@@ -1476,12 +1493,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for MorphWidget<Message> {
         let (Event::Window(window::Event::RedrawRequested(now)), Some(m)) = (event, &self.morph) else { return };
         let state = tree.state.downcast_mut::<MorphState>();
         let ms = now.saturating_duration_since(m.start).as_secs_f32() * 1000.0;
-        while let Some((at, message)) = m.events.get(state.fired) {
-            if ms < *at {
-                break;
-            }
+        for (_, message) in &m.events[state.due(m, ms)..state.fired] {
             shell.publish(message.clone());
-            state.fired += 1;
         }
         if state.fired < m.events.len() {
             shell.request_redraw_at(frame_after(*now));
@@ -1654,8 +1667,20 @@ mod tests {
         s.frame(start + Duration::from_millis(1), ms(320));
         assert_eq!((s.step, s.revealed), (0, false), "a new switch starts over");
         assert!(SHIFT.windows(2).all(|w| (w[0].1 - w[1].1).abs() >= 8.0), "neighbouring steps differ clearly");
-        assert_eq!(SHIFT.iter().position(|s| s.0), Some(2), "the new page takes over at the coarsest step");
+        assert_eq!(SHIFT.iter().position(|s| s.0), Some(1), "the new page takes over at the coarsest step");
         assert!(SHIFT[..SHIFT_REVEAL].iter().all(|s| s.2 == 1.0), "the page is hidden until revealed");
+    }
+    #[test]
+    fn morph_events_restart_with_each_morph() {
+        let mosaic = std::sync::Arc::new(Mosaic { width: 1, height: 1, cells: vec![[0; 3]] });
+        let start = Instant::now();
+        let morph = |start| Morph { from: mosaic.clone(), to: mosaic.clone(), from_rect: Rectangle::default(), to_rect: Rectangle::default(), start, timeline: MorphTimeline::GROW, events: vec![(100.0, 1), (950.0, 2)] };
+        let (grow, mut s) = (morph(start), MorphState::default());
+        assert_eq!((s.due(&grow, 50.0), s.fired), (0, 0));
+        assert_eq!((s.due(&grow, 960.0), s.fired), (0, 2));
+        assert_eq!((s.due(&grow, 990.0), s.fired), (2, 2), "fired events stay fired");
+        let shrink = morph(start + Duration::from_secs(60));
+        assert_eq!((s.due(&shrink, 120.0), s.fired), (0, 1), "the next morph plays its own events");
     }
     #[test]
     fn wave_lifts_and_settles() {
