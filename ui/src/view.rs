@@ -490,7 +490,7 @@ impl App {
         let logo = tacho::logo(26.0, voice);
         let titlebar = row![
             mouse_area(
-                container(row![logo, bold("Mic Noize", 15, INK)].spacing(10).align_y(iced::Center))
+                container(row![logo, bold("Mic Noize", 15, INK), Space::new().width(Length::Fill), tacho::signature()].spacing(10).align_y(iced::Center))
                     .padding([0, 16])
                     .width(Length::Fill)
                     .height(46)

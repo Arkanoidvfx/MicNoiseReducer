@@ -35,6 +35,24 @@ pub fn take_handoff(runtime: &Path) -> Option<Point> {
     let _ = std::fs::remove_file(&path);
     parse_point(text.as_deref()?).filter(|_| fresh)
 }
+/// Waits up to `timeout` for process `pid` to exit. A new UI started while the old one still
+/// runs meets the single-instance guard and quits silently.
+pub fn wait_exit(pid: u32, timeout: Duration) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
+        fn WaitForSingleObject(handle: isize, millis: u32) -> u32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    unsafe {
+        let handle = OpenProcess(SYNCHRONIZE, 0, pid);
+        if handle != 0 {
+            WaitForSingleObject(handle, timeout.as_millis() as u32);
+            CloseHandle(handle);
+        }
+    }
+}
 /// Tells the watcher the new UI is on screen (or will not show a window at all).
 pub fn signal_ui_shown(runtime: &Path) {
     let _ = std::fs::write(shown_file(runtime), b"shown");
@@ -158,7 +176,7 @@ pub fn rehearse(runtime: &Path, center: Option<Point>) -> Result<(), String> {
     let _ = std::fs::remove_file(&ready);
     let at = center.map_or("centered".to_owned(), |c| format!("{:.1},{:.1}", c.x, c.y));
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    std::process::Command::new(exe).arg("--ui-update-rehearsal").arg(at).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new(exe).arg("--ui-update-rehearsal").arg(at).arg(std::process::id().to_string()).spawn().map_err(|e| e.to_string())?;
     for _ in 0..60 {
         if ready.exists() {
             return Ok(());

@@ -27,6 +27,12 @@ const WAVE_LEN: f32 = 568.0;
 const STAGGER: f32 = 9.0;
 const IGNITE_STEP: f32 = 14.0;
 const IDLE_AFTER: Duration = Duration::from_millis(1500);
+/// Animation frame cap. `RedrawRequest::NextFrame` is unthrottled on the tiny-skia backend:
+/// it redraws as fast as the CPU allows, which starved the UI and even the audio engine.
+const FRAME: Duration = Duration::from_millis(16);
+fn frame_after(now: Instant) -> RedrawRequest {
+    RedrawRequest::At(now + FRAME)
+}
 const OFF: Color = Color::from_rgb8(0x1E, 0x1F, 0x22);
 const OFF_RED: Color = Color::from_rgb8(0x2C, 0x1A, 0x1A);
 const OFF_EDGE: Color = Color::from_rgb8(0x2A, 0x2B, 0x30);
@@ -474,7 +480,7 @@ impl<Message> Tacho<'_, Message> {
             || self.ignition(now).is_some()
             || self.clock.opened.is_some_and(|o| now.saturating_duration_since(o) < Duration::from_millis(300));
         if busy {
-            return Some(RedrawRequest::NextFrame);
+            return Some(frame_after(now));
         }
         if state.hover || (self.in_red(self.value) && self.enabled) {
             return Some(soon(33));
@@ -863,7 +869,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Reverse {
                 let t = self.cycle(*now);
                 let moving = (0.25..0.40).contains(&t) || (0.75..0.90).contains(&t);
                 if moving {
-                    shell.request_redraw_at(RedrawRequest::NextFrame);
+                    shell.request_redraw_at(frame_after(*now));
                 } else {
                     let edge = [0.25, 0.75, 1.25].into_iter().find(|e| *e > t).unwrap_or(1.25);
                     let wait = ((edge - t) * REV_CYCLE).max(16.0);
@@ -985,7 +991,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Keycap {
             }
             let span = if self.down { PRESS_MS } else { RELEASE_MS };
             if motion.since.is_some_and(|s| now.saturating_duration_since(s).as_secs_f32() * 1000.0 < span) {
-                shell.request_redraw_at(RedrawRequest::NextFrame);
+                shell.request_redraw_at(frame_after(*now));
             }
         }
     }
@@ -1064,7 +1070,7 @@ fn grain(i: u32, t: u32) -> f32 {
 impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
     fn tag(&self) -> tree::Tag { tree::Tag::of::<MeterState>() }
     fn state(&self) -> tree::State { tree::State::new(MeterState::default()) }
-    fn update(&mut self, tree: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, shell: &mut Shell<'_, Message>, _: &Rectangle) {
+    fn update(&mut self, tree: &mut Tree, event: &Event, _: Layout<'_>, _: mouse::Cursor, _: &Renderer, _: &mut dyn Clipboard, _: &mut Shell<'_, Message>, _: &Rectangle) {
         let Event::Window(window::Event::RedrawRequested(now)) = event else { return };
         if self.noisy {
             return;
@@ -1078,10 +1084,9 @@ impl<Message> Widget<Message, Theme, Renderer> for LevelMeter {
         } else if m.peak_at.is_none_or(|at| now.saturating_duration_since(at) >= PEAK_HOLD) {
             m.peak = (m.peak - dt * 0.6).max(self.level);
         }
-        if m.peak > self.level {
-            let wake = m.peak_at.map_or(*now, |at| at + PEAK_HOLD);
-            shell.request_redraw_at(if wake > *now { RedrawRequest::At(wake) } else { RedrawRequest::NextFrame });
-        }
+        // No frames of its own: the level updates (20 per second while shown) already redraw
+        // the meter, and the peak sinks on those. Asking for frames until the peak met a level
+        // that never stops moving kept the UI redrawing flat out.
     }
     fn size(&self) -> Size<Length> {
         Size { width: Length::Fill, height: Length::Fixed(METER_H) }
@@ -1265,7 +1270,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for PageShift<Message> {
             if ms >= SHIFT_OUT_MS + SHIFT_IN_MS {
                 shell.publish(self.done.clone());
             } else {
-                shell.request_redraw_at(RedrawRequest::NextFrame);
+                shell.request_redraw_at(frame_after(*now));
             }
         }
     }
@@ -1484,7 +1489,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for MorphWidget<Message> {
             state.fired += 1;
         }
         if state.fired < m.events.len() {
-            shell.request_redraw_at(RedrawRequest::NextFrame);
+            shell.request_redraw_at(frame_after(*now));
         }
     }
     fn draw(&self, _: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
@@ -1553,6 +1558,56 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for MorphWidget<Message> {
         }
         let cache = geometry(b, &shapes).cache(Group::unique(), None);
         renderer.draw_geometry(Geometry::load(&cache));
+    }
+}
+
+/// "by ARKANOID" in the sliders' tag style: a quiet slanted chip for the title bar.
+pub fn signature<'a, Message: 'a>() -> Element<'a, Message> {
+    let by = text_width("by", 11.0, Font::with_name("Segoe UI"));
+    let name = text_width("ARKANOID", 11.0, numbers());
+    Element::new(Signature { by, name })
+}
+struct Signature {
+    by: f32,
+    name: f32,
+}
+const SIGNATURE_H: f32 = 20.0;
+const SIGNATURE_LEAN: f32 = 6.0;
+impl Signature {
+    fn width(&self) -> f32 {
+        SIGNATURE_LEAN + 9.0 + self.by + 5.0 + self.name + 9.0
+    }
+}
+impl<Message> Widget<Message, Theme, Renderer> for Signature {
+    fn tag(&self) -> tree::Tag { tree::Tag::of::<Painted>() }
+    fn state(&self) -> tree::State { tree::State::new(Painted::default()) }
+    fn size(&self) -> Size<Length> {
+        Size { width: Length::Fixed(self.width()), height: Length::Fixed(SIGNATURE_H) }
+    }
+    fn layout(&mut self, _: &mut Tree, _: &Renderer, limits: &layout::Limits) -> layout::Node {
+        layout::atomic(limits, Length::Fixed(self.width()), Length::Fixed(SIGNATURE_H))
+    }
+    fn draw(&self, tree: &Tree, renderer: &mut Renderer, _: &Theme, _: &renderer::Style, layout: Layout<'_>, _: mouse::Cursor, _: &Rectangle) {
+        let b = layout.bounds();
+        let mut shapes = Vec::with_capacity(2);
+        let w = b.width - SIGNATURE_LEAN;
+        slant(&mut shapes, b.x, b.y, w, SIGNATURE_H, SIGNATURE_LEAN, OFF_EDGE);
+        slant(&mut shapes, b.x + 1.2, b.y + 1.0, w - 2.4, SIGNATURE_H - 2.0, SIGNATURE_LEAN * (SIGNATURE_H - 2.0) / SIGNATURE_H, Color::from_rgb8(0x1B, 0x1C, 0x1F));
+        tree.state.downcast_ref::<Painted>().draw(renderer, b.expand(2.0), shapes);
+        let text = |content: &str, font: Font| Text {
+            content: content.to_owned(),
+            bounds: Size::new(80.0, SIGNATURE_H),
+            size: Pixels(11.0),
+            line_height: text::LineHeight::default(),
+            font,
+            align_x: text::Alignment::Left,
+            align_y: iced::alignment::Vertical::Center,
+            shaping: text::Shaping::Basic,
+            wrapping: text::Wrapping::None,
+        };
+        let x = b.x + SIGNATURE_LEAN / 2.0 + 9.0;
+        put(renderer, text("by", Font::with_name("Segoe UI")), Point::new(x, b.center_y()), Color::from_rgb8(0x85, 0x86, 0x8D), b.expand(4.0));
+        put(renderer, text("ARKANOID", numbers()), Point::new(x + self.by + 5.0, b.center_y()), INK, b.expand(4.0));
     }
 }
 

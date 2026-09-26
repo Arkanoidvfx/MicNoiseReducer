@@ -3996,6 +3996,16 @@ impl App {
     }
 }
 fn main() {
+    // A GUI-subsystem app has no console: without this a panic vanishes without a trace.
+    if let Some(root)=paths::Paths::resolve().ok().map(|p|p.data) {
+        std::panic::set_hook(Box::new(move |info| {
+            let logs=root.join("Logs");
+            let _=std::fs::create_dir_all(&logs);
+            let text=format!("{} {}\n{}\n\n",env!("CARGO_PKG_VERSION"),info,std::backtrace::Backtrace::force_capture());
+            use std::io::Write;
+            if let Ok(mut file)=std::fs::OpenOptions::new().create(true).append(true).open(logs.join("rust-ui-panic.log")) {let _=file.write_all(text.as_bytes());}
+        }));
+    }
     // Host maintenance must run before every update; implicit startup apply bypasses it.
     let args:Vec<_>=std::env::args_os().collect();
     let upgrade=args.iter().position(|arg|arg=="--upgrade-legacy");
@@ -4039,11 +4049,13 @@ fn main() {
             let runtime=paths::Paths::resolve()?.runtime_root().to_path_buf();
             std::fs::create_dir_all(runtime.join(".update")).map_err(|e|e.to_string())?;
             let center=args.get(at+1).and_then(|v|v.to_str()).and_then(update_window::parse_point);
+            let old=args.get(at+2).and_then(|v|v.to_str()).and_then(|v|v.parse::<u32>().ok());
             let exe=std::env::current_exe().map_err(|e|e.to_string())?;
             let version=env!("CARGO_PKG_VERSION").to_owned();
             return update_window::watch(runtime,center,Some((version.clone(),version)),move||{
                 // The old UI exits as soon as this window stands; the pause is the "install".
                 std::thread::sleep(Duration::from_secs(3));
+                if let Some(pid)=old{update_window::wait_exit(pid,Duration::from_secs(10));}
                 Command::new(&exe).spawn().map_err(|e|e.to_string())?;
                 Ok(false)
             });
